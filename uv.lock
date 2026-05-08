@@ -55,6 +55,19 @@ wheels = [
 ]
 
 [[package]]
+name = "atp-platform-sdk"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cd/d1/b10b4b723eb7c9a1eebed792e428d0076a985e4bdaa4c7e429fe08d4381b/atp_platform_sdk-2.0.0.tar.gz", hash = "sha256:2fece2cda276fa93a17dd4edb90285f2f57b8937164abef2e2e2e5322097060a", size = 9874, upload-time = "2026-04-14T08:07:11.38Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/93/b7/7d5bc9bdb6b50d388ae3525dbd2d36fdd9d3a64694d1742c66015a8fbda2/atp_platform_sdk-2.0.0-py3-none-any.whl", hash = "sha256:9433eed96ee7bd680b3517049d3271d01da4abeee36c904645d1cb580bc8a6bd", size = 12691, upload-time = "2026-04-14T08:07:09.997Z" },
+]
+
+[[package]]
 name = "attrs"
 version = "25.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -691,6 +704,7 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
+    { name = "atp-platform-sdk" },
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "fastmcp" },
@@ -718,6 +732,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.22.1" },
+    { name = "atp-platform-sdk", specifier = ">=2.0.0" },
     { name = "cryptography", specifier = ">=46.0.6" },
     { name = "fastapi", specifier = ">=0.128.1" },
     { name = "fastmcp", specifier = ">=2.14.5" },

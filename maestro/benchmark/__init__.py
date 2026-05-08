@@ -1,9 +1,11 @@
 """R-06b — Agent benchmarking via ATP.
 
-M1 thin slice: data models + async runner driven by Protocols. Mock-only
-in tests; real ATP client and spawner adapters land in M2/M3.
+M1 thin slice: data models + async runner driven by Protocols. M2 added
+``SpawnerResponder`` (real Maestro spawners as the agent under test). M3
+added ``MaestroATPAdapter`` (live ATP HTTP via ``atp-platform-sdk``).
 """
 
+from maestro.benchmark.atp_client import MaestroATPAdapter
 from maestro.benchmark.models import (
     AgentResponse,
     BenchmarkResult,
@@ -28,5 +30,6 @@ __all__ = [
     "BenchmarkRunner",
     "BenchmarkTask",
     "BenchmarkTaskResult",
+    "MaestroATPAdapter",
     "SpawnerResponder",
 ]
