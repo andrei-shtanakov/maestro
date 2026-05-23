@@ -150,3 +150,31 @@ async def test_runner_captures_agent_error_and_still_submits() -> None:
     # No measurements → aggregates are None, not 0
     assert result.total_tokens is None
     assert result.total_cost_usd is None
+
+
+@pytest.mark.anyio
+async def test_run_without_run_id_uses_atp_run_id() -> None:
+    """When caller omits run_id, runner uses the ATP-provided one."""
+    run = MockRun(
+        "atp-r1",
+        [MockTask(0, "p")],
+    )
+    client = MockATPClient(run)
+    agent = MockResponder("a")
+    runner = BenchmarkRunner(client, agent)
+    result = await runner.run(benchmark_id="b")
+    assert result.run_id == "atp-r1"
+
+
+@pytest.mark.anyio
+async def test_run_with_explicit_run_id_overrides_atp() -> None:
+    """Caller-provided run_id wins over ATP's; enables CI-retry idempotency."""
+    run = MockRun(
+        "atp-r2",
+        [MockTask(0, "p")],
+    )
+    client = MockATPClient(run)
+    agent = MockResponder("a")
+    runner = BenchmarkRunner(client, agent)
+    result = await runner.run(benchmark_id="b", run_id="ci-job-42")
+    assert result.run_id == "ci-job-42"

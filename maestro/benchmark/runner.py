@@ -96,13 +96,24 @@ class BenchmarkRunner:
 
         runner = BenchmarkRunner(client, agent)
         result: BenchmarkResult = await runner.run(benchmark_id="swe-mini")
+        # Or with explicit run_id (for CI-retry idempotency):
+        result = await runner.run(benchmark_id="swe-mini", run_id="ci-job-42")
+
+    Args:
+        client: ATP client to start runs and submit tasks.
+        agent: The agent being benchmarked.
     """
 
     def __init__(self, client: ATPClientLike, agent: AgentResponder) -> None:
         self._client = client
         self._agent = agent
 
-    async def run(self, benchmark_id: str) -> BenchmarkResult:
+    async def run(
+        self,
+        benchmark_id: str,
+        *,
+        run_id: str | None = None,
+    ) -> BenchmarkResult:
         started_at = time.monotonic()
         run = await self._client.start_run(benchmark_id, self._agent.agent_id)
 
@@ -130,8 +141,9 @@ class BenchmarkRunner:
         total_tokens = _sum_or_none(t.tokens_used for t in per_task)
         total_cost = _sum_or_none(t.cost_usd for t in per_task)
 
+        effective_run_id = run_id if run_id is not None else run.run_id
         return BenchmarkResult(
-            run_id=run.run_id,
+            run_id=effective_run_id,
             benchmark_id=benchmark_id,
             agent_id=self._agent.agent_id,
             score=score,
