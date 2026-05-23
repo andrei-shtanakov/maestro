@@ -12,7 +12,7 @@ class TestVendoringHeader:
         assert arbiter_client.ARBITER_VENDOR_COMMIT == "861534e"
 
     def test_required_version_pinned(self) -> None:
-        assert arbiter_client.ARBITER_MCP_REQUIRED_VERSION == "0.1.0"
+        assert arbiter_client.ARBITER_MCP_REQUIRED_VERSION == "0.2.0"
 
 
 class TestPublicAPI:
