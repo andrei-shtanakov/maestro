@@ -468,6 +468,7 @@ async def test_helper_treats_unknown_status_as_contract_break(captured_obs_event
     )
     returned = await report_benchmark_to_arbiter(_result(run_id="x"), mock_client)
     assert returned.report_status == "failed"
+    assert returned.report_error is not None
     assert "contract_break" in returned.report_error
     assert "rejected" in returned.report_error
     assert any(
@@ -484,6 +485,7 @@ async def test_helper_treats_missing_status_as_contract_break(captured_obs_event
     )
     returned = await report_benchmark_to_arbiter(_result(run_id="x"), mock_client)
     assert returned.report_status == "failed"
+    assert returned.report_error is not None
     assert "contract_break" in returned.report_error
 
 
@@ -501,7 +503,10 @@ async def test_helper_resets_stale_report_error_on_success():
     )
     # Simulate prior-failure state:
     prior_result = _result(run_id="x").model_copy(
-        update={"report_status": "failed", "report_error": "unavailable: arbiter unavailable"}
+        update={
+            "report_status": "failed",
+            "report_error": "unavailable: arbiter unavailable",
+        }
     )
     returned = await report_benchmark_to_arbiter(prior_result, mock_client)
     assert returned.report_status == "ok"

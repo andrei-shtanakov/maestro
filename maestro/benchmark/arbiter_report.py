@@ -247,7 +247,9 @@ async def report_benchmark_to_arbiter(
     }
     if client is None:
         _obs_log.info("benchmark.report.skipped", **event_attrs)
-        return result.model_copy(update={"report_status": "skipped", "report_error": None})
+        return result.model_copy(
+            update={"report_status": "skipped", "report_error": None}
+        )
 
     with obs.span("benchmark.report", **event_attrs):
         try:
@@ -269,7 +271,9 @@ async def report_benchmark_to_arbiter(
                 _obs_log.info(
                     "benchmark.report.succeeded", score=result.score, **event_attrs
                 )
-            return result.model_copy(update={"report_status": "ok", "report_error": None})
+            return result.model_copy(
+                update={"report_status": "ok", "report_error": None}
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
