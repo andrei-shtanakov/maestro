@@ -1,7 +1,7 @@
 """Tests for the Orchestrator class.
 
 This module contains unit tests for the multi-process orchestrator,
-covering initialization, zadacha resolution, failure handling,
+covering initialization, workstream resolution, failure handling,
 PR body formatting, and shutdown behavior.
 """
 
@@ -12,9 +12,9 @@ import pytest
 
 from maestro.models import (
     OrchestratorConfig,
-    Zadacha,
-    ZadachaConfig,
-    ZadachaStatus,
+    Workstream,
+    WorkstreamConfig,
+    WorkstreamStatus,
 )
 from maestro.orchestrator import Orchestrator, OrchestratorError
 
@@ -41,11 +41,11 @@ def mock_db() -> MagicMock:
     """Provide a mock Database with async methods."""
     db = MagicMock()
     type(db).is_connected = PropertyMock(return_value=True)
-    db.get_all_zadachi = AsyncMock(return_value=[])
-    db.get_zadachi_by_status = AsyncMock(return_value=[])
-    db.create_zadacha = AsyncMock()
-    db.get_zadacha = AsyncMock()
-    db.update_zadacha_status = AsyncMock()
+    db.get_all_workstreams = AsyncMock(return_value=[])
+    db.get_workstreams_by_status = AsyncMock(return_value=[])
+    db.create_workstream = AsyncMock()
+    db.get_workstream = AsyncMock()
+    db.update_workstream_status = AsyncMock()
     return db
 
 
@@ -98,22 +98,22 @@ def orchestrator(
     )
 
 
-def _make_zadacha(
-    zadacha_id: str = "z1",
-    title: str = "Test Zadacha",
-    description: str = "A test zadacha",
+def _make_workstream(
+    workstream_id: str = "z1",
+    title: str = "Test Workstream",
+    description: str = "A test workstream",
     branch: str = "feature/z1",
-    status: ZadachaStatus = ZadachaStatus.PENDING,
+    status: WorkstreamStatus = WorkstreamStatus.PENDING,
     depends_on: list[str] | None = None,
     priority: int = 0,
     retry_count: int = 0,
     max_retries: int = 2,
     scope: list[str] | None = None,
     subtask_progress: str | None = None,
-) -> Zadacha:
-    """Create a Zadacha instance for testing."""
-    return Zadacha(
-        id=zadacha_id,
+) -> Workstream:
+    """Create a Workstream instance for testing."""
+    return Workstream(
+        id=workstream_id,
         title=title,
         description=description,
         branch=branch,
@@ -207,48 +207,48 @@ class TestOrchestratorInit:
 
 
 # =============================================================================
-# _ensure_zadachi Tests
+# _ensure_workstreams Tests
 # =============================================================================
 
 
-class TestEnsureZadachi:
-    """Tests for Orchestrator._ensure_zadachi."""
+class TestEnsureWorkstreams:
+    """Tests for Orchestrator._ensure_workstreams."""
 
     @pytest.mark.anyio
-    async def test_existing_zadachi_noop(
+    async def test_existing_workstreams_noop(
         self,
         orchestrator: Orchestrator,
         mock_db: MagicMock,
     ) -> None:
-        """Test that existing zadachi in DB results in no-op."""
-        existing = [_make_zadacha("z1"), _make_zadacha("z2")]
-        mock_db.get_all_zadachi = AsyncMock(return_value=existing)
+        """Test that existing workstreams in DB results in no-op."""
+        existing = [_make_workstream("z1"), _make_workstream("z2")]
+        mock_db.get_all_workstreams = AsyncMock(return_value=existing)
 
-        await orchestrator._ensure_zadachi()
+        await orchestrator._ensure_workstreams()
 
-        mock_db.create_zadacha.assert_not_called()
-        assert orchestrator._stats.total_zadachi == 2
+        mock_db.create_workstream.assert_not_called()
+        assert orchestrator._stats.total_workstreams == 2
 
     @pytest.mark.anyio
-    async def test_zadachi_from_config_creates_in_db(
+    async def test_workstreams_from_config_creates_in_db(
         self,
         mock_db: MagicMock,
         mock_workspace_mgr: MagicMock,
         mock_decomposer: MagicMock,
         mock_pr_manager: MagicMock,
     ) -> None:
-        """Test that zadachi from config are created in the database."""
-        zadachi_configs = [
-            ZadachaConfig(
+        """Test that workstreams from config are created in the database."""
+        workstreams_configs = [
+            WorkstreamConfig(
                 id="z1",
                 title="First",
-                description="First zadacha",
+                description="First workstream",
                 scope=["src/**"],
             ),
-            ZadachaConfig(
+            WorkstreamConfig(
                 id="z2",
                 title="Second",
-                description="Second zadacha",
+                description="Second workstream",
                 scope=["tests/**"],
             ),
         ]
@@ -258,10 +258,10 @@ class TestEnsureZadachi:
             repo_path="/tmp/test-repo",
             workspace_base="/tmp/test-ws",
             max_concurrent=2,
-            zadachi=zadachi_configs,
+            workstreams=workstreams_configs,
         )
 
-        mock_db.get_all_zadachi = AsyncMock(return_value=[])
+        mock_db.get_all_workstreams = AsyncMock(return_value=[])
 
         orch = Orchestrator(
             db=mock_db,
@@ -272,10 +272,10 @@ class TestEnsureZadachi:
             log_dir=Path("/tmp/test-logs"),
         )
 
-        await orch._ensure_zadachi()
+        await orch._ensure_workstreams()
 
-        assert mock_db.create_zadacha.call_count == 2
-        assert orch._stats.total_zadachi == 2
+        assert mock_db.create_workstream.call_count == 2
+        assert orch._stats.total_workstreams == 2
         mock_decomposer.decompose.assert_not_called()
 
     @pytest.mark.anyio
@@ -286,7 +286,7 @@ class TestEnsureZadachi:
         mock_decomposer: MagicMock,
         mock_pr_manager: MagicMock,
     ) -> None:
-        """Test auto-decomposition when description is provided and no zadachi."""
+        """Test auto-decomposition when description is provided and no workstreams."""
         config = OrchestratorConfig(
             project="test-project",
             description="Build a REST API with auth and CRUD",
@@ -297,13 +297,13 @@ class TestEnsureZadachi:
         )
 
         decomposed = [
-            ZadachaConfig(
+            WorkstreamConfig(
                 id="auth",
                 title="Auth module",
                 description="Add authentication",
                 scope=["auth/**"],
             ),
-            ZadachaConfig(
+            WorkstreamConfig(
                 id="crud",
                 title="CRUD module",
                 description="Add CRUD endpoints",
@@ -311,7 +311,7 @@ class TestEnsureZadachi:
             ),
         ]
         mock_decomposer.decompose = MagicMock(return_value=decomposed)
-        mock_db.get_all_zadachi = AsyncMock(return_value=[])
+        mock_db.get_all_workstreams = AsyncMock(return_value=[])
 
         orch = Orchestrator(
             db=mock_db,
@@ -322,26 +322,26 @@ class TestEnsureZadachi:
             log_dir=Path("/tmp/test-logs"),
         )
 
-        await orch._ensure_zadachi()
+        await orch._ensure_workstreams()
 
         mock_decomposer.decompose.assert_called_once_with(
             "Build a REST API with auth and CRUD"
         )
-        assert mock_db.create_zadacha.call_count == 2
-        assert orch._stats.total_zadachi == 2
+        assert mock_db.create_workstream.call_count == 2
+        assert orch._stats.total_workstreams == 2
 
     @pytest.mark.anyio
-    async def test_no_zadachi_no_description_raises(
+    async def test_no_workstreams_no_description_raises(
         self,
         orchestrator: Orchestrator,
         mock_db: MagicMock,
     ) -> None:
-        """Test that no zadachi and no description raises OrchestratorError."""
-        mock_db.get_all_zadachi = AsyncMock(return_value=[])
-        # orch_config has no zadachi and description defaults to ""
+        """Test that no workstreams and no description raises OrchestratorError."""
+        mock_db.get_all_workstreams = AsyncMock(return_value=[])
+        # orch_config has no workstreams and description defaults to ""
 
-        with pytest.raises(OrchestratorError, match="No zadachi in config"):
-            await orchestrator._ensure_zadachi()
+        with pytest.raises(OrchestratorError, match="No workstreams in config"):
+            await orchestrator._ensure_workstreams()
 
 
 # =============================================================================
@@ -358,49 +358,49 @@ class TestResolveReady:
         orchestrator: Orchestrator,
         mock_db: MagicMock,
     ) -> None:
-        """Test that a pending zadacha with no deps is resolved as ready."""
-        zadacha = _make_zadacha(
+        """Test that a pending workstream with no deps is resolved as ready."""
+        workstream = _make_workstream(
             "z1",
-            status=ZadachaStatus.PENDING,
+            status=WorkstreamStatus.PENDING,
             depends_on=[],
         )
-        mock_db.get_all_zadachi = AsyncMock(return_value=[zadacha])
+        mock_db.get_all_workstreams = AsyncMock(return_value=[workstream])
 
         ready = await orchestrator._resolve_ready(completed_ids=set())
 
         assert ready == ["z1"]
 
     @pytest.mark.anyio
-    async def test_zadacha_with_unmet_deps_not_ready(
+    async def test_workstream_with_unmet_deps_not_ready(
         self,
         orchestrator: Orchestrator,
         mock_db: MagicMock,
     ) -> None:
-        """Test that a zadacha with unmet dependencies is not ready."""
-        z1 = _make_zadacha(
+        """Test that a workstream with unmet dependencies is not ready."""
+        z1 = _make_workstream(
             "z1",
-            status=ZadachaStatus.PENDING,
+            status=WorkstreamStatus.PENDING,
             depends_on=["z0"],
         )
-        mock_db.get_all_zadachi = AsyncMock(return_value=[z1])
+        mock_db.get_all_workstreams = AsyncMock(return_value=[z1])
 
         ready = await orchestrator._resolve_ready(completed_ids=set())
 
         assert ready == []
 
     @pytest.mark.anyio
-    async def test_zadacha_with_met_deps_becomes_ready(
+    async def test_workstream_with_met_deps_becomes_ready(
         self,
         orchestrator: Orchestrator,
         mock_db: MagicMock,
     ) -> None:
-        """Test that a zadacha with all deps completed is ready."""
-        z1 = _make_zadacha(
+        """Test that a workstream with all deps completed is ready."""
+        z1 = _make_workstream(
             "z1",
-            status=ZadachaStatus.PENDING,
+            status=WorkstreamStatus.PENDING,
             depends_on=["z0"],
         )
-        mock_db.get_all_zadachi = AsyncMock(return_value=[z1])
+        mock_db.get_all_workstreams = AsyncMock(return_value=[z1])
 
         ready = await orchestrator._resolve_ready(completed_ids={"z0"})
 
@@ -412,13 +412,13 @@ class TestResolveReady:
         orchestrator: Orchestrator,
         mock_db: MagicMock,
     ) -> None:
-        """Test that a zadacha currently running is not resolved as ready."""
-        z1 = _make_zadacha(
+        """Test that a workstream currently running is not resolved as ready."""
+        z1 = _make_workstream(
             "z1",
-            status=ZadachaStatus.PENDING,
+            status=WorkstreamStatus.PENDING,
             depends_on=[],
         )
-        mock_db.get_all_zadachi = AsyncMock(return_value=[z1])
+        mock_db.get_all_workstreams = AsyncMock(return_value=[z1])
 
         # Simulate z1 being in _running
         orchestrator._running["z1"] = MagicMock()
@@ -433,29 +433,31 @@ class TestResolveReady:
         orchestrator: Orchestrator,
         mock_db: MagicMock,
     ) -> None:
-        """Test that zadachi in non-pending/ready states are excluded."""
-        z_done = _make_zadacha("z1", status=ZadachaStatus.DONE)
-        z_failed = _make_zadacha("z2", status=ZadachaStatus.FAILED)
-        z_running = _make_zadacha("z3", status=ZadachaStatus.RUNNING)
-        mock_db.get_all_zadachi = AsyncMock(return_value=[z_done, z_failed, z_running])
+        """Test that workstreams in non-pending/ready states are excluded."""
+        z_done = _make_workstream("z1", status=WorkstreamStatus.DONE)
+        z_failed = _make_workstream("z2", status=WorkstreamStatus.FAILED)
+        z_running = _make_workstream("z3", status=WorkstreamStatus.RUNNING)
+        mock_db.get_all_workstreams = AsyncMock(
+            return_value=[z_done, z_failed, z_running]
+        )
 
         ready = await orchestrator._resolve_ready(completed_ids=set())
 
         assert ready == []
 
     @pytest.mark.anyio
-    async def test_ready_status_zadacha_resolved(
+    async def test_ready_status_workstream_resolved(
         self,
         orchestrator: Orchestrator,
         mock_db: MagicMock,
     ) -> None:
-        """Test that a READY-status zadacha (not just PENDING) is resolved."""
-        z1 = _make_zadacha(
+        """Test that a READY-status workstream (not just PENDING) is resolved."""
+        z1 = _make_workstream(
             "z1",
-            status=ZadachaStatus.READY,
+            status=WorkstreamStatus.READY,
             depends_on=[],
         )
-        mock_db.get_all_zadachi = AsyncMock(return_value=[z1])
+        mock_db.get_all_workstreams = AsyncMock(return_value=[z1])
 
         ready = await orchestrator._resolve_ready(completed_ids=set())
 
@@ -467,23 +469,23 @@ class TestResolveReady:
         orchestrator: Orchestrator,
         mock_db: MagicMock,
     ) -> None:
-        """Test that ready zadachi are sorted by priority descending."""
-        z_low = _make_zadacha(
+        """Test that ready workstreams are sorted by priority descending."""
+        z_low = _make_workstream(
             "z-low",
-            status=ZadachaStatus.PENDING,
+            status=WorkstreamStatus.PENDING,
             priority=1,
         )
-        z_high = _make_zadacha(
+        z_high = _make_workstream(
             "z-high",
-            status=ZadachaStatus.PENDING,
+            status=WorkstreamStatus.PENDING,
             priority=10,
         )
-        z_mid = _make_zadacha(
+        z_mid = _make_workstream(
             "z-mid",
-            status=ZadachaStatus.PENDING,
+            status=WorkstreamStatus.PENDING,
             priority=5,
         )
-        mock_db.get_all_zadachi = AsyncMock(return_value=[z_low, z_high, z_mid])
+        mock_db.get_all_workstreams = AsyncMock(return_value=[z_low, z_high, z_mid])
 
         ready = await orchestrator._resolve_ready(completed_ids=set())
 
@@ -496,12 +498,12 @@ class TestResolveReady:
         mock_db: MagicMock,
     ) -> None:
         """Test that all deps must be completed, not just some."""
-        z1 = _make_zadacha(
+        z1 = _make_workstream(
             "z1",
-            status=ZadachaStatus.PENDING,
+            status=WorkstreamStatus.PENDING,
             depends_on=["dep-a", "dep-b"],
         )
-        mock_db.get_all_zadachi = AsyncMock(return_value=[z1])
+        mock_db.get_all_workstreams = AsyncMock(return_value=[z1])
 
         # Only one dep met
         ready = await orchestrator._resolve_ready(completed_ids={"dep-a"})
@@ -526,30 +528,30 @@ class TestHandleFailure:
         orchestrator: Orchestrator,
         mock_db: MagicMock,
     ) -> None:
-        """Test that a zadacha with retries left is set back to READY."""
-        zadacha = _make_zadacha(
+        """Test that a workstream with retries left is set back to READY."""
+        workstream = _make_workstream(
             "z1",
             retry_count=0,
             max_retries=2,
         )
-        mock_db.get_zadacha = AsyncMock(return_value=zadacha)
+        mock_db.get_workstream = AsyncMock(return_value=workstream)
 
         await orchestrator._handle_failure("z1", "spec-runner exited with code 1")
 
         # Should transition to FAILED first, then READY
-        calls = mock_db.update_zadacha_status.call_args_list
+        calls = mock_db.update_workstream_status.call_args_list
         assert len(calls) == 2
 
         # First call: mark as FAILED with error + incremented retry count
         first_call_args = calls[0]
-        assert first_call_args[0] == ("z1", ZadachaStatus.FAILED)
+        assert first_call_args[0] == ("z1", WorkstreamStatus.FAILED)
         assert first_call_args[1]["error_message"] == ("spec-runner exited with code 1")
         assert first_call_args[1]["retry_count"] == 1
 
         # Second call: mark as READY
         second_call_args = calls[1]
-        assert second_call_args[0] == ("z1", ZadachaStatus.READY)
-        assert second_call_args[1]["expected_status"] == ZadachaStatus.FAILED
+        assert second_call_args[0] == ("z1", WorkstreamStatus.READY)
+        assert second_call_args[1]["expected_status"] == WorkstreamStatus.FAILED
 
     @pytest.mark.anyio
     async def test_needs_review_when_no_retries(
@@ -557,28 +559,28 @@ class TestHandleFailure:
         orchestrator: Orchestrator,
         mock_db: MagicMock,
     ) -> None:
-        """Test that a zadacha with no retries left goes to NEEDS_REVIEW."""
-        zadacha = _make_zadacha(
+        """Test that a workstream with no retries left goes to NEEDS_REVIEW."""
+        workstream = _make_workstream(
             "z1",
             retry_count=2,
             max_retries=2,
         )
-        mock_db.get_zadacha = AsyncMock(return_value=zadacha)
+        mock_db.get_workstream = AsyncMock(return_value=workstream)
 
         await orchestrator._handle_failure("z1", "spec-runner exited with code 1")
 
-        calls = mock_db.update_zadacha_status.call_args_list
+        calls = mock_db.update_workstream_status.call_args_list
         assert len(calls) == 2
 
         # First call: mark as FAILED
         first_call_args = calls[0]
-        assert first_call_args[0] == ("z1", ZadachaStatus.FAILED)
+        assert first_call_args[0] == ("z1", WorkstreamStatus.FAILED)
         assert first_call_args[1]["error_message"] == ("spec-runner exited with code 1")
 
         # Second call: mark as NEEDS_REVIEW
         second_call_args = calls[1]
-        assert second_call_args[0] == ("z1", ZadachaStatus.NEEDS_REVIEW)
-        assert second_call_args[1]["expected_status"] == ZadachaStatus.FAILED
+        assert second_call_args[0] == ("z1", WorkstreamStatus.NEEDS_REVIEW)
+        assert second_call_args[1]["expected_status"] == WorkstreamStatus.FAILED
 
     @pytest.mark.anyio
     async def test_failure_increments_stats(
@@ -587,12 +589,12 @@ class TestHandleFailure:
         mock_db: MagicMock,
     ) -> None:
         """Test that failure with no retries increments the failed stat."""
-        zadacha = _make_zadacha(
+        workstream = _make_workstream(
             "z1",
             retry_count=2,
             max_retries=2,
         )
-        mock_db.get_zadacha = AsyncMock(return_value=zadacha)
+        mock_db.get_workstream = AsyncMock(return_value=workstream)
 
         await orchestrator._handle_failure("z1", "error")
 
@@ -605,12 +607,12 @@ class TestHandleFailure:
         mock_db: MagicMock,
     ) -> None:
         """Test that retry does not increment the failed stat."""
-        zadacha = _make_zadacha(
+        workstream = _make_workstream(
             "z1",
             retry_count=0,
             max_retries=2,
         )
-        mock_db.get_zadacha = AsyncMock(return_value=zadacha)
+        mock_db.get_workstream = AsyncMock(return_value=workstream)
 
         await orchestrator._handle_failure("z1", "error")
 
@@ -630,14 +632,14 @@ class TestBuildPrBody:
         orchestrator: Orchestrator,
     ) -> None:
         """Test that PR body is formatted with summary, scope, and progress."""
-        zadacha = _make_zadacha(
+        workstream = _make_workstream(
             "z1",
             description="Implement user auth",
             scope=["src/auth/**", "tests/auth/**"],
             subtask_progress="3/5 done",
         )
 
-        body = orchestrator._build_pr_body(zadacha)
+        body = orchestrator._build_pr_body(workstream)
 
         assert "## Summary" in body
         assert "Implement user auth" in body
@@ -653,14 +655,14 @@ class TestBuildPrBody:
         orchestrator: Orchestrator,
     ) -> None:
         """Test that missing progress shows N/A."""
-        zadacha = _make_zadacha(
+        workstream = _make_workstream(
             "z1",
             description="Some work",
             scope=["src/**"],
             subtask_progress=None,
         )
 
-        body = orchestrator._build_pr_body(zadacha)
+        body = orchestrator._build_pr_body(workstream)
 
         assert "N/A" in body
 
@@ -669,13 +671,13 @@ class TestBuildPrBody:
         orchestrator: Orchestrator,
     ) -> None:
         """Test PR body with empty scope list."""
-        zadacha = _make_zadacha(
+        workstream = _make_workstream(
             "z1",
             description="Global changes",
             scope=[],
         )
 
-        body = orchestrator._build_pr_body(zadacha)
+        body = orchestrator._build_pr_body(workstream)
 
         assert "## Scope" in body
         # Scope section should be empty (no bullet items)

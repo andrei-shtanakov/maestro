@@ -1387,6 +1387,7 @@ class TestSchemaMigrationsJournal:
             assert rows == [
                 (1, "r02_arbiter_columns"),
                 (2, "r03_arbiter_routing"),
+                (3, "r06b_rename_zadachi_to_workstreams"),
             ]
         finally:
             await db.close()
@@ -1410,7 +1411,7 @@ class TestSchemaMigrationsJournal:
             )
             row = await cursor.fetchone()
             assert row is not None
-            assert row["n"] == 2
+            assert row["n"] == 3
         finally:
             await db2.close()
 
@@ -1471,6 +1472,7 @@ class TestSchemaMigrationsJournal:
             assert rows == [
                 (1, "r02_arbiter_columns"),
                 (2, "r03_arbiter_routing"),
+                (3, "r06b_rename_zadachi_to_workstreams"),
             ]
             # Sanity: the idempotent ALTERs must not have fired twice.
             cursor = await db._connection.execute("PRAGMA table_info(tasks)")
@@ -1715,5 +1717,92 @@ class TestGetTasksWithPendingOutcome:
             pending = await db.get_tasks_with_pending_outcome()
             ids = {t.id for t in pending}
             assert ids == {"pending"}
+        finally:
+            await db.close()
+
+
+class TestMigrationRenameZadachiToWorkstreams:
+    """Migration 3: rename zadachi → workstreams on existing DBs."""
+
+    @pytest.mark.anyio
+    async def test_migration_renames_zadachi_to_workstreams(self, tmp_path) -> None:
+        """Pre-rename DB (zadachi table) is migrated to workstreams on connect."""
+        import aiosqlite
+
+        from maestro.database import Database
+
+        db_path = tmp_path / "old.db"
+        # Create a pre-rename schema matching the old full zadachi table shape.
+        zadachi_ddl = """
+            CREATE TABLE zadachi (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                workspace_path TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                scope TEXT,
+                priority INTEGER DEFAULT 0,
+                pr_url TEXT,
+                process_pid INTEGER,
+                subtask_progress TEXT,
+                error_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                max_retries INTEGER DEFAULT 2,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await conn.execute(zadachi_ddl)
+            await conn.execute(
+                "CREATE TABLE zadacha_dependencies (zadacha_id TEXT, depends_on TEXT)"
+            )
+            await conn.execute("CREATE INDEX idx_zadachi_status ON zadachi(status)")
+            await conn.execute(
+                "INSERT INTO zadachi (id, title, description, branch, status) "
+                "VALUES ('w1', 'Test', 'Desc', 'feature/w1', 'pending')"
+            )
+            await conn.commit()
+
+        # Open via maestro Database — triggers initialize_schema + migrations
+        db = Database(db_path)
+        await db.connect()
+        try:
+            assert db._connection is not None
+            # zadachi gone, workstreams present
+            cursor = await db._connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name IN ('zadachi', 'workstreams')"
+            )
+            tables = {row["name"] for row in await cursor.fetchall()}
+            assert tables == {"workstreams"}
+
+            # Data preserved
+            cursor = await db._connection.execute("SELECT id, status FROM workstreams")
+            rows = await cursor.fetchall()
+            assert len(rows) == 1
+            assert rows[0]["id"] == "w1"
+            assert rows[0]["status"] == "pending"
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_migration_is_noop_on_fresh_db(self, tmp_path) -> None:
+        """Fresh DB (workstreams created by SCHEMA_SQL) skips the rename."""
+        from maestro.database import Database
+
+        db = Database(tmp_path / "fresh.db")
+        await db.connect()
+        try:
+            assert db._connection is not None
+            cursor = await db._connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name IN ('zadachi', 'workstreams')"
+            )
+            tables = {row["name"] for row in await cursor.fetchall()}
+            assert "workstreams" in tables
+            assert "zadachi" not in tables
         finally:
             await db.close()

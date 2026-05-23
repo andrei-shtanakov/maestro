@@ -28,10 +28,10 @@ from maestro.database import (
     Database,
     MessageNotFoundError,
     TaskNotFoundError,
-    ZadachaNotFoundError,
+    WorkstreamNotFoundError,
     create_database,
 )
-from maestro.models import Message, TaskCost, TaskStatus, ZadachaStatus
+from maestro.models import Message, TaskCost, TaskStatus, WorkstreamStatus
 
 
 # =============================================================================
@@ -945,11 +945,11 @@ def create_app_with_lifespan(db_path: str | Path | None = None) -> FastAPI:
         )
 
     # =========================================================================
-    # Zadachi Endpoints
+    # Workstreams Endpoints
     # =========================================================================
 
-    class ZadachaResponse(BaseModel):
-        """Response model for a zadacha."""
+    class WorkstreamResponse(BaseModel):
+        """Response model for a workstream."""
 
         id: str
         title: str
@@ -965,10 +965,10 @@ def create_app_with_lifespan(db_path: str | Path | None = None) -> FastAPI:
         retry_count: int
         max_retries: int
 
-    class ZadachaListResponse(BaseModel):
-        """Response model for zadachi list."""
+    class WorkstreamListResponse(BaseModel):
+        """Response model for workstreams list."""
 
-        zadachi: list[ZadachaResponse]
+        workstreams: list[WorkstreamResponse]
         count: int
 
     class CallbackRequest(BaseModel):
@@ -989,20 +989,20 @@ def create_app_with_lifespan(db_path: str | Path | None = None) -> FastAPI:
         message: str = ""
 
     @app.get(
-        "/zadachi",
-        response_model=ZadachaListResponse,
-        tags=["Zadachi"],
+        "/workstreams",
+        response_model=WorkstreamListResponse,
+        tags=["Workstreams"],
     )
-    async def list_zadachi() -> ZadachaListResponse:
-        """Get all zadachi with their statuses."""
+    async def list_workstreams() -> WorkstreamListResponse:
+        """Get all workstreams with their statuses."""
         if _db is None:
             raise HTTPException(
                 status_code=503,
                 detail="Database not available",
             )
-        zadachi = await _db.get_all_zadachi()
+        workstreams = await _db.get_all_workstreams()
         responses = [
-            ZadachaResponse(
+            WorkstreamResponse(
                 id=z.id,
                 title=z.title,
                 description=z.description,
@@ -1017,27 +1017,27 @@ def create_app_with_lifespan(db_path: str | Path | None = None) -> FastAPI:
                 retry_count=z.retry_count,
                 max_retries=z.max_retries,
             )
-            for z in zadachi
+            for z in workstreams
         ]
-        return ZadachaListResponse(zadachi=responses, count=len(responses))
+        return WorkstreamListResponse(workstreams=responses, count=len(responses))
 
     @app.get(
-        "/zadachi/{zadacha_id}",
-        response_model=ZadachaResponse,
-        tags=["Zadachi"],
+        "/workstreams/{workstream_id}",
+        response_model=WorkstreamResponse,
+        tags=["Workstreams"],
     )
-    async def get_zadacha_detail(
-        zadacha_id: str,
-    ) -> ZadachaResponse:
-        """Get details of a specific zadacha."""
+    async def get_workstream_detail(
+        workstream_id: str,
+    ) -> WorkstreamResponse:
+        """Get details of a specific workstream."""
         if _db is None:
             raise HTTPException(
                 status_code=503,
                 detail="Database not available",
             )
         try:
-            z = await _db.get_zadacha(zadacha_id)
-            return ZadachaResponse(
+            z = await _db.get_workstream(workstream_id)
+            return WorkstreamResponse(
                 id=z.id,
                 title=z.title,
                 description=z.description,
@@ -1052,19 +1052,19 @@ def create_app_with_lifespan(db_path: str | Path | None = None) -> FastAPI:
                 retry_count=z.retry_count,
                 max_retries=z.max_retries,
             )
-        except ZadachaNotFoundError as err:
+        except WorkstreamNotFoundError as err:
             raise HTTPException(
                 status_code=404,
-                detail=f"Zadacha '{zadacha_id}' not found",
+                detail=f"Workstream '{workstream_id}' not found",
             ) from err
 
     @app.post(
-        "/zadachi/{zadacha_id}/callback",
+        "/workstreams/{workstream_id}/callback",
         response_model=CallbackResponse,
-        tags=["Zadachi"],
+        tags=["Workstreams"],
     )
-    async def zadacha_callback(
-        zadacha_id: str,
+    async def workstream_callback(
+        workstream_id: str,
         request: CallbackRequest,
     ) -> CallbackResponse:
         """Receive callback from spec-runner process.
@@ -1078,24 +1078,24 @@ def create_app_with_lifespan(db_path: str | Path | None = None) -> FastAPI:
                 detail="Database not available",
             )
         try:
-            z = await _db.get_zadacha(zadacha_id)
+            z = await _db.get_workstream(workstream_id)
 
             note = f"{request.task_id}: {request.status}"
 
-            await _db.update_zadacha_status(
-                zadacha_id,
-                ZadachaStatus(z.status.value),
+            await _db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus(z.status.value),
                 subtask_progress=note,
             )
 
             return CallbackResponse(
                 success=True,
-                message=f"Updated {zadacha_id}",
+                message=f"Updated {workstream_id}",
             )
-        except ZadachaNotFoundError:
+        except WorkstreamNotFoundError:
             return CallbackResponse(
                 success=False,
-                message=(f"Zadacha '{zadacha_id}' not found"),
+                message=(f"Workstream '{workstream_id}' not found"),
             )
 
     return app

@@ -8,7 +8,7 @@ Maestro is an AI Agent Orchestrator with two operation modes:
 
 1. **Task Scheduler** (`maestro run`) — coordinates multiple AI coding agents (Claude Code, Codex, Aider) on tasks defined in a single YAML config. All tasks share one directory.
 
-2. **Multi-Process Orchestrator** (`maestro orchestrate`) — decomposes a project into independent work units ("zadachi"), runs each in an isolated git worktree via spec-runner, and creates PRs on completion.
+2. **Multi-Process Orchestrator** (`maestro orchestrate`) — decomposes a project into independent work units ("workstreams"), runs each in an isolated git worktree via spec-runner, and creates PRs on completion.
 
 ## Development Commands
 
@@ -21,7 +21,7 @@ uv run maestro retry <task-id> --db maestro.db
 
 # === Multi-Process Orchestrator (new mode) ===
 uv run maestro orchestrate <project.yaml>   # Run orchestrator
-uv run maestro zadachi --db maestro.db       # Show zadachi status
+uv run maestro workstreams --db maestro.db       # Show workstreams status
 uv run maestro workspaces <project.yaml>     # List active worktrees
 
 # === Tests ===
@@ -47,12 +47,12 @@ uv add --dev <package>
 ### Core modules in `maestro/`
 
 **Shared infrastructure:**
-- **models.py**: Pydantic models (Task, TaskStatus, Zadacha, ZadachaStatus, OrchestratorConfig)
+- **models.py**: Pydantic models (Task, TaskStatus, Workstream, WorkstreamStatus, OrchestratorConfig)
 - **config.py**: YAML parsing with defaults merging, env var substitution, `load_orchestrator_config()`
-- **database.py**: SQLite layer with async CRUD, WAL mode (tasks + zadachi tables)
+- **database.py**: SQLite layer with async CRUD, WAL mode (tasks + workstreams tables)
 - **dag.py**: DAG building, cycle detection, topological sort, scope overlap warnings
 - **git.py**: Git operations (branch, rebase, push, worktree, merge)
-- **cli.py**: Typer CLI (run, status, retry, stop, approve, orchestrate, zadachi, workspaces)
+- **cli.py**: Typer CLI (run, status, retry, stop, approve, orchestrate, workstreams, workspaces)
 - **scheduler.py**: Main scheduler loop — polls DAG, spawns agents, monitors completion
 - **validator.py**: Post-task validation (run validation_cmd)
 - **retry.py**: Exponential backoff retry logic with jitter
@@ -63,12 +63,12 @@ uv add --dev <package>
 **Multi-process orchestration (new):**
 - **orchestrator.py**: Main async loop — decompose, spawn, monitor, PR creation
 - **workspace.py**: Git worktree lifecycle (create, setup, cleanup)
-- **decomposer.py**: Project decomposition via Claude CLI into zadachi + spec generation
+- **decomposer.py**: Project decomposition via Claude CLI into workstreams + spec generation
 - **pr_manager.py**: GitHub PR creation via `gh` CLI
 
 **Subpackages:**
 - **spawners/**: AgentSpawner ABC + implementations (claude_code, codex, aider, announce) + registry
-- **coordination/**: MCP server (FastMCP) + REST API (FastAPI) with /zadachi endpoints
+- **coordination/**: MCP server (FastMCP) + REST API (FastAPI) with /workstreams endpoints
 - **notifications/**: Desktop notifications (macOS/Linux)
 - **dashboard/**: Web UI with DAG visualization (Mermaid.js) + SSE updates
 
@@ -82,7 +82,7 @@ PENDING -> READY -> RUNNING -> VALIDATING -> DONE
                NEEDS_REVIEW -> (manual) -> READY
 ```
 
-### Zadacha State Machine (orchestrator mode)
+### Workstream State Machine (orchestrator mode)
 
 ```
 PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
@@ -95,11 +95,11 @@ PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
 ### Key Design Decisions
 
 - **Two modes**: Scheduler for single-process tasks, Orchestrator for multi-process isolation
-- **Workspace isolation**: git worktree per zadacha (lightweight, shares .git)
-- **Two-level hierarchy**: Orchestrator manages zadachi, spec-runner manages subtasks within each
-- **Git strategy**: `feature/<zadacha-id>` branch per zadacha, subtask branches merge into it, then PR to main
+- **Workspace isolation**: git worktree per workstream (lightweight, shares .git)
+- **Two-level hierarchy**: Orchestrator manages workstreams, spec-runner manages subtasks within each
+- **Git strategy**: `feature/<workstream-id>` branch per workstream, subtask branches merge into it, then PR to main
 - **Communication**: REST API callbacks from spec-runner (state file polling deprecated)
-- **Conflict prevention**: Zadachi define `scope` (file/dir globs), decomposer validates non-overlap
+- **Conflict prevention**: Workstreams define `scope` (file/dir globs), decomposer validates non-overlap
 - **Storage**: SQLite (single file, no external services)
 - **Spec-runner**: External package (PyPI) handles subtask execution within a worktree
 
@@ -107,8 +107,8 @@ PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
 
 ```
 1. Load project.yaml
-2. Decompose project into zadachi (Claude CLI or manual config)
-3. For each ready zadacha:
+2. Decompose project into workstreams (Claude CLI or manual config)
+3. For each ready workstream:
    a. Create git worktree + branch
    b. Generate spec/tasks.md via Claude CLI (read-only tools)
    c. Write spec-runner.config.yaml

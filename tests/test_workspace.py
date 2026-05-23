@@ -46,13 +46,13 @@ class TestCreateWorkspace:
     ) -> None:
         """Test that create_workspace creates a worktree directory."""
         result = workspace_mgr.create_workspace(
-            "zadacha-001",
-            "agent/zadacha-001",
+            "workstream-001",
+            "agent/workstream-001",
         )
 
         assert result.exists()
         assert result.is_dir()
-        assert result.name == "zadacha-001"
+        assert result.name == "workstream-001"
         # The worktree should contain the repo files
         assert (result / "README.md").exists()
 
@@ -63,11 +63,11 @@ class TestCreateWorkspace:
     ) -> None:
         """Test that create_workspace returns path under workspace_base."""
         result = workspace_mgr.create_workspace(
-            "zadacha-002",
-            "agent/zadacha-002",
+            "workstream-002",
+            "agent/workstream-002",
         )
 
-        expected = workspace_mgr.workspace_base / "zadacha-002"
+        expected = workspace_mgr.workspace_base / "workstream-002"
         assert result == expected
 
     @pytest.mark.integration
@@ -77,7 +77,7 @@ class TestCreateWorkspace:
     ) -> None:
         """Test that creating a workspace in an existing dir raises error."""
         # Create the directory manually so it already exists
-        workspace_path = workspace_mgr.workspace_base / "zadacha-dup"
+        workspace_path = workspace_mgr.workspace_base / "workstream-dup"
         workspace_path.mkdir(parents=True)
 
         with pytest.raises(
@@ -85,8 +85,8 @@ class TestCreateWorkspace:
             match="already exists",
         ):
             workspace_mgr.create_workspace(
-                "zadacha-dup",
-                "agent/zadacha-dup",
+                "workstream-dup",
+                "agent/workstream-dup",
             )
 
     @pytest.mark.integration
@@ -107,8 +107,8 @@ class TestCreateWorkspace:
             ),
         ):
             workspace_mgr.create_workspace(
-                "zadacha-fail",
-                "agent/zadacha-fail",
+                "workstream-fail",
+                "agent/workstream-fail",
             )
 
     @pytest.mark.integration
@@ -120,8 +120,8 @@ class TestCreateWorkspace:
         assert not workspace_mgr.workspace_base.exists()
 
         workspace_mgr.create_workspace(
-            "zadacha-first",
-            "agent/zadacha-first",
+            "workstream-first",
+            "agent/workstream-first",
         )
 
         assert workspace_mgr.workspace_base.exists()
@@ -142,8 +142,8 @@ class TestSetupSpecRunner:
     ) -> None:
         """Test that setup_spec_runner writes executor.config.yaml."""
         workspace_path = workspace_mgr.create_workspace(
-            "zadacha-spec",
-            "agent/zadacha-spec",
+            "workstream-spec",
+            "agent/workstream-spec",
         )
         config = {"mode": "test", "timeout": 60}
 
@@ -163,8 +163,8 @@ class TestSetupSpecRunner:
     ) -> None:
         """Test that setup_spec_runner creates spec/ directory."""
         workspace_path = workspace_mgr.create_workspace(
-            "zadacha-specdir",
-            "agent/zadacha-specdir",
+            "workstream-specdir",
+            "agent/workstream-specdir",
         )
 
         workspace_mgr.setup_spec_runner(workspace_path, {"key": "value"})
@@ -193,8 +193,8 @@ class TestSetupSpecRunner:
     ) -> None:
         """Test that calling setup_spec_runner twice doesn't fail."""
         workspace_path = workspace_mgr.create_workspace(
-            "zadacha-idem",
-            "agent/zadacha-idem",
+            "workstream-idem",
+            "agent/workstream-idem",
         )
         config = {"run": True}
 
@@ -221,14 +221,14 @@ class TestCleanupWorkspace:
     ) -> None:
         """Test that cleanup_workspace removes the worktree directory."""
         workspace_mgr.create_workspace(
-            "zadacha-clean",
-            "agent/zadacha-clean",
+            "workstream-clean",
+            "agent/workstream-clean",
         )
-        assert workspace_mgr.workspace_exists("zadacha-clean")
+        assert workspace_mgr.workspace_exists("workstream-clean")
 
-        workspace_mgr.cleanup_workspace("zadacha-clean")
+        workspace_mgr.cleanup_workspace("workstream-clean")
 
-        assert not workspace_mgr.workspace_exists("zadacha-clean")
+        assert not workspace_mgr.workspace_exists("workstream-clean")
 
     def test_cleanup_workspace_already_cleaned_noop(
         self,
@@ -245,8 +245,8 @@ class TestCleanupWorkspace:
     ) -> None:
         """Test that cleanup falls back to shutil when git remove fails."""
         workspace_path = workspace_mgr.create_workspace(
-            "zadacha-fallback",
-            "agent/zadacha-fallback",
+            "workstream-fallback",
+            "agent/workstream-fallback",
         )
         assert workspace_path.exists()
 
@@ -261,7 +261,7 @@ class TestCleanupWorkspace:
                 "prune_worktrees",
             ) as mock_prune,
         ):
-            workspace_mgr.cleanup_workspace("zadacha-fallback")
+            workspace_mgr.cleanup_workspace("workstream-fallback")
 
         # shutil.rmtree should have removed it
         assert not workspace_path.exists()
@@ -283,11 +283,11 @@ class TestGetWorkspacePath:
     ) -> None:
         """Test get_workspace_path returns correct path for existing workspace."""
         created = workspace_mgr.create_workspace(
-            "zadacha-get",
-            "agent/zadacha-get",
+            "workstream-get",
+            "agent/workstream-get",
         )
 
-        result = workspace_mgr.get_workspace_path("zadacha-get")
+        result = workspace_mgr.get_workspace_path("workstream-get")
 
         assert result == created
         assert result.exists()
@@ -319,18 +319,18 @@ class TestWorkspaceExists:
     ) -> None:
         """Test workspace_exists returns True for existing workspace."""
         workspace_mgr.create_workspace(
-            "zadacha-exists",
-            "agent/zadacha-exists",
+            "workstream-exists",
+            "agent/workstream-exists",
         )
 
-        assert workspace_mgr.workspace_exists("zadacha-exists") is True
+        assert workspace_mgr.workspace_exists("workstream-exists") is True
 
     def test_workspace_exists_false(
         self,
         workspace_mgr: WorkspaceManager,
     ) -> None:
         """Test workspace_exists returns False for absent workspace."""
-        assert workspace_mgr.workspace_exists("no-such-zadacha") is False
+        assert workspace_mgr.workspace_exists("no-such-workstream") is False
 
 
 # =============================================================================
@@ -354,14 +354,14 @@ class TestListWorkspaces:
         workspace_mgr: WorkspaceManager,
     ) -> None:
         """Test list_workspaces returns existing workspace directories."""
-        workspace_mgr.create_workspace("zadacha-a", "agent/zadacha-a")
-        workspace_mgr.create_workspace("zadacha-b", "agent/zadacha-b")
+        workspace_mgr.create_workspace("workstream-a", "agent/workstream-a")
+        workspace_mgr.create_workspace("workstream-b", "agent/workstream-b")
 
         workspaces = workspace_mgr.list_workspaces()
 
         names = [w.name for w in workspaces]
-        assert "zadacha-a" in names
-        assert "zadacha-b" in names
+        assert "workstream-a" in names
+        assert "workstream-b" in names
         assert len(workspaces) == 2
 
     def test_list_workspaces_base_not_exists(
@@ -386,7 +386,7 @@ class TestListWorkspaces:
         workspace_mgr: WorkspaceManager,
     ) -> None:
         """Test that list_workspaces skips directories starting with dot."""
-        workspace_mgr.create_workspace("zadacha-vis", "agent/zadacha-vis")
+        workspace_mgr.create_workspace("workstream-vis", "agent/workstream-vis")
 
         # Create a hidden directory manually
         hidden = workspace_mgr.workspace_base / ".hidden"
@@ -395,7 +395,7 @@ class TestListWorkspaces:
         workspaces = workspace_mgr.list_workspaces()
 
         names = [w.name for w in workspaces]
-        assert "zadacha-vis" in names
+        assert "workstream-vis" in names
         assert ".hidden" not in names
 
     @pytest.mark.integration
@@ -404,9 +404,9 @@ class TestListWorkspaces:
         workspace_mgr: WorkspaceManager,
     ) -> None:
         """Test that list_workspaces returns directories in sorted order."""
-        workspace_mgr.create_workspace("zadacha-c", "agent/zadacha-c")
-        workspace_mgr.create_workspace("zadacha-a", "agent/zadacha-a")
-        workspace_mgr.create_workspace("zadacha-b", "agent/zadacha-b")
+        workspace_mgr.create_workspace("workstream-c", "agent/workstream-c")
+        workspace_mgr.create_workspace("workstream-a", "agent/workstream-a")
+        workspace_mgr.create_workspace("workstream-b", "agent/workstream-b")
 
         workspaces = workspace_mgr.list_workspaces()
         names = [w.name for w in workspaces]
@@ -428,16 +428,16 @@ class TestCleanupAll:
         workspace_mgr: WorkspaceManager,
     ) -> None:
         """Test that cleanup_all removes every workspace."""
-        workspace_mgr.create_workspace("zadacha-x", "agent/zadacha-x")
-        workspace_mgr.create_workspace("zadacha-y", "agent/zadacha-y")
+        workspace_mgr.create_workspace("workstream-x", "agent/workstream-x")
+        workspace_mgr.create_workspace("workstream-y", "agent/workstream-y")
 
         assert len(workspace_mgr.list_workspaces()) == 2
 
         workspace_mgr.cleanup_all()
 
         assert len(workspace_mgr.list_workspaces()) == 0
-        assert not workspace_mgr.workspace_exists("zadacha-x")
-        assert not workspace_mgr.workspace_exists("zadacha-y")
+        assert not workspace_mgr.workspace_exists("workstream-x")
+        assert not workspace_mgr.workspace_exists("workstream-y")
 
     def test_cleanup_all_empty_is_noop(
         self,

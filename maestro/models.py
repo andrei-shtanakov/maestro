@@ -3,7 +3,7 @@
 This module defines the core data models for task configuration, runtime state,
 and project configuration. It includes the TaskStatus enum with valid state
 transitions and comprehensive validation. Also defines models for multi-process
-orchestration with zadachi (independent work units).
+orchestration with workstreams (independent work units).
 """
 
 import re
@@ -863,13 +863,13 @@ class Message(BaseModel):
 
 
 class WorkspaceType(StrEnum):
-    """Workspace isolation strategy for zadachi."""
+    """Workspace isolation strategy for workstreams."""
 
     WORKTREE = "worktree"
 
 
-class ZadachaStatus(StrEnum):
-    """Zadacha execution status with valid state transitions.
+class WorkstreamStatus(StrEnum):
+    """Workstream execution status with valid state transitions.
 
     State machine:
         PENDING → DECOMPOSING → READY → RUNNING → MERGING → PR_CREATED → DONE
@@ -895,7 +895,7 @@ class ZadachaStatus(StrEnum):
     @classmethod
     def valid_transitions(
         cls,
-    ) -> dict["ZadachaStatus", set["ZadachaStatus"]]:
+    ) -> dict["WorkstreamStatus", set["WorkstreamStatus"]]:
         """Return the mapping of valid state transitions."""
         return {
             cls.PENDING: {cls.DECOMPOSING, cls.READY},
@@ -910,31 +910,31 @@ class ZadachaStatus(StrEnum):
             cls.ABANDONED: set(),
         }
 
-    def can_transition_to(self, target: "ZadachaStatus") -> bool:
+    def can_transition_to(self, target: "WorkstreamStatus") -> bool:
         """Check if transition to target status is valid."""
         return target in self.valid_transitions().get(self, set())
 
     def is_terminal(self) -> bool:
         """Check if this is a terminal state."""
-        return self in (ZadachaStatus.DONE, ZadachaStatus.ABANDONED)
+        return self in (WorkstreamStatus.DONE, WorkstreamStatus.ABANDONED)
 
 
-class ZadachaConfig(BaseModel):
-    """Configuration for a single zadacha (independent work unit).
+class WorkstreamConfig(BaseModel):
+    """Configuration for a single workstream (independent work unit).
 
     Used in YAML config or produced by auto-decomposition.
     """
 
-    id: str = Field(..., min_length=1, description="Unique zadacha identifier")
+    id: str = Field(..., min_length=1, description="Unique workstream identifier")
     title: str = Field(..., min_length=1, description="Human-readable title")
     description: str = Field(..., min_length=1, description="Detailed description")
     scope: list[str] = Field(
         default_factory=list,
-        description="File/directory globs this zadacha owns",
+        description="File/directory globs this workstream owns",
     )
     depends_on: list[str] = Field(
         default_factory=list,
-        description="IDs of zadachi this one depends on",
+        description="IDs of workstreams this one depends on",
     )
     priority: int = Field(
         default=0,
@@ -946,10 +946,10 @@ class ZadachaConfig(BaseModel):
     @field_validator("id")
     @classmethod
     def validate_id_format(cls, v: str) -> str:
-        """Validate zadacha ID format."""
+        """Validate workstream ID format."""
         if not re.match(r"^[a-zA-Z0-9_-]+$", v):
             msg = (
-                "Zadacha ID must contain only alphanumeric "
+                "Workstream ID must contain only alphanumeric "
                 "characters, hyphens, and underscores"
             )
             raise ValueError(msg)
@@ -977,36 +977,36 @@ class ZadachaConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_no_self_dependency(self) -> Self:
-        """Ensure zadacha does not depend on itself."""
+        """Ensure workstream does not depend on itself."""
         if self.id in self.depends_on:
-            msg = f"Zadacha '{self.id}' cannot depend on itself"
+            msg = f"Workstream '{self.id}' cannot depend on itself"
             raise ValueError(msg)
         return self
 
 
-class Zadacha(BaseModel):
-    """Runtime zadacha model with execution state.
+class Workstream(BaseModel):
+    """Runtime workstream model with execution state.
 
-    A zadacha is an independent work unit that runs in its own
+    A workstream is an independent work unit that runs in its own
     git worktree via spec-runner.
     """
 
-    id: str = Field(..., min_length=1, description="Unique zadacha identifier")
+    id: str = Field(..., min_length=1, description="Unique workstream identifier")
     title: str = Field(..., min_length=1, description="Human-readable title")
     description: str = Field(..., min_length=1, description="Detailed description")
     branch: str = Field(..., min_length=1, description="Git branch name")
     workspace_path: str | None = Field(default=None, description="Path to git worktree")
-    status: ZadachaStatus = Field(
-        default=ZadachaStatus.PENDING,
+    status: WorkstreamStatus = Field(
+        default=WorkstreamStatus.PENDING,
         description="Current execution status",
     )
     scope: list[str] = Field(
         default_factory=list,
-        description="File/directory globs this zadacha owns",
+        description="File/directory globs this workstream owns",
     )
     depends_on: list[str] = Field(
         default_factory=list,
-        description="IDs of zadachi this one depends on",
+        description="IDs of workstreams this one depends on",
     )
     priority: int = Field(default=0, description="Execution priority")
     process_pid: int | None = Field(
@@ -1032,12 +1032,12 @@ class Zadacha(BaseModel):
         default=None, description="Completion timestamp"
     )
 
-    def can_transition_to(self, target: ZadachaStatus) -> bool:
+    def can_transition_to(self, target: WorkstreamStatus) -> bool:
         """Check if transition to target status is valid."""
         return self.status.can_transition_to(target)
 
-    def transition_to(self, target: ZadachaStatus) -> "Zadacha":
-        """Create a new Zadacha with the target status.
+    def transition_to(self, target: WorkstreamStatus) -> "Workstream":
+        """Create a new Workstream with the target status.
 
         Raises:
             ValueError: If the transition is not valid.
@@ -1046,16 +1046,16 @@ class Zadacha(BaseModel):
             msg = f"Invalid transition from {self.status.value} to {target.value}"
             raise ValueError(msg)
 
-        updates: dict[str, datetime | ZadachaStatus] = {"status": target}
+        updates: dict[str, datetime | WorkstreamStatus] = {"status": target}
 
-        if target == ZadachaStatus.RUNNING and self.started_at is None:
+        if target == WorkstreamStatus.RUNNING and self.started_at is None:
             updates["started_at"] = datetime.now(UTC)
 
         if (
             target
             in (
-                ZadachaStatus.DONE,
-                ZadachaStatus.ABANDONED,
+                WorkstreamStatus.DONE,
+                WorkstreamStatus.ABANDONED,
             )
             and self.started_at
         ):
@@ -1064,16 +1064,16 @@ class Zadacha(BaseModel):
         return self.model_copy(update=updates)
 
     def can_retry(self) -> bool:
-        """Check if zadacha can be retried."""
+        """Check if workstream can be retried."""
         return self.retry_count < self.max_retries
 
     @classmethod
     def from_config(
         cls,
-        config: ZadachaConfig,
+        config: WorkstreamConfig,
         branch_prefix: str = "feature/",
-    ) -> "Zadacha":
-        """Create a Zadacha from a ZadachaConfig."""
+    ) -> "Workstream":
+        """Create a Workstream from a WorkstreamConfig."""
         return cls(
             id=config.id,
             title=config.title,
@@ -1254,24 +1254,24 @@ class OrchestratorConfig(BaseModel):
         default=3,
         ge=1,
         le=100,
-        description="Max concurrent zadachi (1-100)",
+        description="Max concurrent workstreams (1-100)",
     )
     base_branch: str = Field(default="main", description="Base branch name")
     branch_prefix: str = Field(
         default="feature/",
-        description="Prefix for zadacha branches",
+        description="Prefix for workstream branches",
     )
     auto_pr: bool = Field(
         default=True,
-        description="Auto-create PR after zadacha completes",
+        description="Auto-create PR after workstream completes",
     )
     spec_runner: SpecRunnerConfig = Field(
         default_factory=SpecRunnerConfig,
         description="Spec-runner configuration",
     )
-    zadachi: list[ZadachaConfig] = Field(
+    workstreams: list[WorkstreamConfig] = Field(
         default_factory=list,
-        description="Manual zadachi list (auto-decompose if empty)",
+        description="Manual workstreams list (auto-decompose if empty)",
     )
     callback_url: str = Field(
         default="",
@@ -1307,22 +1307,22 @@ class OrchestratorConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def validate_unique_zadacha_ids(self) -> Self:
-        """Ensure all zadacha IDs are unique."""
-        ids = [z.id for z in self.zadachi]
+    def validate_unique_workstream_ids(self) -> Self:
+        """Ensure all workstream IDs are unique."""
+        ids = [z.id for z in self.workstreams]
         if len(ids) != len(set(ids)):
             duplicates = [i for i in ids if ids.count(i) > 1]
-            msg = f"Duplicate zadacha IDs: {set(duplicates)}"
+            msg = f"Duplicate workstream IDs: {set(duplicates)}"
             raise ValueError(msg)
         return self
 
     @model_validator(mode="after")
-    def validate_zadacha_dependencies_exist(self) -> Self:
-        """Ensure all zadacha dependencies reference existing IDs."""
-        ids = {z.id for z in self.zadachi}
-        for z in self.zadachi:
+    def validate_workstream_dependencies_exist(self) -> Self:
+        """Ensure all workstream dependencies reference existing IDs."""
+        ids = {z.id for z in self.workstreams}
+        for z in self.workstreams:
             missing = set(z.depends_on) - ids
             if missing:
-                msg = f"Zadacha '{z.id}' has unknown dependencies: {missing}"
+                msg = f"Workstream '{z.id}' has unknown dependencies: {missing}"
                 raise ValueError(msg)
         return self

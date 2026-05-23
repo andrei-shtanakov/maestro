@@ -1,7 +1,7 @@
 """GitHub PR management for multi-process orchestration.
 
 This module provides PRManager for creating pull requests
-via the GitHub CLI (gh) after zadachi complete.
+via the GitHub CLI (gh) after workstreams complete.
 """
 
 import logging
@@ -22,8 +22,8 @@ class GHNotFoundError(PRManagerError):
 class PRManager:
     """Manages GitHub pull request creation via gh CLI.
 
-    Creates PRs from zadacha branches to the base branch
-    after all subtasks in a zadacha are complete.
+    Creates PRs from workstream branches to the base branch
+    after all subtasks in a workstream are complete.
     """
 
     def __init__(

@@ -13,7 +13,7 @@ from maestro.decomposer import (
     ScopeOverlapWarning,
     _patterns_overlap,
 )
-from maestro.models import ZadachaConfig
+from maestro.models import WorkstreamConfig
 
 
 # =============================================================================
@@ -21,19 +21,19 @@ from maestro.models import ZadachaConfig
 # =============================================================================
 
 
-def _make_zadacha_json(
-    zadachi: list[dict[str, object]] | None = None,
+def _make_workstream_json(
+    workstreams: list[dict[str, object]] | None = None,
 ) -> str:
-    """Build a valid JSON response with zadachi.
+    """Build a valid JSON response with workstreams.
 
     Args:
-        zadachi: Optional list of zadacha dicts.
+        workstreams: Optional list of workstream dicts.
 
     Returns:
-        JSON string containing the zadachi array.
+        JSON string containing the workstreams array.
     """
-    if zadachi is None:
-        zadachi = [
+    if workstreams is None:
+        workstreams = [
             {
                 "id": "auth-module",
                 "title": "Authentication Module",
@@ -51,7 +51,7 @@ def _make_zadacha_json(
                 "priority": 60,
             },
         ]
-    return json.dumps(zadachi)
+    return json.dumps(workstreams)
 
 
 def _make_spec_response() -> str:
@@ -136,11 +136,11 @@ class TestDecompose:
     """Tests for the decompose method."""
 
     @patch("maestro.decomposer.subprocess.run")
-    def test_decompose_returns_zadachi_from_valid_json(
+    def test_decompose_returns_workstreams_from_valid_json(
         self, mock_run: MagicMock, temp_dir: Path
     ) -> None:
-        """Test decompose parses valid JSON into ZadachaConfig list."""
-        valid_json = _make_zadacha_json()
+        """Test decompose parses valid JSON into WorkstreamConfig list."""
+        valid_json = _make_workstream_json()
         # First call: _get_repo_tree (find), second call: _run_claude
         mock_run.side_effect = [
             _make_subprocess_result(stdout=".\n./src\n./tests\n"),
@@ -152,7 +152,7 @@ class TestDecompose:
 
         assert isinstance(result, list)
         assert len(result) == 2
-        assert all(isinstance(z, ZadachaConfig) for z in result)
+        assert all(isinstance(z, WorkstreamConfig) for z in result)
         assert result[0].id == "auth-module"
         assert result[1].id == "api-endpoints"
 
@@ -162,7 +162,7 @@ class TestDecompose:
     ) -> None:
         """Test decompose extracts JSON from markdown code blocks."""
         wrapped = (
-            "Here is the decomposition:\n```json\n" + _make_zadacha_json() + "\n```"
+            "Here is the decomposition:\n```json\n" + _make_workstream_json() + "\n```"
         )
         mock_run.side_effect = [
             _make_subprocess_result(stdout=".\n./src\n"),
@@ -235,23 +235,25 @@ class TestDecompose:
 
         decomposer = ProjectDecomposer(temp_dir)
 
-        with pytest.raises(DecomposerError, match="Decomposition produced no zadachi"):
+        with pytest.raises(
+            DecomposerError, match="Decomposition produced no workstreams"
+        ):
             decomposer.decompose("Build a web app")
 
     @patch("maestro.decomposer.subprocess.run")
-    def test_decompose_raises_on_invalid_zadacha_fields(
+    def test_decompose_raises_on_invalid_workstream_fields(
         self, mock_run: MagicMock, temp_dir: Path
     ) -> None:
-        """Test decompose raises DecomposerError on invalid zadacha fields."""
-        bad_zadachi = json.dumps([{"id": "", "title": "T", "description": "D"}])
+        """Test decompose raises DecomposerError on invalid workstream fields."""
+        bad_workstreams = json.dumps([{"id": "", "title": "T", "description": "D"}])
         mock_run.side_effect = [
             _make_subprocess_result(stdout=".\n"),
-            _make_subprocess_result(stdout=bad_zadachi),
+            _make_subprocess_result(stdout=bad_workstreams),
         ]
 
         decomposer = ProjectDecomposer(temp_dir)
 
-        with pytest.raises(DecomposerError, match="Failed to validate zadachi"):
+        with pytest.raises(DecomposerError, match="Failed to validate workstreams"):
             decomposer.decompose("Build a web app")
 
     @patch("maestro.decomposer.subprocess.run")
@@ -289,7 +291,7 @@ class TestDecompose:
         self, mock_run: MagicMock, temp_dir: Path
     ) -> None:
         """Test decompose preserves dependency information."""
-        valid_json = _make_zadacha_json()
+        valid_json = _make_workstream_json()
         mock_run.side_effect = [
             _make_subprocess_result(stdout=".\n"),
             _make_subprocess_result(stdout=valid_json),
@@ -306,7 +308,7 @@ class TestDecompose:
         self, mock_run: MagicMock, temp_dir: Path
     ) -> None:
         """Test decompose preserves priority values."""
-        valid_json = _make_zadacha_json()
+        valid_json = _make_workstream_json()
         mock_run.side_effect = [
             _make_subprocess_result(stdout=".\n"),
             _make_subprocess_result(stdout=valid_json),
@@ -336,7 +338,7 @@ class TestGenerateSpec:
             stdout=_make_spec_response(),
         )
 
-        zadacha = ZadachaConfig(
+        workstream = WorkstreamConfig(
             id="auth-module",
             title="Authentication Module",
             description="Implement user authentication",
@@ -346,7 +348,7 @@ class TestGenerateSpec:
         workspace.mkdir()
 
         decomposer = ProjectDecomposer(temp_dir)
-        decomposer.generate_spec(zadacha, workspace)
+        decomposer.generate_spec(workstream, workspace)
 
         spec_dir = workspace / "spec"
         assert spec_dir.is_dir()
@@ -361,7 +363,7 @@ class TestGenerateSpec:
             stdout=_make_spec_response(),
         )
 
-        zadacha = ZadachaConfig(
+        workstream = WorkstreamConfig(
             id="auth-module",
             title="Authentication Module",
             description="Implement user authentication",
@@ -371,7 +373,7 @@ class TestGenerateSpec:
         workspace.mkdir()
 
         decomposer = ProjectDecomposer(temp_dir)
-        decomposer.generate_spec(zadacha, workspace)
+        decomposer.generate_spec(workstream, workspace)
 
         spec_dir = workspace / "spec"
         tasks_text = (spec_dir / "tasks.md").read_text()
@@ -388,7 +390,7 @@ class TestGenerateSpec:
             stderr="Error: something went wrong",
         )
 
-        zadacha = ZadachaConfig(
+        workstream = WorkstreamConfig(
             id="auth-module",
             title="Authentication Module",
             description="Implement user authentication",
@@ -400,7 +402,7 @@ class TestGenerateSpec:
         decomposer = ProjectDecomposer(temp_dir)
 
         with pytest.raises(DecomposerError, match="Claude CLI failed"):
-            decomposer.generate_spec(zadacha, workspace)
+            decomposer.generate_spec(workstream, workspace)
 
     @patch("maestro.decomposer.subprocess.run")
     def test_generate_spec_fallback_when_no_markers(
@@ -411,7 +413,7 @@ class TestGenerateSpec:
             stdout="Some plain text response without file markers.\n",
         )
 
-        zadacha = ZadachaConfig(
+        workstream = WorkstreamConfig(
             id="auth-module",
             title="Authentication Module",
             description="Implement user authentication",
@@ -421,7 +423,7 @@ class TestGenerateSpec:
         workspace.mkdir()
 
         decomposer = ProjectDecomposer(temp_dir)
-        decomposer.generate_spec(zadacha, workspace)
+        decomposer.generate_spec(workstream, workspace)
 
         spec_dir = workspace / "spec"
         assert (spec_dir / "tasks.md").exists()
@@ -437,7 +439,7 @@ class TestGenerateSpec:
             stdout=_make_spec_response(),
         )
 
-        zadacha = ZadachaConfig(
+        workstream = WorkstreamConfig(
             id="auth-module",
             title="Authentication Module",
             description="Implement user authentication",
@@ -447,7 +449,7 @@ class TestGenerateSpec:
         workspace.mkdir()
 
         decomposer = ProjectDecomposer(temp_dir)
-        decomposer.generate_spec(zadacha, workspace)
+        decomposer.generate_spec(workstream, workspace)
 
         assert (workspace / "spec").is_dir()
 
@@ -458,7 +460,7 @@ class TestGenerateSpec:
         """Test generate_spec raises DecomposerError on timeout."""
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=["claude"], timeout=600)
 
-        zadacha = ZadachaConfig(
+        workstream = WorkstreamConfig(
             id="auth-module",
             title="Authentication Module",
             description="Implement user authentication",
@@ -470,7 +472,7 @@ class TestGenerateSpec:
         decomposer = ProjectDecomposer(temp_dir)
 
         with pytest.raises(DecomposerError, match="timed out"):
-            decomposer.generate_spec(zadacha, workspace)
+            decomposer.generate_spec(workstream, workspace)
 
 
 # =============================================================================
@@ -483,20 +485,20 @@ class TestValidateNonOverlap:
 
     def test_non_overlapping_scopes_returns_no_warnings(self) -> None:
         """Test that non-overlapping scopes produce no warnings."""
-        zadachi = [
-            ZadachaConfig(
+        workstreams = [
+            WorkstreamConfig(
                 id="frontend",
                 title="Frontend",
                 description="Build frontend",
                 scope=["src/frontend/**"],
             ),
-            ZadachaConfig(
+            WorkstreamConfig(
                 id="backend",
                 title="Backend",
                 description="Build backend",
                 scope=["src/backend/**"],
             ),
-            ZadachaConfig(
+            WorkstreamConfig(
                 id="tests",
                 title="Tests",
                 description="Write tests",
@@ -504,20 +506,20 @@ class TestValidateNonOverlap:
             ),
         ]
 
-        warnings = ProjectDecomposer.validate_non_overlap(zadachi)
+        warnings = ProjectDecomposer.validate_non_overlap(workstreams)
 
         assert warnings == []
 
     def test_overlapping_scopes_returns_warnings(self) -> None:
         """Test that overlapping scopes produce correct warnings."""
-        zadachi = [
-            ZadachaConfig(
+        workstreams = [
+            WorkstreamConfig(
                 id="auth",
                 title="Auth",
                 description="Authentication",
                 scope=["src/**"],
             ),
-            ZadachaConfig(
+            WorkstreamConfig(
                 id="api",
                 title="API",
                 description="API endpoints",
@@ -525,23 +527,23 @@ class TestValidateNonOverlap:
             ),
         ]
 
-        warnings = ProjectDecomposer.validate_non_overlap(zadachi)
+        warnings = ProjectDecomposer.validate_non_overlap(workstreams)
 
         assert len(warnings) == 1
         assert isinstance(warnings[0], ScopeOverlapWarning)
-        assert warnings[0].zadacha_a == "auth"
-        assert warnings[0].zadacha_b == "api"
+        assert warnings[0].workstream_a == "auth"
+        assert warnings[0].workstream_b == "api"
 
     def test_empty_scopes_returns_no_warnings(self) -> None:
         """Test that empty scopes produce no warnings."""
-        zadachi = [
-            ZadachaConfig(
+        workstreams = [
+            WorkstreamConfig(
                 id="task-a",
                 title="Task A",
                 description="First task",
                 scope=[],
             ),
-            ZadachaConfig(
+            WorkstreamConfig(
                 id="task-b",
                 title="Task B",
                 description="Second task",
@@ -549,14 +551,14 @@ class TestValidateNonOverlap:
             ),
         ]
 
-        warnings = ProjectDecomposer.validate_non_overlap(zadachi)
+        warnings = ProjectDecomposer.validate_non_overlap(workstreams)
 
         assert warnings == []
 
-    def test_single_zadacha_returns_no_warnings(self) -> None:
-        """Test that a single zadacha produces no warnings."""
-        zadachi = [
-            ZadachaConfig(
+    def test_single_workstream_returns_no_warnings(self) -> None:
+        """Test that a single workstream produces no warnings."""
+        workstreams = [
+            WorkstreamConfig(
                 id="solo",
                 title="Solo",
                 description="Only task",
@@ -564,32 +566,32 @@ class TestValidateNonOverlap:
             ),
         ]
 
-        warnings = ProjectDecomposer.validate_non_overlap(zadachi)
+        warnings = ProjectDecomposer.validate_non_overlap(workstreams)
 
         assert warnings == []
 
     def test_empty_list_returns_no_warnings(self) -> None:
-        """Test that empty zadachi list produces no warnings."""
+        """Test that empty workstreams list produces no warnings."""
         warnings = ProjectDecomposer.validate_non_overlap([])
 
         assert warnings == []
 
     def test_multiple_overlapping_pairs(self) -> None:
         """Test detection of multiple overlapping pairs."""
-        zadachi = [
-            ZadachaConfig(
+        workstreams = [
+            WorkstreamConfig(
                 id="task-a",
                 title="Task A",
                 description="First",
                 scope=["src/**"],
             ),
-            ZadachaConfig(
+            WorkstreamConfig(
                 id="task-b",
                 title="Task B",
                 description="Second",
                 scope=["src/module/**"],
             ),
-            ZadachaConfig(
+            WorkstreamConfig(
                 id="task-c",
                 title="Task C",
                 description="Third",
@@ -597,7 +599,7 @@ class TestValidateNonOverlap:
             ),
         ]
 
-        warnings = ProjectDecomposer.validate_non_overlap(zadachi)
+        warnings = ProjectDecomposer.validate_non_overlap(workstreams)
 
         # All three pairs should overlap: A<->B, A<->C, B<->C
         assert len(warnings) == 3
@@ -605,8 +607,8 @@ class TestValidateNonOverlap:
     def test_scope_overlap_warning_str(self) -> None:
         """Test ScopeOverlapWarning string representation."""
         warning = ScopeOverlapWarning(
-            zadacha_a="auth",
-            zadacha_b="api",
+            workstream_a="auth",
+            workstream_b="api",
             overlapping_patterns=["src/** <-> src/api/**"],
         )
 
@@ -618,20 +620,20 @@ class TestValidateNonOverlap:
 
     def test_mixed_overlapping_and_non_overlapping(self) -> None:
         """Test with a mix of overlapping and non-overlapping scopes."""
-        zadachi = [
-            ZadachaConfig(
+        workstreams = [
+            WorkstreamConfig(
                 id="frontend",
                 title="Frontend",
                 description="Frontend code",
                 scope=["frontend/**"],
             ),
-            ZadachaConfig(
+            WorkstreamConfig(
                 id="backend",
                 title="Backend",
                 description="Backend code",
                 scope=["backend/**"],
             ),
-            ZadachaConfig(
+            WorkstreamConfig(
                 id="backend-extra",
                 title="Backend Extra",
                 description="More backend code",
@@ -639,11 +641,11 @@ class TestValidateNonOverlap:
             ),
         ]
 
-        warnings = ProjectDecomposer.validate_non_overlap(zadachi)
+        warnings = ProjectDecomposer.validate_non_overlap(workstreams)
 
         assert len(warnings) == 1
-        assert warnings[0].zadacha_a == "backend"
-        assert warnings[0].zadacha_b == "backend-extra"
+        assert warnings[0].workstream_a == "backend"
+        assert warnings[0].workstream_b == "backend-extra"
 
 
 # =============================================================================

@@ -27,7 +27,7 @@ from maestro.cli import (
     app,
 )
 from maestro.database import create_database
-from maestro.models import AgentType, Task, TaskStatus, Zadacha, ZadachaConfig
+from maestro.models import AgentType, Task, TaskStatus, Workstream, WorkstreamConfig
 
 
 runner = CliRunner()
@@ -52,10 +52,10 @@ def _write_orchestrator_config(base_dir: Path) -> Path:
         "repo_path": str(repo_dir),
         "workspace_base": str(workspace_dir),
         "max_concurrent": 1,
-        "zadachi": [
+        "workstreams": [
             {
                 "id": "z-new",
-                "title": "New Zadacha",
+                "title": "New Workstream",
                 "description": "Do work",
                 "scope": ["*"],
             }
@@ -68,18 +68,18 @@ def _write_orchestrator_config(base_dir: Path) -> Path:
     return config_path
 
 
-async def _seed_zadacha(db_path: Path, zadacha_id: str) -> None:
-    """Insert a zadacha record into the database."""
+async def _seed_workstream(db_path: Path, workstream_id: str) -> None:
+    """Insert a workstream record into the database."""
     db = await create_database(db_path)
     try:
-        config = ZadachaConfig(
-            id=zadacha_id,
-            title=f"Zadacha {zadacha_id}",
+        config = WorkstreamConfig(
+            id=workstream_id,
+            title=f"Workstream {workstream_id}",
             description="Existing work",
             scope=["*"],
         )
-        zadacha = Zadacha.from_config(config, branch_prefix="feature/")
-        await db.create_zadacha(zadacha)
+        workstream = Workstream.from_config(config, branch_prefix="feature/")
+        await db.create_workstream(workstream)
     finally:
         await db.close()
 
@@ -263,7 +263,9 @@ class TestOrchestratorResumeFlag:
         db_path: Path,
         resume: bool,
     ) -> None:
-        stats = SimpleNamespace(total_zadachi=0, completed=0, failed=0, prs_created=0)
+        stats = SimpleNamespace(
+            total_workstreams=0, completed=0, failed=0, prs_created=0
+        )
 
         with (
             patch("maestro.cli.GitManager") as mock_git_mgr,
@@ -293,14 +295,14 @@ class TestOrchestratorResumeFlag:
     ) -> None:
         config_path = _write_orchestrator_config(temp_dir)
         db_path = temp_dir / "state.db"
-        await _seed_zadacha(db_path, "existing")
+        await _seed_workstream(db_path, "existing")
 
         await self._run_with_patches(config_path, db_path, resume=False)
 
         db = await create_database(db_path)
         try:
-            zadachi = await db.get_all_zadachi()
-            assert zadachi == []
+            workstreams = await db.get_all_workstreams()
+            assert workstreams == []
         finally:
             await db.close()
 
@@ -311,15 +313,15 @@ class TestOrchestratorResumeFlag:
     ) -> None:
         config_path = _write_orchestrator_config(temp_dir)
         db_path = temp_dir / "state.db"
-        await _seed_zadacha(db_path, "existing")
+        await _seed_workstream(db_path, "existing")
 
         await self._run_with_patches(config_path, db_path, resume=True)
 
         db = await create_database(db_path)
         try:
-            zadachi = await db.get_all_zadachi()
-            assert len(zadachi) == 1
-            assert zadachi[0].id == "existing"
+            workstreams = await db.get_all_workstreams()
+            assert len(workstreams) == 1
+            assert workstreams[0].id == "existing"
         finally:
             await db.close()
 

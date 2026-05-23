@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.0 — Rename Zadacha → Workstream (2026-05-23)
+
+**Breaking changes** (no backward compatibility):
+- CLI: `maestro zadachi` → `maestro workstreams`
+- REST API: `/zadachi` endpoints → `/workstreams`; `/zadachi/{zadacha_id}` → `/workstreams/{workstream_id}`
+- `project.yaml`: top-level key `zadachi:` → `workstreams:`
+- DB schema: `zadachi` table → `workstreams`; `zadacha_dependencies` → `workstream_dependencies`; `zadacha_id` columns → `workstream_id`. Migration auto-applied on first run.
+- Python API: `Zadacha`, `ZadachaStatus`, `ZadachaConfig`, `ZadachaNotFoundError`, `ZadachaAlreadyExistsError` → `Workstream`, `WorkstreamStatus`, `WorkstreamConfig`, `WorkstreamNotFoundError`, `WorkstreamAlreadyExistsError`. Code that imports these symbols must update.
+
+**Motivation:** transliterated Russian word ("zadacha" / "zadachi") in identifiers was confusing for English-speaking users and code review. `Workstream` is the natural English term for the concept — a parallel independent track of work that owns its own git worktree, spec-runner subprocess, and final PR.
+
+**Scheduler-mode `Task` concept is UNAFFECTED** — only the orchestrator-mode concept was renamed.
+
+---
+
 ## v0.3.0 (2026-05-23)
 
 ### Added
@@ -87,10 +102,10 @@ First public release.
 - **Mode 1 (Task Scheduler):** DAG-based scheduling of AI coding agents
   (Claude Code, Codex, Aider) in a shared directory
 - **Mode 2 (Multi-Process Orchestrator):** Decompose projects into independent
-  zadachi, run each in isolated git worktrees via spec-runner, auto-create PRs
+  workstreams, run each in isolated git worktrees via spec-runner, auto-create PRs
 - Spawner registry with 4 built-in spawners (claude_code, codex, aider, announce)
 - SQLite state persistence with crash recovery
-- CLI: run, status, retry, stop, orchestrate, zadachi, workspaces
+- CLI: run, status, retry, stop, orchestrate, workstreams, workspaces
 - Web dashboard with DAG visualization and SSE updates
 - Desktop notifications (macOS/Linux)
 - Auto-commit per task with git diff summary
