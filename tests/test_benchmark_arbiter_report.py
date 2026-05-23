@@ -358,3 +358,96 @@ async def test_helper_does_not_catch_cancelled():
     mock_client.report_benchmark_raw = AsyncMock(side_effect=asyncio.CancelledError())
     with pytest.raises(asyncio.CancelledError):
         await report_benchmark_to_arbiter(_result(), mock_client)
+
+
+# ---------------------------------------------------------------------------
+# Task 4.6 — obs instrumentation: distinct event names per outcome
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def captured_obs_events(monkeypatch):
+    """Capture structlog log calls on arbiter_report._obs_log."""
+    events: list[dict[str, object]] = []
+
+    class _CapturingLogger:
+        def _capture(self, level: str, event: str, **kw):
+            events.append({"level": level, "event": event, **kw})
+
+        def info(self, event: str, **kw):
+            self._capture("info", event, **kw)
+
+        def warning(self, event: str, **kw):
+            self._capture("warning", event, **kw)
+
+        def error(self, event: str, **kw):
+            self._capture("error", event, **kw)
+
+        # span() calls log.info / log.error directly under the hood, so we don't
+        # need to mock obs.span itself for these tests.
+
+    import maestro.benchmark.arbiter_report as ar
+
+    monkeypatch.setattr(ar, "_obs_log", _CapturingLogger())
+    return events
+
+
+@pytest.mark.asyncio
+async def test_emits_skipped_when_client_none(captured_obs_events):
+    await report_benchmark_to_arbiter(_result(run_id="x"), None)
+    assert any(
+        e["event"] == "benchmark.report.skipped" and e.get("run_id") == "x"
+        for e in captured_obs_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_emits_succeeded_on_created(captured_obs_events):
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(
+        return_value={"status": "created", "run_id": "x"}
+    )
+    await report_benchmark_to_arbiter(_result(run_id="x"), mock_client)
+    assert any(e["event"] == "benchmark.report.succeeded" for e in captured_obs_events)
+
+
+@pytest.mark.asyncio
+async def test_emits_duplicate_on_duplicate(captured_obs_events):
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(
+        return_value={"status": "duplicate", "run_id": "x"}
+    )
+    await report_benchmark_to_arbiter(_result(run_id="x"), mock_client)
+    assert any(e["event"] == "benchmark.report.duplicate" for e in captured_obs_events)
+    # Must NOT also emit succeeded (these are mutually exclusive)
+    assert not any(
+        e["event"] == "benchmark.report.succeeded" for e in captured_obs_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_emits_contract_break_event_distinct(captured_obs_events):
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(
+        side_effect=ArbiterContractError(-32602, "missing")
+    )
+    await report_benchmark_to_arbiter(_result(run_id="x"), mock_client)
+    assert any(
+        e["event"] == "benchmark.report.contract_break" and e["level"] == "error"
+        for e in captured_obs_events
+    )
+    # Must NOT emit the generic failed event when it's a contract break
+    assert not any(e["event"] == "benchmark.report.failed" for e in captured_obs_events)
+
+
+@pytest.mark.asyncio
+async def test_emits_failed_on_unavailable_with_warning_severity(captured_obs_events):
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(side_effect=ArbiterUnavailable("x"))
+    await report_benchmark_to_arbiter(_result(run_id="x"), mock_client)
+    assert any(
+        e["event"] == "benchmark.report.failed"
+        and e["level"] == "warning"
+        and e.get("error_class") == "unavailable"
+        for e in captured_obs_events
+    )

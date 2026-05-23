@@ -20,10 +20,14 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
+from maestro._vendor import obs
 from maestro.coordination.arbiter_errors import (
     ArbiterContractError,
     ArbiterUnavailable,
 )
+
+
+_obs_log = obs.get_logger("maestro.benchmark.arbiter_report")
 
 
 if TYPE_CHECKING:
@@ -226,39 +230,61 @@ async def report_benchmark_to_arbiter(
     never mutates the input. Helper never raises except for
     ``asyncio.CancelledError`` (a ``BaseException`` that must propagate).
 
-    Status outcomes:
-    - ``client=None`` → "skipped" (no RPC, no report_error)
-    - RPC success ("created" or "duplicate") → "ok"
-    - Any failure (transient, contract, timeout, unexpected) → "failed",
-      with ``report_error`` formatted as ``"<error_class>: <details>"``.
+    Emits 5 distinct obs events (one per outcome class):
+    - ``benchmark.report.skipped`` (info) — client=None
+    - ``benchmark.report.succeeded`` (info) — RPC ok, new row created
+    - ``benchmark.report.duplicate`` (info) — RPC ok, idempotency
+    - ``benchmark.report.failed`` (warning|error) — transient or unexpected failure
+    - ``benchmark.report.contract_break`` (error) — JSON-RPC contract drift
 
-    Args:
-        result: Domain BenchmarkResult to report.
-        client: ArbiterClient (or compatible) with ``report_benchmark_raw``.
-            ``None`` skips reporting (caller did not configure arbiter).
-        max_per_task: Truncation cap for per_task list. Defaults to
-            ``REPORT_MAX_PER_TASK`` (env-overridable).
-
-    Returns:
-        Updated copy of ``result`` (input is unmodified).
+    The contract_break case has its own event NAME (not just severity)
+    so alerting rules can match by name directly.
     """
+    event_attrs = {
+        "run_id": result.run_id,
+        "benchmark_id": result.benchmark_id,
+        "agent_id": result.agent_id,
+    }
     if client is None:
+        _obs_log.info("benchmark.report.skipped", **event_attrs)
         return result.model_copy(update={"report_status": "skipped"})
 
-    try:
-        payload = _build_wire_payload(result, max_per_task)
-        await asyncio.wait_for(
-            client.report_benchmark_raw(payload.model_dump(mode="json")),
-            timeout=REPORT_TIMEOUT_S,
-        )
-        return result.model_copy(update={"report_status": "ok"})
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        error_class, details = _classify_error(exc)
-        return result.model_copy(
-            update={
-                "report_status": "failed",
-                "report_error": f"{error_class}: {details}",
-            }
-        )
+    with obs.span("benchmark.report", **event_attrs):
+        try:
+            payload = _build_wire_payload(result, max_per_task)
+            response = await asyncio.wait_for(
+                client.report_benchmark_raw(payload.model_dump(mode="json")),
+                timeout=REPORT_TIMEOUT_S,
+            )
+            status = response.get("status") if isinstance(response, dict) else None
+            if status == "duplicate":
+                _obs_log.info("benchmark.report.duplicate", **event_attrs)
+            else:
+                _obs_log.info(
+                    "benchmark.report.succeeded", score=result.score, **event_attrs
+                )
+            return result.model_copy(update={"report_status": "ok"})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error_class, details = _classify_error(exc)
+            severity = _ERROR_SEVERITY[error_class]
+            event_name = (
+                "benchmark.report.contract_break"
+                if error_class == "contract_break"
+                else "benchmark.report.failed"
+            )
+            log_method = _obs_log.error if severity == "error" else _obs_log.warning
+            log_method(
+                event_name,
+                error_class=error_class,
+                error=details,
+                severity=severity,
+                **event_attrs,
+            )
+            return result.model_copy(
+                update={
+                    "report_status": "failed",
+                    "report_error": f"{error_class}: {details}",
+                }
+            )
