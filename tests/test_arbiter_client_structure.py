@@ -8,8 +8,11 @@ from maestro.coordination import arbiter_client
 
 
 class TestVendoringHeader:
-    def test_vendor_commit_pinned(self) -> None:
-        assert arbiter_client.ARBITER_VENDOR_COMMIT == "861534e"
+    def test_vendored_from_sha_pinned(self) -> None:
+        # ARBITER_VENDORED_FROM_SHA is the single source of truth for the
+        # vendored commit; the legacy ARBITER_VENDOR_COMMIT alias was removed
+        # in R-06b M4 Copilot polish #5.
+        assert arbiter_client.ARBITER_VENDORED_FROM_SHA.startswith("7aeb6b1")
 
     def test_required_version_pinned(self) -> None:
         assert arbiter_client.ARBITER_MCP_REQUIRED_VERSION == "0.2.0"

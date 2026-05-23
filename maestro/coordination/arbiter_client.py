@@ -1,7 +1,10 @@
 """Vendored Arbiter MCP client for Maestro.
 
-VENDORED FROM: arbiter@861534e (repo: arbiter, path: orchestrator/arbiter_client.py + types.py).
-TARGET ARBITER VERSION: 0.1.0 (enforced by _handshake against serverInfo.version).
+VENDORED FROM: arbiter@7aeb6b1 (R-06b M4 baseline) — extended in M4 with
+               version-axis negotiation + report_benchmark surface; see
+               maestro/benchmark/arbiter_report.py.
+TARGET ARBITER VERSION: 0.2.0 (enforced by _handshake against
+                        serverInfo.version).
 
 Why vendored rather than imported: R-03 design treats the Arbiter subprocess
 as an external service. Pinning the client to a specific commit isolates
@@ -48,7 +51,6 @@ from maestro.coordination.arbiter_errors import (
 
 logger = logging.getLogger(__name__)
 
-ARBITER_VENDOR_COMMIT = "861534e"
 ARBITER_MCP_REQUIRED_VERSION = "0.2.0"  # bumped for R-06b M4 (arbiter Phase 1)
 
 # R-06b M4: MCP tool-surface version negotiation. protocolVersion (server-advertised
