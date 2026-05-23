@@ -56,7 +56,7 @@ ARBITER_MCP_REQUIRED_VERSION = "0.2.0"  # bumped for R-06b M4 (arbiter Phase 1)
 # arbiter build/release version. They are independent axes — see spec §6.
 ARBITER_PROTOCOL_VERSION = "1.1.0"
 MIN_ARBITER_PROTOCOL: tuple[int, int] = (1, 1)
-ARBITER_VENDORED_FROM_SHA = "aa38b37162c9c4a518493579604a76aa8326bd86"
+ARBITER_VENDORED_FROM_SHA = "7aeb6b1a987a2610c9f2cddb38d90f42d849da42"
 
 
 def _parse_version(v: str) -> tuple[int, int]:
