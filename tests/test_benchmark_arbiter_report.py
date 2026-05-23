@@ -232,3 +232,59 @@ def test_classify_dispatches_on_type_not_string():
     must still classify as 'unavailable' (because dispatch is by type)."""
     e = ArbiterUnavailable("connection timeout after 30s")
     assert _classify_error(e) == ("unavailable", "arbiter unavailable")
+
+
+# ---------------------------------------------------------------------------
+# Task 4.4 — report_benchmark_to_arbiter happy + skipped paths
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock, MagicMock  # noqa: E402
+
+from maestro.benchmark.arbiter_report import report_benchmark_to_arbiter  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_helper_returns_skipped_when_client_none():
+    result = _result(run_id="skip")
+    returned = await report_benchmark_to_arbiter(result, client=None)
+    assert returned.report_status == "skipped"
+    assert returned.report_error is None
+    # Immutability: input unchanged (it was the default "skipped" anyway)
+    assert result.report_status == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_helper_returns_ok_on_created():
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(
+        return_value={"status": "created", "run_id": "x"}
+    )
+    result = _result(run_id="x")
+    returned = await report_benchmark_to_arbiter(result, mock_client)
+    assert returned.report_status == "ok"
+    assert returned.report_error is None
+    mock_client.report_benchmark_raw.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_helper_returns_ok_on_duplicate():
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(
+        return_value={"status": "duplicate", "run_id": "x"}
+    )
+    result = _result(run_id="x")
+    returned = await report_benchmark_to_arbiter(result, mock_client)
+    assert returned.report_status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_helper_returns_new_object_not_mutated():
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(
+        return_value={"status": "created", "run_id": "x"}
+    )
+    result = _result()
+    returned = await report_benchmark_to_arbiter(result, mock_client)
+    assert returned is not result
+    assert result.report_status == "skipped"  # default — helper did NOT mutate input
+    assert returned.report_status == "ok"

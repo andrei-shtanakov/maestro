@@ -16,7 +16,7 @@ import asyncio
 import os
 import random
 from datetime import UTC
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
@@ -28,6 +28,19 @@ from maestro.coordination.arbiter_errors import (
 
 if TYPE_CHECKING:
     from maestro.benchmark.models import BenchmarkResult, BenchmarkTaskResult
+
+
+@runtime_checkable
+class _ArbiterClientLike(Protocol):
+    """Structural protocol for duck-typed arbiter client.
+
+    Keeps the benchmark layer independent of the coordination layer —
+    any object with ``report_benchmark_raw(dict) -> awaitable`` satisfies
+    this protocol. ``ArbiterClient`` from ``maestro.coordination`` fulfils
+    it without explicit registration.
+    """
+
+    async def report_benchmark_raw(self, payload: dict) -> dict: ...
 
 
 ErrorClassBucket = Literal["timeout", "crash", "test_failure", "other"]
@@ -190,3 +203,45 @@ def _classify_error(exc: BaseException) -> tuple[ErrorClass, str]:
     if isinstance(exc, ArbiterUnavailable):
         return "unavailable", "arbiter unavailable"
     return "unexpected", f"{type(exc).__name__}: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Task 4.4 — report_benchmark_to_arbiter (happy + skipped paths)
+# Error paths (failed/contract_break) are added in Task 4.5.
+# obs.emit instrumentation is added in Task 4.6.
+# ---------------------------------------------------------------------------
+
+REPORT_TIMEOUT_S = 30.0
+
+
+async def report_benchmark_to_arbiter(
+    result: BenchmarkResult,
+    client: _ArbiterClientLike | None,
+    *,
+    max_per_task: int = REPORT_MAX_PER_TASK,
+) -> BenchmarkResult:
+    """Send a benchmark result to arbiter; return updated copy with report_status set.
+
+    Returns a NEW ``BenchmarkResult`` with ``report_status`` set —
+    never mutates the input. Error paths (failed/contract_break) are
+    added in Task 4.5; obs.emit is added in Task 4.6.
+
+    - ``client=None`` → ``report_status="skipped"``, no RPC.
+    - successful RPC ("created" or "duplicate") → ``report_status="ok"``.
+
+    Args:
+        result: Domain BenchmarkResult to report.
+        client: ArbiterClient (or compatible) with ``report_benchmark_raw``.
+            ``None`` skips reporting (caller did not configure arbiter).
+        max_per_task: Truncation cap for per_task list. Defaults to
+            ``REPORT_MAX_PER_TASK`` (env-overridable).
+
+    Returns:
+        Updated copy of ``result`` (input is unmodified).
+    """
+    if client is None:
+        return result.model_copy(update={"report_status": "skipped"})
+
+    payload = _build_wire_payload(result, max_per_task)
+    await client.report_benchmark_raw(payload.model_dump(mode="json"))
+    return result.model_copy(update={"report_status": "ok"})
