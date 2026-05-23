@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.3.0 (2026-05-23)
+
+### Added
+- `maestro/benchmark/arbiter_report.py` — `report_benchmark_to_arbiter(result, client)` helper; never raises (except `CancelledError`); returns a copy with `report_status` / `report_error` set.
+- `BenchmarkResult.report_status` (`Literal["ok","failed","skipped"]`) + `.report_error` (`str | None`) on the M1 model.
+- `BenchmarkTaskResult.task_type` and `.score` (additive; populated from ATP `metadata.task_type` when present).
+- `BenchmarkRunner.run(..., run_id: str | None = None)` — caller-provided `run_id` overrides ATP's for CI-retry idempotency.
+- `ArbiterClient.report_benchmark_raw(payload)` — low-level MCP method.
+- `ArbiterContractError(code, message, data)` — distinguishes JSON-RPC contract breaks (`-32600`/`-32602`/`-32603`) from transient `ArbiterUnavailable`.
+- Vendored client: `ARBITER_PROTOCOL_VERSION = "1.1.0"`, `MIN_ARBITER_PROTOCOL = (1, 1)`, `ARBITER_VENDORED_FROM_SHA = "7aeb6b1..."`; `start()` validates server-advertised `protocolVersion` (major-mismatch → `ArbiterContractError`, minor-low → WARNING).
+- `_cowork_output/benchmark-contract/report_benchmark-v1.schema.json` — single source of truth (schema-first).
+- `scripts/smoke_benchmark_report.py` — CI smoke against a real arbiter subprocess.
+- 5 distinct observability events: `benchmark.report.{skipped,succeeded,duplicate,failed,contract_break}` (contract_break gets ERROR severity).
+
+### Configuration
+- `MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK` env override (default 200) for per_task truncation.
+
+### Changed
+- `ARBITER_MCP_REQUIRED_VERSION` bumped `"0.1.0" → "0.2.0"` to match arbiter Phase 1 binary.
+- `_send_and_receive` now raises `ArbiterContractError` (not `ArbiterUnavailable`) on JSON-RPC error codes -32600/-32602/-32603.
+
+### Tests
+- New: `tests/test_benchmark_arbiter_report.py` (~33 tests — projection, classification, helper paths, obs emit), `tests/test_benchmark_contract.py` (~9 tests — JSONSchema validation + forward-compat), `tests/test_arbiter_real_subprocess_benchmark.py` (3 e2e cases: created + duplicate + contract_break), `tests/test_arbiter_client_version.py` (5 version-sync tests), `tests/test_arbiter_errors.py` (4 contract-error tests), `tests/test_benchmark_models.py` (4 additive-field tests).
+- Extended: `tests/test_arbiter_client.py` (+5 method/error-classification tests), `tests/test_benchmark_runner.py` (+4 run_id/task_type tests), `tests/test_benchmark_atp_client.py` (+3 task_type extraction tests).
+
+### Cross-repo
+- Requires `arbiter-mcp` at SHA `7aeb6b1a987a2610c9f2cddb38d90f42d849da42` or later (advertises `protocolVersion="1.1.0"`, new `report_benchmark` MCP tool, `benchmark_runs` table migration).
+
+Design: `docs/superpowers/specs/2026-05-23-r06b-m4-arbiter-wiring-design.md`.
+Plan: `docs/superpowers/plans/2026-05-23-r06b-m4-arbiter-wiring.md`.
+
 ## v0.2.0 (2026-04-17)
 
 ### Added

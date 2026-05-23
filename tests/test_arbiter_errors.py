@@ -33,3 +33,35 @@ def test_errors_can_be_raised_and_caught() -> None:
         raise ArbiterStartupError("x")
     with pytest.raises(ArbiterError):
         raise ArbiterUnavailable("y")
+
+
+def test_contract_error_is_subclass_of_arbiter_error() -> None:
+    from maestro.coordination.arbiter_errors import ArbiterContractError
+
+    assert issubclass(ArbiterContractError, ArbiterError)
+
+
+def test_contract_error_sibling_of_unavailable() -> None:
+    """contract_break and unavailable are sibling categories, not parent/child."""
+    from maestro.coordination.arbiter_errors import ArbiterContractError
+
+    assert not issubclass(ArbiterContractError, ArbiterUnavailable)
+    assert not issubclass(ArbiterUnavailable, ArbiterContractError)
+
+
+def test_contract_error_carries_code_message_data() -> None:
+    from maestro.coordination.arbiter_errors import ArbiterContractError
+
+    e = ArbiterContractError(-32602, "missing field 'agent_id'", {"field": "agent_id"})
+    assert e.code == -32602
+    assert e.message == "missing field 'agent_id'"
+    assert e.data == {"field": "agent_id"}
+    assert "-32602" in str(e)
+    assert "missing field" in str(e)
+
+
+def test_contract_error_data_defaults_to_empty_dict() -> None:
+    from maestro.coordination.arbiter_errors import ArbiterContractError
+
+    e = ArbiterContractError(-32603, "internal")
+    assert e.data == {}

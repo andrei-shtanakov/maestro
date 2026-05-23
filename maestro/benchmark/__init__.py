@@ -5,6 +5,11 @@ M1 thin slice: data models + async runner driven by Protocols. M2 added
 added ``MaestroATPAdapter`` (live ATP HTTP via ``atp-platform-sdk``).
 """
 
+from maestro.benchmark.arbiter_report import (
+    ReportBenchmarkPayload,
+    WireTaskResult,
+    report_benchmark_to_arbiter,
+)
 from maestro.benchmark.atp_client import MaestroATPAdapter
 from maestro.benchmark.models import (
     AgentResponse,
@@ -31,5 +36,8 @@ __all__ = [
     "BenchmarkTask",
     "BenchmarkTaskResult",
     "MaestroATPAdapter",
+    "ReportBenchmarkPayload",
     "SpawnerResponder",
+    "WireTaskResult",
+    "report_benchmark_to_arbiter",
 ]

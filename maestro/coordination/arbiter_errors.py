@@ -37,3 +37,18 @@ class ArbiterUnavailable(ArbiterError):
     def __init__(self, message: str, cause: BaseException | None = None) -> None:
         super().__init__(message)
         self.cause = cause
+
+
+class ArbiterContractError(ArbiterError):
+    """JSON-RPC error from arbiter indicating schema or protocol mismatch.
+
+    Always means: vendored client diverged from server, payload bug, or
+    payload_version mismatch. Never transient — retry is meaningless.
+    Sibling to ArbiterUnavailable (which IS transient).
+    """
+
+    def __init__(self, code: int, message: str, data: dict | None = None) -> None:
+        self.code = code
+        self.message = message
+        self.data = data or {}
+        super().__init__(f"contract error {code}: {message}")

@@ -39,13 +39,32 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from maestro.coordination.arbiter_errors import ArbiterStartupError, ArbiterUnavailable
+from maestro.coordination.arbiter_errors import (
+    ArbiterContractError,
+    ArbiterStartupError,
+    ArbiterUnavailable,
+)
 
 
 logger = logging.getLogger(__name__)
 
 ARBITER_VENDOR_COMMIT = "861534e"
-ARBITER_MCP_REQUIRED_VERSION = "0.1.0"
+ARBITER_MCP_REQUIRED_VERSION = "0.2.0"  # bumped for R-06b M4 (arbiter Phase 1)
+
+# R-06b M4: MCP tool-surface version negotiation. protocolVersion (server-advertised
+# in initialize response) is the tool-surface marker; serverInfo.version above is the
+# arbiter build/release version. They are independent axes — see spec §6.
+ARBITER_PROTOCOL_VERSION = "1.1.0"
+MIN_ARBITER_PROTOCOL: tuple[int, int] = (1, 1)
+ARBITER_VENDORED_FROM_SHA = "7aeb6b1a987a2610c9f2cddb38d90f42d849da42"
+
+
+def _parse_version(v: str) -> tuple[int, int]:
+    """Parse 'X.Y[.Z]' → (X, Y). Non-numeric parts coerce to 0."""
+    parts = v.split(".")
+    major = int(parts[0]) if parts and parts[0].isdigit() else 0
+    minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    return (major, minor)
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +394,28 @@ class ArbiterClient:
             arguments["agent_id"] = agent_id
         return await self._call_tool("get_agent_status", arguments)
 
+    async def report_benchmark_raw(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Send a benchmark result to arbiter (low-level dict-taking method).
+
+        Prefer the typed wrapper
+        ``maestro.benchmark.arbiter_report.report_benchmark_to_arbiter``,
+        which constructs a validated ``ReportBenchmarkPayload`` and never
+        raises. This raw method is exposed for tests and advanced callers
+        that want to bypass the helper layer.
+
+        Args:
+            payload: Pre-serialized dict (typically from
+                ``ReportBenchmarkPayload.model_dump(mode="json")``).
+
+        Returns:
+            Response dict from arbiter: ``{"status": "created"|"duplicate", "run_id": ...}``.
+
+        Raises:
+            ArbiterUnavailable: On transient transport errors (after one retry).
+            ArbiterContractError: On JSON-RPC contract errors (-32600/-32602/-32603).
+        """
+        return await self._call_tool("report_benchmark", payload)
+
     # ------------------------------------------------------------------
     # Typed convenience methods
     # ------------------------------------------------------------------
@@ -478,7 +519,15 @@ class ArbiterClient:
             raise ArbiterUnavailable(f"Failed to start Arbiter: {e}", cause=e) from e
 
     async def _handshake(self) -> dict[str, Any]:
-        """Perform MCP initialize + initialized handshake with version check."""
+        """Perform MCP initialize + initialized handshake with version check.
+
+        Two version axes (see R-06b M4 design §6):
+        - serverInfo.version: exact-equality against ARBITER_MCP_REQUIRED_VERSION
+          (arbiter Cargo build/release).
+        - protocolVersion: range check against MIN_ARBITER_PROTOCOL (MCP tool surface).
+          Major-below-MIN = ArbiterContractError (hard incompatibility); minor-below =
+          WARNING (graceful degradation, some tools may be missing).
+        """
         result = await self._send_request("initialize", {})
         server_info = result.get("serverInfo", {}) or {}
         version = server_info.get("version", "")
@@ -487,6 +536,21 @@ class ArbiterClient:
                 f"arbiter version mismatch: expected "
                 f"{ARBITER_MCP_REQUIRED_VERSION!r}, got {version!r}. "
                 f"Re-vendor client or update ARBITER_MCP_REQUIRED_VERSION."
+            )
+        server_protocol = _parse_version(str(result.get("protocolVersion", "0.0")))
+        our_major = _parse_version(ARBITER_PROTOCOL_VERSION)[0]
+        if server_protocol[0] != our_major:
+            raise ArbiterContractError(
+                -1,
+                f"protocol major mismatch: server={server_protocol}, "
+                f"min={MIN_ARBITER_PROTOCOL}",
+            )
+        if server_protocol < MIN_ARBITER_PROTOCOL:
+            logger.warning(
+                "arbiter protocol minor lower than required: server=%s, min=%s — "
+                "report_benchmark may be missing",
+                server_protocol,
+                MIN_ARBITER_PROTOCOL,
             )
         await self._send_notification("notifications/initialized")
         return result
@@ -560,9 +624,16 @@ class ArbiterClient:
 
         if "error" in response and response["error"] is not None:
             err = response["error"]
+            code = err.get("code", -32000)
+            msg_text = err.get("message", "Unknown error")
+            data = err.get("data")
+            if code in (-32600, -32602, -32603):
+                # Hard contract break: invalid request / invalid params / internal.
+                # Retry is meaningless; surfaces to caller for fix-or-bail.
+                raise ArbiterContractError(code, msg_text, data)
+            # Other codes (e.g. -32000 server error) treated as transient.
             raise ArbiterUnavailable(
-                f"protocol error: JSON-RPC error {err.get('code', -32000)}: "
-                f"{err.get('message', 'Unknown error')}"
+                f"protocol error: JSON-RPC error {code}: {msg_text}"
             )
 
         return response.get("result", {})  # type: ignore[no-any-return]
