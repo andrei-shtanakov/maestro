@@ -188,3 +188,47 @@ def test_env_override_for_max_per_task(monkeypatch):
         # Restore default for subsequent tests
         monkeypatch.delenv("MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK", raising=False)
         importlib.reload(ar)
+
+
+# ---------------------------------------------------------------------------
+# Task 4.3 — _classify_error, ErrorClass, _ERROR_SEVERITY
+# ---------------------------------------------------------------------------
+
+
+from maestro.benchmark.arbiter_report import _classify_error  # noqa: E402
+from maestro.coordination.arbiter_errors import (  # noqa: E402
+    ArbiterContractError,
+    ArbiterUnavailable,
+)
+
+
+def test_classify_timeout():
+    assert _classify_error(TimeoutError()) == ("timeout", "report timed out")
+
+
+def test_classify_contract_error_preserves_code_and_message():
+    e = ArbiterContractError(-32602, "missing field")
+    cls, msg = _classify_error(e)
+    assert cls == "contract_break"
+    assert "-32602" in msg
+    assert "missing field" in msg
+
+
+def test_classify_unavailable():
+    e = ArbiterUnavailable("broken pipe")
+    assert _classify_error(e) == ("unavailable", "arbiter unavailable")
+
+
+def test_classify_unexpected_includes_type_name():
+    e = ValueError("oops")
+    cls, msg = _classify_error(e)
+    assert cls == "unexpected"
+    assert "ValueError" in msg
+    assert "oops" in msg
+
+
+def test_classify_dispatches_on_type_not_string():
+    """Regression guard: an ArbiterUnavailable whose message contains 'timeout'
+    must still classify as 'unavailable' (because dispatch is by type)."""
+    e = ArbiterUnavailable("connection timeout after 30s")
+    assert _classify_error(e) == ("unavailable", "arbiter unavailable")

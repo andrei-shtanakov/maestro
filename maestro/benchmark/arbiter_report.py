@@ -12,12 +12,18 @@ Design: docs/superpowers/specs/2026-05-23-r06b-m4-arbiter-wiring-design.md
 
 from __future__ import annotations
 
+import asyncio
 import os
 import random
 from datetime import UTC
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict
+
+from maestro.coordination.arbiter_errors import (
+    ArbiterContractError,
+    ArbiterUnavailable,
+)
 
 
 if TYPE_CHECKING:
@@ -154,3 +160,33 @@ def _build_wire_payload(
         per_task_total_count=len(result.per_task),
         per_task_truncated=truncated,
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 4.3 — _classify_error, ErrorClass, _ERROR_SEVERITY
+# ---------------------------------------------------------------------------
+
+ErrorClass = Literal["unavailable", "timeout", "contract_break", "unexpected"]
+
+_ERROR_SEVERITY: dict[ErrorClass, Literal["warning", "error"]] = {
+    "unavailable": "warning",  # transient
+    "timeout": "warning",  # transient
+    "contract_break": "error",  # vendored drift / payload bug — must fix
+    "unexpected": "error",  # catch-all → tracking
+}
+
+
+def _classify_error(exc: BaseException) -> tuple[ErrorClass, str]:
+    """Normalize an exception into (class, short_msg). isinstance dispatch.
+
+    Single source of truth for both ``obs.emit`` error_class and the
+    ``BenchmarkResult.report_error`` message. NEVER use string-match
+    on exc.args / str(exc) — that's the bug class this avoids.
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout", "report timed out"
+    if isinstance(exc, ArbiterContractError):
+        return "contract_break", f"{exc.code}: {exc.message}"
+    if isinstance(exc, ArbiterUnavailable):
+        return "unavailable", "arbiter unavailable"
+    return "unexpected", f"{type(exc).__name__}: {exc}"
