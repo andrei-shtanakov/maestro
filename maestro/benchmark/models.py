@@ -11,6 +11,7 @@ context.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -51,6 +52,9 @@ class BenchmarkTaskResult(BaseModel):
     tokens_used: int | None = None
     cost_usd: float | None = None
     error: str | None = None
+    # R-06b M4 additive (domain — used by CLI/local display; not all wire-bound):
+    task_type: str | None = None
+    score: float | None = None
 
 
 class BenchmarkResult(BaseModel):
@@ -71,3 +75,6 @@ class BenchmarkResult(BaseModel):
     total_cost_usd: float | None = None
     duration_seconds: float
     ts: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    # R-06b M4 additive (transport status; helper sets via model_copy):
+    report_status: Literal["ok", "failed", "skipped"] = "skipped"
+    report_error: str | None = None
