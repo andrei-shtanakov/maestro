@@ -257,8 +257,11 @@ async def report_benchmark_to_arbiter(
     """Send a benchmark result to arbiter; return updated copy with report_status set.
 
     Returns a NEW ``BenchmarkResult`` with ``report_status`` set —
-    never mutates the input. Helper never raises except for
-    ``asyncio.CancelledError`` (a ``BaseException`` that must propagate).
+    never mutates the input. Helper never raises ``Exception``-subclass
+    errors — all are caught and mapped to ``report_status="failed"``.
+    ``BaseException``-only signals (``asyncio.CancelledError``,
+    ``KeyboardInterrupt``, ``SystemExit``) propagate naturally because
+    the internal ``except Exception`` clause does not cover them.
 
     Emits 5 distinct obs events (one per outcome class):
     - ``benchmark.report.skipped`` (info) — client=None
