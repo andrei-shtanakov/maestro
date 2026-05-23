@@ -13,6 +13,7 @@ Design: docs/superpowers/specs/2026-05-23-r06b-m4-arbiter-wiring-design.md
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
 from datetime import UTC
@@ -28,6 +29,7 @@ from maestro.coordination.arbiter_errors import (
 
 
 _obs_log = obs.get_logger("maestro.benchmark.arbiter_report")
+logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
@@ -106,9 +108,37 @@ class WireTaskResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MAX_PER_TASK = 200
-REPORT_MAX_PER_TASK: int = int(
-    os.getenv("MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK", _DEFAULT_MAX_PER_TASK)
-)
+
+
+def _parse_max_per_task_env(default: int) -> int:
+    """Parse MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK with defensive fallback.
+
+    Returns *default* when the variable is unset. Logs a WARNING and returns
+    *default* if the value is not a valid integer. Clamps values < 1 to 1
+    (cap=0 would make per-task reporting head-empty; negative is meaningless).
+    """
+    raw = os.getenv("MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK")
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK=%r — using default %d",
+            raw,
+            default,
+        )
+        return default
+    if value < 1:
+        logger.warning(
+            "MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK=%d < 1 — clamping to 1",
+            value,
+        )
+        return 1
+    return value
+
+
+REPORT_MAX_PER_TASK: int = _parse_max_per_task_env(_DEFAULT_MAX_PER_TASK)
 
 
 class ReportBenchmarkPayload(BaseModel):
