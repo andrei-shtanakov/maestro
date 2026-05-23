@@ -65,3 +65,20 @@ def test_contract_error_data_defaults_to_empty_dict() -> None:
 
     e = ArbiterContractError(-32603, "internal")
     assert e.data == {}
+
+
+def test_contract_error_preserves_non_dict_data() -> None:
+    """JSON-RPC error.data MAY be any JSON type — don't collapse via `or {}`."""
+    from maestro.coordination.arbiter_errors import ArbiterContractError
+
+    e_int = ArbiterContractError(-32602, "code", data=0)
+    assert e_int.data == 0  # was 0, must NOT become {}
+
+    e_list = ArbiterContractError(-32602, "code", data=["a", "b"])
+    assert e_list.data == ["a", "b"]
+
+    e_string = ArbiterContractError(-32602, "code", data="payload-fragment")
+    assert e_string.data == "payload-fragment"
+
+    e_false = ArbiterContractError(-32602, "code", data=False)
+    assert e_false.data is False
