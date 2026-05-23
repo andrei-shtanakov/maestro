@@ -43,6 +43,7 @@ class _Task:
 
     task_index: int
     prompt: str
+    task_type: str | None = None  # R-06b M4: pulled from ATP metadata when present
 
 
 def _extract_task_index(raw: dict[str, Any]) -> int:
@@ -63,6 +64,18 @@ def _extract_prompt(raw: dict[str, Any]) -> str:
     """
     task = raw.get("task") or {}
     return str(task.get("description", ""))
+
+
+def _extract_task_type(raw: dict[str, Any]) -> str | None:
+    """Pull ``task_type`` out of an ATPRequest dict (R-06b M4).
+
+    The benchmark API may stamp ``task_type`` into ``metadata`` for some
+    benchmarks (e.g. swe-bench has bugfix/feature/refactor labels);
+    others don't. Returns ``None`` when absent.
+    """
+    metadata = raw.get("metadata") or {}
+    value = metadata.get("task_type")
+    return str(value) if value is not None else None
 
 
 def _extract_task_id(raw: dict[str, Any]) -> str:
@@ -89,7 +102,11 @@ class _RunAdapter:
         async for raw in self._sdk_run:
             idx = _extract_task_index(raw)
             self._task_ids[idx] = _extract_task_id(raw)
-            yield _Task(task_index=idx, prompt=_extract_prompt(raw))
+            yield _Task(
+                task_index=idx,
+                prompt=_extract_prompt(raw),
+                task_type=_extract_task_type(raw),
+            )
 
     async def submit(self, task_index: int, response: str) -> None:
         task_id = self._task_ids.get(

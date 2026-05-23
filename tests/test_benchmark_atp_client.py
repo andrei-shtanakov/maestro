@@ -304,3 +304,35 @@ async def test_finalize_returns_zero_when_total_score_missing(
 
     assert result.score == 0.0
     assert result.per_task == []
+
+
+def test_extract_task_type_from_metadata() -> None:
+    """Pull task_type out of ATP metadata when present."""
+    from maestro.benchmark.atp_client import _extract_task_type
+
+    raw = {
+        "task_id": "t0",
+        "task": {"description": "fix"},
+        "metadata": {"task_index": 0, "task_type": "bugfix"},
+    }
+    assert _extract_task_type(raw) == "bugfix"
+
+
+def test_extract_task_type_none_when_absent() -> None:
+    """Return None when task_type is not in metadata."""
+    from maestro.benchmark.atp_client import _extract_task_type
+
+    raw = {
+        "task_id": "t0",
+        "task": {"description": "fix"},
+        "metadata": {"task_index": 0},
+    }
+    assert _extract_task_type(raw) is None
+
+
+def test_extract_task_type_none_when_metadata_missing() -> None:
+    """Return None when metadata is missing entirely."""
+    from maestro.benchmark.atp_client import _extract_task_type
+
+    raw = {"task_id": "t0", "task": {"description": "fix"}}
+    assert _extract_task_type(raw) is None

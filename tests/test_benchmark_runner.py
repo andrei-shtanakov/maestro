@@ -178,3 +178,52 @@ async def test_run_with_explicit_run_id_overrides_atp() -> None:
     runner = BenchmarkRunner(client, agent)
     result = await runner.run(benchmark_id="b", run_id="ci-job-42")
     assert result.run_id == "ci-job-42"
+
+
+@pytest.mark.anyio
+async def test_runner_propagates_task_type_when_present() -> None:
+    """If BenchmarkTask exposes task_type, runner threads it into
+    BenchmarkTaskResult."""
+
+    class TaskWithType:
+        def __init__(self) -> None:
+            self.task_index = 0
+            self.prompt = "fix bug"
+            self.task_type = "bugfix"
+
+    class RunWithTypedTasks:
+        def __init__(self) -> None:
+            self.run_id = "r"
+            self.submitted: list[tuple[int, str]] = []
+            self.finalized: bool = False
+
+        async def tasks(self) -> AsyncIterator[TaskWithType]:
+            yield TaskWithType()
+
+        async def submit(self, task_index: int, response: str) -> None:
+            self.submitted.append((task_index, response))
+
+        async def finalize(self) -> tuple[float, dict[str, float]]:
+            self.finalized = True
+            return 0.5, {}
+
+    class ClientWithTypedTasks:
+        async def start_run(
+            self, benchmark_id: str, agent_name: str
+        ) -> RunWithTypedTasks:
+            return RunWithTypedTasks()
+
+    runner = BenchmarkRunner(ClientWithTypedTasks(), MockResponder("a"))
+    result = await runner.run(benchmark_id="b")
+    assert result.per_task[0].task_type == "bugfix"
+
+
+@pytest.mark.anyio
+async def test_runner_task_type_none_when_task_lacks_attr() -> None:
+    """Existing M1 mocks without task_type → BenchmarkTaskResult.task_type
+    is None."""
+    run = MockRun("r", [MockTask(0, "p")])
+    client = MockATPClient(run)
+    runner = BenchmarkRunner(client, MockResponder("a"))
+    result = await runner.run(benchmark_id="b")
+    assert result.per_task[0].task_type is None

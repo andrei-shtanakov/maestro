@@ -132,6 +132,7 @@ class BenchmarkRunner:
                     tokens_used=response.tokens_used,
                     cost_usd=response.cost_usd,
                     error=response.error,
+                    task_type=getattr(task, "task_type", None),
                 )
             )
 
