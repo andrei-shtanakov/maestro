@@ -11,7 +11,7 @@ on:
 env:
   # Pin arbiter to the commit that closed arbiter#9 + shipped obs v1.
   # Bump when the Maestro↔arbiter contract evolves.
-  ARBITER_PINNED_SHA: d1a8ecd
+  ARBITER_PINNED_SHA: 7aeb6b1a987a2610c9f2cddb38d90f42d849da42
 
 jobs:
   lint:
@@ -111,8 +111,31 @@ jobs:
         working-directory: Maestro
         run: uv sync
 
-      - name: Run R-05 real-subprocess tests
+      - name: Verify vendored arbiter_client matches pinned SHA
+        if: github.event_name != 'schedule'
+        working-directory: Maestro
+        env:
+          ARBITER_PINNED_SHA: ${{ env.ARBITER_PINNED_SHA }}
+        run: |
+          PYVENDOR_SHA=$(uv run python -c "from maestro.coordination.arbiter_client import ARBITER_VENDORED_FROM_SHA; print(ARBITER_VENDORED_FROM_SHA)")
+          if [ "$PYVENDOR_SHA" != "$ARBITER_PINNED_SHA" ]; then
+            echo "::error::vendored copy out of sync with pinned arbiter: vendored=$PYVENDOR_SHA, pinned=$ARBITER_PINNED_SHA — re-vendor required"
+            exit 1
+          fi
+          echo "vendored OK: $PYVENDOR_SHA"
+
+      - name: Run real-subprocess tests (R-05 + R-06b M4)
         working-directory: Maestro
         env:
           MAESTRO_ARBITER_BIN: ${{ github.workspace }}/arbiter/target/release/arbiter-mcp
-        run: uv run python -m pytest tests/test_arbiter_real_subprocess.py -v
+        run: |
+          uv run python -m pytest \
+            tests/test_arbiter_real_subprocess.py \
+            tests/test_arbiter_real_subprocess_benchmark.py \
+            -v
+
+      - name: Run benchmark report smoke
+        working-directory: Maestro
+        env:
+          MAESTRO_ARBITER_BIN: ${{ github.workspace }}/arbiter/target/release/arbiter-mcp
+        run: uv run python scripts/smoke_benchmark_report.py
