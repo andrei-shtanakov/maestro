@@ -247,7 +247,7 @@ async def report_benchmark_to_arbiter(
     }
     if client is None:
         _obs_log.info("benchmark.report.skipped", **event_attrs)
-        return result.model_copy(update={"report_status": "skipped"})
+        return result.model_copy(update={"report_status": "skipped", "report_error": None})
 
     with obs.span("benchmark.report", **event_attrs):
         try:
