@@ -522,3 +522,53 @@ async def test_helper_resets_stale_report_error_on_skipped():
     returned = await report_benchmark_to_arbiter(prior_result, None)
     assert returned.report_status == "skipped"
     assert returned.report_error is None
+
+
+# ---------------------------------------------------------------------------
+# Copilot polish #3 — defensive REPORT_MAX_PER_TASK env parsing
+# ---------------------------------------------------------------------------
+
+
+def test_env_parser_returns_default_when_unset(monkeypatch):
+    from maestro.benchmark.arbiter_report import _parse_max_per_task_env
+
+    monkeypatch.delenv("MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK", raising=False)
+    assert _parse_max_per_task_env(200) == 200
+
+
+def test_env_parser_returns_int_when_valid(monkeypatch):
+    from maestro.benchmark.arbiter_report import _parse_max_per_task_env
+
+    monkeypatch.setenv("MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK", "50")
+    assert _parse_max_per_task_env(200) == 50
+
+
+def test_env_parser_falls_back_on_garbage(monkeypatch, caplog):
+    from maestro.benchmark.arbiter_report import _parse_max_per_task_env
+
+    monkeypatch.setenv("MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK", "not-an-int")
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    result = _parse_max_per_task_env(200)
+    assert result == 200
+    assert "Invalid" in caplog.text
+
+
+def test_env_parser_clamps_zero_to_one(monkeypatch, caplog):
+    from maestro.benchmark.arbiter_report import _parse_max_per_task_env
+
+    monkeypatch.setenv("MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK", "0")
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    result = _parse_max_per_task_env(200)
+    assert result == 1
+    assert "clamping" in caplog.text
+
+
+def test_env_parser_clamps_negative(monkeypatch):
+    from maestro.benchmark.arbiter_report import _parse_max_per_task_env
+
+    monkeypatch.setenv("MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK", "-5")
+    assert _parse_max_per_task_env(200) == 1

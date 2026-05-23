@@ -47,8 +47,16 @@ class ArbiterContractError(ArbiterError):
     Sibling to ArbiterUnavailable (which IS transient).
     """
 
-    def __init__(self, code: int, message: str, data: dict | None = None) -> None:
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        data: object = None,
+    ) -> None:
         self.code = code
         self.message = message
-        self.data = data or {}
+        # data is JSON-RPC `error.data` — MAY be any JSON type per spec.
+        # Default to empty dict when omitted; store the actual value otherwise
+        # (do NOT collapse 0 / "" / [] / False via `or {}`).
+        self.data: object = data if data is not None else {}
         super().__init__(f"contract error {code}: {message}")
