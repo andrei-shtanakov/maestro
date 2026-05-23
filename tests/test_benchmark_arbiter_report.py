@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from pydantic import ValidationError
 
@@ -288,3 +290,71 @@ async def test_helper_returns_new_object_not_mutated():
     assert returned is not result
     assert result.report_status == "skipped"  # default — helper did NOT mutate input
     assert returned.report_status == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Task 4.5 — error paths: fire-and-forget, classified failures, never raises
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_helper_failed_on_unavailable():
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(
+        side_effect=ArbiterUnavailable("broken pipe")
+    )
+    returned = await report_benchmark_to_arbiter(_result(), mock_client)
+    assert returned.report_status == "failed"
+    assert returned.report_error == "unavailable: arbiter unavailable"
+
+
+@pytest.mark.asyncio
+async def test_helper_failed_on_contract_break():
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(
+        side_effect=ArbiterContractError(-32602, "missing agent_id")
+    )
+    returned = await report_benchmark_to_arbiter(_result(), mock_client)
+    assert returned.report_status == "failed"
+    assert isinstance(returned.report_error, str)
+    assert "contract_break: -32602" in returned.report_error
+    assert "missing agent_id" in returned.report_error
+
+
+@pytest.mark.asyncio
+async def test_helper_failed_on_timeout(monkeypatch):
+    """When client hangs past REPORT_TIMEOUT_S, helper times out and classifies."""
+
+    async def hang(_payload):
+        await asyncio.sleep(60)
+
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = hang
+    # Use tiny timeout for the test
+    import maestro.benchmark.arbiter_report as ar
+
+    monkeypatch.setattr(ar, "REPORT_TIMEOUT_S", 0.05)
+    returned = await report_benchmark_to_arbiter(_result(), mock_client)
+    assert returned.report_status == "failed"
+    assert isinstance(returned.report_error, str)
+    assert returned.report_error.startswith("timeout:")
+
+
+@pytest.mark.asyncio
+async def test_helper_failed_on_unexpected_exception():
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(side_effect=ValueError("oops"))
+    returned = await report_benchmark_to_arbiter(_result(), mock_client)
+    assert returned.report_status == "failed"
+    assert isinstance(returned.report_error, str)
+    assert "unexpected: ValueError" in returned.report_error
+    assert "oops" in returned.report_error
+
+
+@pytest.mark.asyncio
+async def test_helper_does_not_catch_cancelled():
+    """CancelledError is BaseException; must propagate (not return failed)."""
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(side_effect=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await report_benchmark_to_arbiter(_result(), mock_client)

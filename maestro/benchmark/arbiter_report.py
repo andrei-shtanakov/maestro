@@ -223,11 +223,14 @@ async def report_benchmark_to_arbiter(
     """Send a benchmark result to arbiter; return updated copy with report_status set.
 
     Returns a NEW ``BenchmarkResult`` with ``report_status`` set —
-    never mutates the input. Error paths (failed/contract_break) are
-    added in Task 4.5; obs.emit is added in Task 4.6.
+    never mutates the input. Helper never raises except for
+    ``asyncio.CancelledError`` (a ``BaseException`` that must propagate).
 
-    - ``client=None`` → ``report_status="skipped"``, no RPC.
-    - successful RPC ("created" or "duplicate") → ``report_status="ok"``.
+    Status outcomes:
+    - ``client=None`` → "skipped" (no RPC, no report_error)
+    - RPC success ("created" or "duplicate") → "ok"
+    - Any failure (transient, contract, timeout, unexpected) → "failed",
+      with ``report_error`` formatted as ``"<error_class>: <details>"``.
 
     Args:
         result: Domain BenchmarkResult to report.
@@ -242,6 +245,20 @@ async def report_benchmark_to_arbiter(
     if client is None:
         return result.model_copy(update={"report_status": "skipped"})
 
-    payload = _build_wire_payload(result, max_per_task)
-    await client.report_benchmark_raw(payload.model_dump(mode="json"))
-    return result.model_copy(update={"report_status": "ok"})
+    try:
+        payload = _build_wire_payload(result, max_per_task)
+        await asyncio.wait_for(
+            client.report_benchmark_raw(payload.model_dump(mode="json")),
+            timeout=REPORT_TIMEOUT_S,
+        )
+        return result.model_copy(update={"report_status": "ok"})
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        error_class, details = _classify_error(exc)
+        return result.model_copy(
+            update={
+                "report_status": "failed",
+                "report_error": f"{error_class}: {details}",
+            }
+        )
