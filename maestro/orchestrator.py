@@ -22,9 +22,9 @@ from maestro.decomposer import ProjectDecomposer
 from maestro.merge_logs import merge_logs_dir
 from maestro.models import (
     OrchestratorConfig,
-    Zadacha,
-    ZadachaConfig,
-    ZadachaStatus,
+    Workstream,
+    WorkstreamConfig,
+    WorkstreamStatus,
 )
 from maestro.pr_manager import PRManager, PRManagerError
 from maestro.spec_runner import read_executor_state
@@ -36,10 +36,10 @@ class OrchestratorError(Exception):
 
 
 @dataclass
-class RunningZadacha:
-    """Represents a currently running zadacha process."""
+class RunningWorkstream:
+    """Represents a currently running workstream process."""
 
-    zadacha: Zadacha
+    workstream: Workstream
     process: asyncio.subprocess.Process
     started_at: datetime
     workspace_path: Path
@@ -50,7 +50,7 @@ class RunningZadacha:
 class OrchestratorStats:
     """Statistics for an orchestration run."""
 
-    total_zadachi: int = 0
+    total_workstreams: int = 0
     completed: int = 0
     failed: int = 0
     prs_created: int = 0
@@ -61,8 +61,8 @@ class Orchestrator:
     """Coordinates multiple spec-runner processes.
 
     Main loop:
-    1. Decompose project into zadachi (if needed)
-    2. Resolve ready zadachi from DAG
+    1. Decompose project into workstreams (if needed)
+    2. Resolve ready workstreams from DAG
     3. Create workspace + spawn spec-runner for each
     4. Monitor processes, read progress
     5. On completion: push + create PR + cleanup
@@ -94,7 +94,7 @@ class Orchestrator:
         self._config = config
         self._log_dir = log_dir or Path(config.repo_path).expanduser() / "logs"
 
-        self._running: dict[str, RunningZadacha] = {}
+        self._running: dict[str, RunningWorkstream] = {}
         self._shutdown_grace_seconds: float = 5.0
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
@@ -125,8 +125,8 @@ class Orchestrator:
         self._log_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Step 1: Ensure zadachi exist
-            await self._ensure_zadachi()
+            # Step 1: Ensure workstreams exist
+            await self._ensure_workstreams()
 
             # Step 2: Main loop
             await self._main_loop()
@@ -143,64 +143,64 @@ class Orchestrator:
 
         return self._stats
 
-    async def _ensure_zadachi(self) -> None:
-        """Ensure zadachi are in the database.
+    async def _ensure_workstreams(self) -> None:
+        """Ensure workstreams are in the database.
 
-        If no zadachi exist, run decomposition.
+        If no workstreams exist, run decomposition.
         """
-        existing = await self._db.get_all_zadachi()
+        existing = await self._db.get_all_workstreams()
 
         if existing:
-            self._logger.info("Found %d existing zadachi", len(existing))
-            self._stats.total_zadachi = len(existing)
+            self._logger.info("Found %d existing workstreams", len(existing))
+            self._stats.total_workstreams = len(existing)
             return
 
-        # Use manually specified zadachi from config
-        if self._config.zadachi:
+        # Use manually specified workstreams from config
+        if self._config.workstreams:
             self._logger.info(
-                "Creating %d zadachi from config",
-                len(self._config.zadachi),
+                "Creating %d workstreams from config",
+                len(self._config.workstreams),
             )
-            await self._create_zadachi_from_configs(self._config.zadachi)
+            await self._create_workstreams_from_configs(self._config.workstreams)
             return
 
         # Auto-decompose
         if not self._config.description:
-            msg = (
-                "No zadachi in config and no project description for auto-decomposition"
-            )
+            msg = "No workstreams in config and no project description for auto-decomposition"
             raise OrchestratorError(msg)
 
         self._logger.info("Auto-decomposing project")
         configs = self._decomposer.decompose(self._config.description)
-        await self._create_zadachi_from_configs(configs)
+        await self._create_workstreams_from_configs(configs)
 
-    async def _create_zadachi_from_configs(self, configs: list[ZadachaConfig]) -> None:
-        """Create Zadacha records in DB from configs."""
+    async def _create_workstreams_from_configs(
+        self, configs: list[WorkstreamConfig]
+    ) -> None:
+        """Create Workstream records in DB from configs."""
         for config in configs:
-            zadacha = Zadacha.from_config(
+            workstream = Workstream.from_config(
                 config,
                 branch_prefix=self._config.branch_prefix,
             )
-            await self._db.create_zadacha(zadacha)
+            await self._db.create_workstream(workstream)
 
-        self._stats.total_zadachi = len(configs)
-        self._logger.info("Created %d zadachi in database", len(configs))
+        self._stats.total_workstreams = len(configs)
+        self._logger.info("Created %d workstreams in database", len(configs))
 
     async def _main_loop(self) -> None:
         """Main orchestration loop."""
         poll_interval = 2.0
 
         while not self._shutdown_requested:
-            # Get completed zadacha IDs
+            # Get completed workstream IDs
             completed_ids = await self._get_completed_ids()
 
             # Check if all done
-            if await self._all_zadachi_complete():
-                self._logger.info("All zadachi complete")
+            if await self._all_workstreams_complete():
+                self._logger.info("All workstreams complete")
                 break
 
-            # Resolve ready zadachi
+            # Resolve ready workstreams
             ready_ids = await self._resolve_ready(completed_ids)
 
             # Spawn up to max_concurrent
@@ -217,43 +217,43 @@ class Orchestrator:
                 )
 
     async def _get_completed_ids(self) -> set[str]:
-        """Get IDs of completed zadachi."""
-        done = await self._db.get_zadachi_by_status(ZadachaStatus.DONE)
+        """Get IDs of completed workstreams."""
+        done = await self._db.get_workstreams_by_status(WorkstreamStatus.DONE)
         return {z.id for z in done}
 
-    async def _all_zadachi_complete(self) -> bool:
-        """Check if all zadachi are in terminal states."""
-        all_z = await self._db.get_all_zadachi()
+    async def _all_workstreams_complete(self) -> bool:
+        """Check if all workstreams are in terminal states."""
+        all_z = await self._db.get_all_workstreams()
         terminal = {
-            ZadachaStatus.DONE,
-            ZadachaStatus.ABANDONED,
+            WorkstreamStatus.DONE,
+            WorkstreamStatus.ABANDONED,
         }
 
         for z in all_z:
             if z.status not in terminal:
-                if z.status == ZadachaStatus.NEEDS_REVIEW:
+                if z.status == WorkstreamStatus.NEEDS_REVIEW:
                     continue
                 return False
 
         return True
 
     async def _resolve_ready(self, completed_ids: set[str]) -> list[str]:
-        """Resolve zadachi that are ready to run.
+        """Resolve workstreams that are ready to run.
 
-        A zadacha is ready when:
+        A workstream is ready when:
         - Status is PENDING or READY
         - All dependencies are completed
         - Not already running
         """
-        all_z = await self._db.get_all_zadachi()
+        all_z = await self._db.get_all_workstreams()
         ready: list[str] = []
 
         for z in all_z:
             if z.id in self._running:
                 continue
             if z.status not in (
-                ZadachaStatus.PENDING,
-                ZadachaStatus.READY,
+                WorkstreamStatus.PENDING,
+                WorkstreamStatus.READY,
             ):
                 continue
 
@@ -273,7 +273,7 @@ class Orchestrator:
         return ready
 
     async def _spawn_ready(self, ready_ids: list[str]) -> None:
-        """Spawn ready zadachi up to concurrency limit."""
+        """Spawn ready workstreams up to concurrency limit."""
         available = self._config.max_concurrent - len(self._running)
 
         for zid in ready_ids[:available]:
@@ -281,61 +281,63 @@ class Orchestrator:
                 break
 
             try:
-                await self._spawn_zadacha(zid)
+                await self._spawn_workstream(zid)
             except Exception as e:
                 self._logger.error(
-                    "Failed to spawn zadacha '%s': %s",
+                    "Failed to spawn workstream '%s': %s",
                     zid,
                     e,
                 )
-                await self._db.update_zadacha_status(
+                await self._db.update_workstream_status(
                     zid,
-                    ZadachaStatus.FAILED,
+                    WorkstreamStatus.FAILED,
                     error_message=str(e),
                 )
 
-    async def _spawn_zadacha(self, zadacha_id: str) -> None:
-        """Spawn a spec-runner process for a zadacha."""
-        zadacha = await self._db.get_zadacha(zadacha_id)
+    async def _spawn_workstream(self, workstream_id: str) -> None:
+        """Spawn a spec-runner process for a workstream."""
+        workstream = await self._db.get_workstream(workstream_id)
 
         # Transition to DECOMPOSING for spec generation
-        await self._db.update_zadacha_status(
-            zadacha_id,
-            ZadachaStatus.DECOMPOSING,
-            expected_status=zadacha.status,
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.DECOMPOSING,
+            expected_status=workstream.status,
         )
 
         # Create workspace
-        if not self._workspace_mgr.workspace_exists(zadacha_id):
-            workspace = self._workspace_mgr.create_workspace(zadacha_id, zadacha.branch)
+        if not self._workspace_mgr.workspace_exists(workstream_id):
+            workspace = self._workspace_mgr.create_workspace(
+                workstream_id, workstream.branch
+            )
         else:
-            workspace = self._workspace_mgr.get_workspace_path(zadacha_id)
+            workspace = self._workspace_mgr.get_workspace_path(workstream_id)
 
         # Update workspace path in DB
-        await self._db.update_zadacha_status(
-            zadacha_id,
-            ZadachaStatus.DECOMPOSING,
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.DECOMPOSING,
             workspace_path=str(workspace),
         )
 
-        # Generate spec for this zadacha
+        # Generate spec for this workstream
         # Always regenerate: the repo may already have spec/tasks.md
         # from a previous run or different project phase
-        zadacha_config = ZadachaConfig(
-            id=zadacha.id,
-            title=zadacha.title,
-            description=zadacha.description,
-            scope=zadacha.scope,
-            depends_on=zadacha.depends_on,
-            priority=zadacha.priority,
+        workstream_config = WorkstreamConfig(
+            id=workstream.id,
+            title=workstream.title,
+            description=workstream.description,
+            scope=workstream.scope,
+            depends_on=workstream.depends_on,
+            priority=workstream.priority,
         )
-        self._decomposer.generate_spec(zadacha_config, workspace)
+        self._decomposer.generate_spec(workstream_config, workspace)
 
         # Setup spec-runner config
         executor_config = self._config.spec_runner.to_executor_config()
-        # Set main_branch to the zadacha branch (so spec-runner
+        # Set main_branch to the workstream branch (so spec-runner
         # merges subtask branches back to it)
-        executor_config.setdefault("executor", {})["main_branch"] = zadacha.branch
+        executor_config.setdefault("executor", {})["main_branch"] = workstream.branch
         self._workspace_mgr.setup_spec_runner(workspace, executor_config)
 
         # Commit generated spec + config so spec-runner subtask
@@ -344,19 +346,19 @@ class Orchestrator:
             None,
             self._commit_spec_in_workspace,
             workspace,
-            zadacha_id,
+            workstream_id,
         )
 
         # Transition to READY then RUNNING
-        await self._db.update_zadacha_status(zadacha_id, ZadachaStatus.READY)
-        await self._db.update_zadacha_status(
-            zadacha_id,
-            ZadachaStatus.RUNNING,
-            expected_status=ZadachaStatus.READY,
+        await self._db.update_workstream_status(workstream_id, WorkstreamStatus.READY)
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.RUNNING,
+            expected_status=WorkstreamStatus.READY,
         )
 
         # Spawn spec-runner
-        log_file = self._log_dir / f"{zadacha_id}.log"
+        log_file = self._log_dir / f"{workstream_id}.log"
 
         cmd = ["spec-runner", "run", "--all"]
 
@@ -367,7 +369,7 @@ class Orchestrator:
 
         log_fd = os.open(str(log_file), os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
         try:
-            with span("task.execute", task_id=zadacha_id):
+            with span("task.execute", task_id=workstream_id):
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     cwd=workspace,
@@ -380,16 +382,16 @@ class Orchestrator:
             raise
 
         # Update PID in DB
-        await self._db.update_zadacha_status(
-            zadacha_id,
-            ZadachaStatus.RUNNING,
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.RUNNING,
             process_pid=process.pid,
         )
 
-        self._running[zadacha_id] = RunningZadacha(
-            zadacha=zadacha.model_copy(
+        self._running[workstream_id] = RunningWorkstream(
+            workstream=workstream.model_copy(
                 update={
-                    "status": ZadachaStatus.RUNNING,
+                    "status": WorkstreamStatus.RUNNING,
                     "workspace_path": str(workspace),
                 }
             ),
@@ -401,7 +403,7 @@ class Orchestrator:
 
         self._logger.info(
             "Spawned spec-runner for '%s' (PID %d) in %s",
-            zadacha_id,
+            workstream_id,
             process.pid,
             workspace,
         )
@@ -409,14 +411,14 @@ class Orchestrator:
     @staticmethod
     def _commit_spec_in_workspace(
         workspace: Path,
-        zadacha_id: str,
+        workstream_id: str,
     ) -> None:
         """Commit generated spec files in the worktree.
 
         This ensures spec-runner subtask branches inherit
         the generated tasks.md when they branch off.
         """
-        with span("task.execute", task_id=zadacha_id):
+        with span("task.execute", task_id=workstream_id):
             subprocess.run(
                 ["git", "add", "spec/", "spec-runner.config.yaml"],
                 cwd=workspace,
@@ -425,7 +427,7 @@ class Orchestrator:
                 check=False,
             )
             subprocess.run(
-                ["git", "commit", "-m", f"maestro: add spec for {zadacha_id}"],
+                ["git", "commit", "-m", f"maestro: add spec for {workstream_id}"],
                 cwd=workspace,
                 env={**os.environ, **child_env()},
                 capture_output=True,
@@ -436,8 +438,8 @@ class Orchestrator:
         """Merge feature branch into base branch in the main repo.
 
         Prevents accumulation of unmerged branches that diverge
-        and cause conflicts. Each zadacha is merged immediately
-        after completion so the next zadacha sees all prior work.
+        and cause conflicts. Each workstream is merged immediately
+        after completion so the next workstream sees all prior work.
         """
         repo = Path(self._config.repo_path).expanduser()
         base = self._config.base_branch
@@ -486,8 +488,8 @@ class Orchestrator:
 
     async def _update_progress(
         self,
-        zadacha_id: str,
-        running: RunningZadacha,
+        workstream_id: str,
+        running: RunningWorkstream,
     ) -> None:
         """Read spec-runner state file for progress.
 
@@ -502,109 +504,109 @@ class Orchestrator:
         if state is None:
             return
 
-        await self._db.update_zadacha_status(
-            zadacha_id,
-            ZadachaStatus.RUNNING,
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.RUNNING,
             subtask_progress=state.progress_label(),
         )
 
     async def _handle_completion(
         self,
-        zadacha_id: str,
-        running: RunningZadacha,
+        workstream_id: str,
+        running: RunningWorkstream,
         return_code: int,
     ) -> None:
         """Handle spec-runner process completion."""
         if return_code == 0:
             self._logger.info(
-                "Zadacha '%s' completed successfully",
-                zadacha_id,
+                "Workstream '%s' completed successfully",
+                workstream_id,
             )
-            await self._handle_success(zadacha_id, running)
+            await self._handle_success(workstream_id, running)
         else:
             self._logger.warning(
-                "Zadacha '%s' failed (code %d)",
-                zadacha_id,
+                "Workstream '%s' failed (code %d)",
+                workstream_id,
                 return_code,
             )
             await self._handle_failure(
-                zadacha_id,
+                workstream_id,
                 f"spec-runner exited with code {return_code}",
             )
 
     async def _handle_success(
         self,
-        zadacha_id: str,
-        _running: RunningZadacha,
+        workstream_id: str,
+        _running: RunningWorkstream,
     ) -> None:
-        """Handle successful zadacha completion.
+        """Handle successful workstream completion.
 
         Push branch, create PR, cleanup workspace.
         """
-        zadacha = await self._db.get_zadacha(zadacha_id)
+        workstream = await self._db.get_workstream(workstream_id)
 
         # Transition to MERGING
-        await self._db.update_zadacha_status(
-            zadacha_id,
-            ZadachaStatus.MERGING,
-            expected_status=ZadachaStatus.RUNNING,
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.MERGING,
+            expected_status=WorkstreamStatus.RUNNING,
         )
 
         # Push branch and create PR
         if self._config.auto_pr:
             try:
                 pr_url = self._pr_manager.push_and_create_pr(
-                    branch=zadacha.branch,
-                    title=f"[Maestro] {zadacha.title}",
-                    body=self._build_pr_body(zadacha),
+                    branch=workstream.branch,
+                    title=f"[Maestro] {workstream.title}",
+                    body=self._build_pr_body(workstream),
                     base_branch=self._config.base_branch,
                 )
 
-                await self._db.update_zadacha_status(
-                    zadacha_id,
-                    ZadachaStatus.PR_CREATED,
+                await self._db.update_workstream_status(
+                    workstream_id,
+                    WorkstreamStatus.PR_CREATED,
                     pr_url=pr_url,
                 )
 
                 self._stats.prs_created += 1
                 self._logger.info(
                     "Created PR for '%s': %s",
-                    zadacha_id,
+                    workstream_id,
                     pr_url,
                 )
             except PRManagerError as e:
                 self._logger.warning(
                     "Failed to create PR for '%s': %s",
-                    zadacha_id,
+                    workstream_id,
                     e,
                 )
                 # Still mark as PR_CREATED (PR may exist)
-                await self._db.update_zadacha_status(
-                    zadacha_id,
-                    ZadachaStatus.PR_CREATED,
+                await self._db.update_workstream_status(
+                    workstream_id,
+                    WorkstreamStatus.PR_CREATED,
                     error_message=f"PR creation note: {e}",
                 )
 
         # Mark as DONE
-        current = await self._db.get_zadacha(zadacha_id)
-        if current.status == ZadachaStatus.PR_CREATED:
-            await self._db.update_zadacha_status(
-                zadacha_id,
-                ZadachaStatus.DONE,
-                expected_status=ZadachaStatus.PR_CREATED,
+        current = await self._db.get_workstream(workstream_id)
+        if current.status == WorkstreamStatus.PR_CREATED:
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.DONE,
+                expected_status=WorkstreamStatus.PR_CREATED,
             )
-        elif current.status == ZadachaStatus.MERGING:
+        elif current.status == WorkstreamStatus.MERGING:
             # No PR created (auto_pr=False)
             # MERGING -> can't go to DONE directly, so
             # transition through PR_CREATED
-            await self._db.update_zadacha_status(
-                zadacha_id,
-                ZadachaStatus.PR_CREATED,
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.PR_CREATED,
             )
-            await self._db.update_zadacha_status(
-                zadacha_id,
-                ZadachaStatus.DONE,
-                expected_status=ZadachaStatus.PR_CREATED,
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.DONE,
+                expected_status=WorkstreamStatus.PR_CREATED,
             )
 
         self._stats.completed += 1
@@ -614,66 +616,66 @@ class Orchestrator:
         await asyncio.get_running_loop().run_in_executor(
             None,
             self._merge_into_base,
-            zadacha.branch,
+            workstream.branch,
         )
 
         # Cleanup workspace
-        self._workspace_mgr.cleanup_workspace(zadacha_id)
+        self._workspace_mgr.cleanup_workspace(workstream_id)
 
     async def _handle_failure(
         self,
-        zadacha_id: str,
+        workstream_id: str,
         error_message: str,
     ) -> None:
-        """Handle zadacha failure with retry logic."""
-        zadacha = await self._db.get_zadacha(zadacha_id)
+        """Handle workstream failure with retry logic."""
+        workstream = await self._db.get_workstream(workstream_id)
 
-        if zadacha.can_retry():
-            new_count = zadacha.retry_count + 1
+        if workstream.can_retry():
+            new_count = workstream.retry_count + 1
             self._logger.info(
-                "Retrying zadacha '%s' (%d/%d)",
-                zadacha_id,
+                "Retrying workstream '%s' (%d/%d)",
+                workstream_id,
                 new_count,
-                zadacha.max_retries,
+                workstream.max_retries,
             )
-            await self._db.update_zadacha_status(
-                zadacha_id,
-                ZadachaStatus.FAILED,
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.FAILED,
                 error_message=error_message,
                 retry_count=new_count,
             )
-            await self._db.update_zadacha_status(
-                zadacha_id,
-                ZadachaStatus.READY,
-                expected_status=ZadachaStatus.FAILED,
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.READY,
+                expected_status=WorkstreamStatus.FAILED,
             )
         else:
             self._logger.warning(
-                "Zadacha '%s' exhausted retries",
-                zadacha_id,
+                "Workstream '%s' exhausted retries",
+                workstream_id,
             )
-            await self._db.update_zadacha_status(
-                zadacha_id,
-                ZadachaStatus.FAILED,
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.FAILED,
                 error_message=error_message,
             )
-            await self._db.update_zadacha_status(
-                zadacha_id,
-                ZadachaStatus.NEEDS_REVIEW,
-                expected_status=ZadachaStatus.FAILED,
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=WorkstreamStatus.FAILED,
             )
             self._stats.failed += 1
 
-    def _build_pr_body(self, zadacha: Zadacha) -> str:
-        """Build PR body from zadacha info."""
-        scope_str = "\n".join(f"- `{s}`" for s in zadacha.scope)
+    def _build_pr_body(self, workstream: Workstream) -> str:
+        """Build PR body from workstream info."""
+        scope_str = "\n".join(f"- `{s}`" for s in workstream.scope)
         return (
             f"## Summary\n\n"
-            f"{zadacha.description}\n\n"
+            f"{workstream.description}\n\n"
             f"## Scope\n\n"
             f"{scope_str}\n\n"
             f"## Progress\n\n"
-            f"{zadacha.subtask_progress or 'N/A'}\n\n"
+            f"{workstream.subtask_progress or 'N/A'}\n\n"
             f"---\n"
             f"🤖 Generated by Maestro Orchestrator"
         )
@@ -707,25 +709,25 @@ class Orchestrator:
                 await running.process.wait()
             except OSError as e:
                 self._logger.debug(
-                    "Failed to terminate process for zadacha %s during cleanup: %s",
+                    "Failed to terminate process for workstream %s during cleanup: %s",
                     zid,
                     e,
                 )
 
             try:
-                await self._db.update_zadacha_status(
+                await self._db.update_workstream_status(
                     zid,
-                    ZadachaStatus.FAILED,
+                    WorkstreamStatus.FAILED,
                     error_message="Orchestrator shutdown",
                 )
-                await self._db.update_zadacha_status(
+                await self._db.update_workstream_status(
                     zid,
-                    ZadachaStatus.READY,
-                    expected_status=ZadachaStatus.FAILED,
+                    WorkstreamStatus.READY,
+                    expected_status=WorkstreamStatus.FAILED,
                 )
             except Exception as e:
                 self._logger.warning(
-                    "Failed to update zadacha '%s' during cleanup: %s",
+                    "Failed to update workstream '%s' during cleanup: %s",
                     zid,
                     e,
                 )

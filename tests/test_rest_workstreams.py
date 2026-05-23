@@ -1,7 +1,7 @@
-"""Tests for REST API zadachi endpoints.
+"""Tests for REST API workstreams endpoints.
 
-This module contains unit tests for the zadachi-related REST API endpoints:
-GET /zadachi, GET /zadachi/{zadacha_id}, and POST /zadachi/{zadacha_id}/callback.
+This module contains unit tests for the workstreams-related REST API endpoints:
+GET /workstreams, GET /workstreams/{workstream_id}, and POST /workstreams/{workstream_id}/callback.
 """
 
 from collections.abc import AsyncGenerator
@@ -11,8 +11,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from maestro.coordination.rest_api import create_app_with_lifespan
-from maestro.database import ZadachaNotFoundError
-from maestro.models import Zadacha, ZadachaStatus
+from maestro.database import WorkstreamNotFoundError
+from maestro.models import Workstream, WorkstreamStatus
 
 
 # =============================================================================
@@ -29,15 +29,15 @@ def mock_db() -> AsyncMock:
 
 
 @pytest.fixture
-def sample_zadacha() -> Zadacha:
-    """Provide a sample zadacha for testing."""
-    return Zadacha(
-        id="zadacha-001",
+def sample_workstream() -> Workstream:
+    """Provide a sample workstream for testing."""
+    return Workstream(
+        id="workstream-001",
         title="Implement auth module",
         description="Add authentication to the API",
-        branch="agent/zadacha-001",
-        workspace_path="/tmp/worktree/zadacha-001",
-        status=ZadachaStatus.RUNNING,
+        branch="agent/workstream-001",
+        workspace_path="/tmp/worktree/workstream-001",
+        status=WorkstreamStatus.RUNNING,
         scope=["src/auth/**/*.py"],
         priority=10,
         pr_url=None,
@@ -49,15 +49,15 @@ def sample_zadacha() -> Zadacha:
 
 
 @pytest.fixture
-def sample_zadacha_done() -> Zadacha:
-    """Provide a completed zadacha for testing."""
-    return Zadacha(
-        id="zadacha-002",
+def sample_workstream_done() -> Workstream:
+    """Provide a completed workstream for testing."""
+    return Workstream(
+        id="workstream-002",
         title="Fix database migration",
         description="Update schema migration scripts",
-        branch="agent/zadacha-002",
-        workspace_path="/tmp/worktree/zadacha-002",
-        status=ZadachaStatus.DONE,
+        branch="agent/workstream-002",
+        workspace_path="/tmp/worktree/workstream-002",
+        status=WorkstreamStatus.DONE,
         scope=["migrations/**/*.sql"],
         priority=5,
         pr_url="https://github.com/test/repo/pull/42",
@@ -70,7 +70,7 @@ def sample_zadacha_done() -> Zadacha:
 
 @pytest.fixture
 async def client(mock_db: AsyncMock) -> AsyncGenerator[AsyncClient, None]:
-    """Provide an async HTTP client for testing zadachi endpoints."""
+    """Provide an async HTTP client for testing workstreams endpoints."""
     app = create_app_with_lifespan()
     transport = ASGITransport(app=app)
     with patch("maestro.coordination.rest_api._db", mock_db):
@@ -79,89 +79,91 @@ async def client(mock_db: AsyncMock) -> AsyncGenerator[AsyncClient, None]:
 
 
 # =============================================================================
-# Unit Tests: List Zadachi
+# Unit Tests: List Workstreams
 # =============================================================================
 
 
-class TestListZadachi:
-    """Tests for GET /zadachi endpoint."""
+class TestListWorkstreams:
+    """Tests for GET /workstreams endpoint."""
 
     @pytest.mark.anyio
-    async def test_list_zadachi_returns_list(
+    async def test_list_workstreams_returns_list(
         self,
         client: AsyncClient,
         mock_db: AsyncMock,
-        sample_zadacha: Zadacha,
-        sample_zadacha_done: Zadacha,
+        sample_workstream: Workstream,
+        sample_workstream_done: Workstream,
     ) -> None:
-        """Test that GET /zadachi returns a list of zadachi."""
-        mock_db.get_all_zadachi.return_value = [
-            sample_zadacha,
-            sample_zadacha_done,
+        """Test that GET /workstreams returns a list of workstreams."""
+        mock_db.get_all_workstreams.return_value = [
+            sample_workstream,
+            sample_workstream_done,
         ]
 
-        response = await client.get("/zadachi")
+        response = await client.get("/workstreams")
 
         assert response.status_code == 200
         data = response.json()
         assert data["count"] == 2
-        assert len(data["zadachi"]) == 2
-        assert data["zadachi"][0]["id"] == "zadacha-001"
-        assert data["zadachi"][0]["title"] == "Implement auth module"
-        assert data["zadachi"][0]["status"] == "running"
-        assert data["zadachi"][0]["scope"] == ["src/auth/**/*.py"]
-        assert data["zadachi"][0]["priority"] == 10
-        assert data["zadachi"][0]["subtask_progress"] == "2/5 done"
-        assert data["zadachi"][1]["id"] == "zadacha-002"
-        assert data["zadachi"][1]["status"] == "done"
-        assert data["zadachi"][1]["pr_url"] == "https://github.com/test/repo/pull/42"
-        mock_db.get_all_zadachi.assert_awaited_once()
+        assert len(data["workstreams"]) == 2
+        assert data["workstreams"][0]["id"] == "workstream-001"
+        assert data["workstreams"][0]["title"] == "Implement auth module"
+        assert data["workstreams"][0]["status"] == "running"
+        assert data["workstreams"][0]["scope"] == ["src/auth/**/*.py"]
+        assert data["workstreams"][0]["priority"] == 10
+        assert data["workstreams"][0]["subtask_progress"] == "2/5 done"
+        assert data["workstreams"][1]["id"] == "workstream-002"
+        assert data["workstreams"][1]["status"] == "done"
+        assert (
+            data["workstreams"][1]["pr_url"] == "https://github.com/test/repo/pull/42"
+        )
+        mock_db.get_all_workstreams.assert_awaited_once()
 
     @pytest.mark.anyio
-    async def test_list_zadachi_empty(
+    async def test_list_workstreams_empty(
         self,
         client: AsyncClient,
         mock_db: AsyncMock,
     ) -> None:
-        """Test that GET /zadachi returns empty list when no zadachi exist."""
-        mock_db.get_all_zadachi.return_value = []
+        """Test that GET /workstreams returns empty list when no workstreams exist."""
+        mock_db.get_all_workstreams.return_value = []
 
-        response = await client.get("/zadachi")
+        response = await client.get("/workstreams")
 
         assert response.status_code == 200
         data = response.json()
-        assert data["zadachi"] == []
+        assert data["workstreams"] == []
         assert data["count"] == 0
-        mock_db.get_all_zadachi.assert_awaited_once()
+        mock_db.get_all_workstreams.assert_awaited_once()
 
 
 # =============================================================================
-# Unit Tests: Get Zadacha Detail
+# Unit Tests: Get Workstream Detail
 # =============================================================================
 
 
-class TestGetZadachaDetail:
-    """Tests for GET /zadachi/{zadacha_id} endpoint."""
+class TestGetWorkstreamDetail:
+    """Tests for GET /workstreams/{workstream_id} endpoint."""
 
     @pytest.mark.anyio
-    async def test_get_zadacha_returns_detail(
+    async def test_get_workstream_returns_detail(
         self,
         client: AsyncClient,
         mock_db: AsyncMock,
-        sample_zadacha: Zadacha,
+        sample_workstream: Workstream,
     ) -> None:
-        """Test that GET /zadachi/{id} returns zadacha details."""
-        mock_db.get_zadacha.return_value = sample_zadacha
+        """Test that GET /workstreams/{id} returns workstream details."""
+        mock_db.get_workstream.return_value = sample_workstream
 
-        response = await client.get("/zadachi/zadacha-001")
+        response = await client.get("/workstreams/workstream-001")
 
         assert response.status_code == 200
         data = response.json()
-        assert data["id"] == "zadacha-001"
+        assert data["id"] == "workstream-001"
         assert data["title"] == "Implement auth module"
         assert data["description"] == "Add authentication to the API"
-        assert data["branch"] == "agent/zadacha-001"
-        assert data["workspace_path"] == "/tmp/worktree/zadacha-001"
+        assert data["branch"] == "agent/workstream-001"
+        assert data["workspace_path"] == "/tmp/worktree/workstream-001"
         assert data["status"] == "running"
         assert data["scope"] == ["src/auth/**/*.py"]
         assert data["priority"] == 10
@@ -170,47 +172,47 @@ class TestGetZadachaDetail:
         assert data["error_message"] is None
         assert data["retry_count"] == 0
         assert data["max_retries"] == 2
-        mock_db.get_zadacha.assert_awaited_once_with("zadacha-001")
+        mock_db.get_workstream.assert_awaited_once_with("workstream-001")
 
     @pytest.mark.anyio
-    async def test_get_zadacha_not_found(
+    async def test_get_workstream_not_found(
         self,
         client: AsyncClient,
         mock_db: AsyncMock,
     ) -> None:
-        """Test that GET /zadachi/{id} returns 404 when not found."""
-        mock_db.get_zadacha.side_effect = ZadachaNotFoundError(
-            "Zadacha 'nonexistent' not found"
+        """Test that GET /workstreams/{id} returns 404 when not found."""
+        mock_db.get_workstream.side_effect = WorkstreamNotFoundError(
+            "Workstream 'nonexistent' not found"
         )
 
-        response = await client.get("/zadachi/nonexistent")
+        response = await client.get("/workstreams/nonexistent")
 
         assert response.status_code == 404
         assert "not found" in response.json()["detail"].lower()
-        mock_db.get_zadacha.assert_awaited_once_with("nonexistent")
+        mock_db.get_workstream.assert_awaited_once_with("nonexistent")
 
 
 # =============================================================================
-# Unit Tests: Zadacha Callback
+# Unit Tests: Workstream Callback
 # =============================================================================
 
 
-class TestZadachaCallback:
-    """Tests for POST /zadachi/{zadacha_id}/callback endpoint."""
+class TestWorkstreamCallback:
+    """Tests for POST /workstreams/{workstream_id}/callback endpoint."""
 
     @pytest.mark.anyio
-    async def test_callback_updates_zadacha(
+    async def test_callback_updates_workstream(
         self,
         client: AsyncClient,
         mock_db: AsyncMock,
-        sample_zadacha: Zadacha,
+        sample_workstream: Workstream,
     ) -> None:
-        """Test that valid callback updates zadacha status."""
-        mock_db.get_zadacha.return_value = sample_zadacha
-        mock_db.update_zadacha_status.return_value = sample_zadacha
+        """Test that valid callback updates workstream status."""
+        mock_db.get_workstream.return_value = sample_workstream
+        mock_db.update_workstream_status.return_value = sample_workstream
 
         response = await client.post(
-            "/zadachi/zadacha-001/callback",
+            "/workstreams/workstream-001/callback",
             json={
                 "task_id": "subtask-3",
                 "status": "completed",
@@ -221,27 +223,27 @@ class TestZadachaCallback:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert "Updated zadacha-001" in data["message"]
-        mock_db.get_zadacha.assert_awaited_once_with("zadacha-001")
-        mock_db.update_zadacha_status.assert_awaited_once_with(
-            "zadacha-001",
-            ZadachaStatus.RUNNING,
+        assert "Updated workstream-001" in data["message"]
+        mock_db.get_workstream.assert_awaited_once_with("workstream-001")
+        mock_db.update_workstream_status.assert_awaited_once_with(
+            "workstream-001",
+            WorkstreamStatus.RUNNING,
             subtask_progress="subtask-3: completed",
         )
 
     @pytest.mark.anyio
-    async def test_callback_zadacha_not_found(
+    async def test_callback_workstream_not_found(
         self,
         client: AsyncClient,
         mock_db: AsyncMock,
     ) -> None:
-        """Test that callback returns failure when zadacha not found."""
-        mock_db.get_zadacha.side_effect = ZadachaNotFoundError(
-            "Zadacha 'missing' not found"
+        """Test that callback returns failure when workstream not found."""
+        mock_db.get_workstream.side_effect = WorkstreamNotFoundError(
+            "Workstream 'missing' not found"
         )
 
         response = await client.post(
-            "/zadachi/missing/callback",
+            "/workstreams/missing/callback",
             json={
                 "task_id": "subtask-1",
                 "status": "failed",
@@ -262,7 +264,7 @@ class TestZadachaCallback:
     ) -> None:
         """Test that invalid callback payload returns 422."""
         response = await client.post(
-            "/zadachi/zadacha-001/callback",
+            "/workstreams/workstream-001/callback",
             json={"invalid": "payload"},
         )
 
@@ -276,7 +278,7 @@ class TestZadachaCallback:
     ) -> None:
         """Test that missing required fields in callback returns 422."""
         response = await client.post(
-            "/zadachi/zadacha-001/callback",
+            "/workstreams/workstream-001/callback",
             json={"task_id": "subtask-1"},
         )
 
@@ -287,14 +289,14 @@ class TestZadachaCallback:
         self,
         client: AsyncClient,
         mock_db: AsyncMock,
-        sample_zadacha: Zadacha,
+        sample_workstream: Workstream,
     ) -> None:
         """Test callback with optional error field."""
-        mock_db.get_zadacha.return_value = sample_zadacha
-        mock_db.update_zadacha_status.return_value = sample_zadacha
+        mock_db.get_workstream.return_value = sample_workstream
+        mock_db.update_workstream_status.return_value = sample_workstream
 
         response = await client.post(
-            "/zadachi/zadacha-001/callback",
+            "/workstreams/workstream-001/callback",
             json={
                 "task_id": "subtask-5",
                 "status": "failed",
@@ -306,9 +308,9 @@ class TestZadachaCallback:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        mock_db.update_zadacha_status.assert_awaited_once_with(
-            "zadacha-001",
-            ZadachaStatus.RUNNING,
+        mock_db.update_workstream_status.assert_awaited_once_with(
+            "workstream-001",
+            WorkstreamStatus.RUNNING,
             subtask_progress="subtask-5: failed",
         )
 
@@ -317,14 +319,14 @@ class TestZadachaCallback:
         self,
         client: AsyncClient,
         mock_db: AsyncMock,
-        sample_zadacha: Zadacha,
+        sample_workstream: Workstream,
     ) -> None:
         """Test callback uses default duration_seconds when omitted."""
-        mock_db.get_zadacha.return_value = sample_zadacha
-        mock_db.update_zadacha_status.return_value = sample_zadacha
+        mock_db.get_workstream.return_value = sample_workstream
+        mock_db.update_workstream_status.return_value = sample_workstream
 
         response = await client.post(
-            "/zadachi/zadacha-001/callback",
+            "/workstreams/workstream-001/callback",
             json={
                 "task_id": "subtask-1",
                 "status": "started",

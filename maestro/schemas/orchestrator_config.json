@@ -115,11 +115,11 @@
       "title": "SpecRunnerConfig",
       "type": "object"
     },
-    "ZadachaConfig": {
-      "description": "Configuration for a single zadacha (independent work unit).\n\nUsed in YAML config or produced by auto-decomposition.",
+    "WorkstreamConfig": {
+      "description": "Configuration for a single workstream (independent work unit).\n\nUsed in YAML config or produced by auto-decomposition.",
       "properties": {
         "id": {
-          "description": "Unique zadacha identifier",
+          "description": "Unique workstream identifier",
           "minLength": 1,
           "title": "Id",
           "type": "string"
@@ -137,7 +137,7 @@
           "type": "string"
         },
         "scope": {
-          "description": "File/directory globs this zadacha owns",
+          "description": "File/directory globs this workstream owns",
           "items": {
             "type": "string"
           },
@@ -145,7 +145,7 @@
           "type": "array"
         },
         "depends_on": {
-          "description": "IDs of zadachi this one depends on",
+          "description": "IDs of workstreams this one depends on",
           "items": {
             "type": "string"
           },
@@ -166,7 +166,7 @@
         "title",
         "description"
       ],
-      "title": "ZadachaConfig",
+      "title": "WorkstreamConfig",
       "type": "object"
     }
   },
@@ -204,7 +204,7 @@
     },
     "max_concurrent": {
       "default": 3,
-      "description": "Max concurrent zadachi (1-100)",
+      "description": "Max concurrent workstreams (1-100)",
       "maximum": 100,
       "minimum": 1,
       "title": "Max Concurrent",
@@ -218,13 +218,13 @@
     },
     "branch_prefix": {
       "default": "feature/",
-      "description": "Prefix for zadacha branches",
+      "description": "Prefix for workstream branches",
       "title": "Branch Prefix",
       "type": "string"
     },
     "auto_pr": {
       "default": true,
-      "description": "Auto-create PR after zadacha completes",
+      "description": "Auto-create PR after workstream completes",
       "title": "Auto Pr",
       "type": "boolean"
     },
@@ -232,12 +232,12 @@
       "$ref": "#/$defs/SpecRunnerConfig",
       "description": "Spec-runner configuration"
     },
-    "zadachi": {
-      "description": "Manual zadachi list (auto-decompose if empty)",
+    "workstreams": {
+      "description": "Manual workstreams list (auto-decompose if empty)",
       "items": {
-        "$ref": "#/$defs/ZadachaConfig"
+        "$ref": "#/$defs/WorkstreamConfig"
       },
-      "title": "Zadachi",
+      "title": "Workstreams",
       "type": "array"
     },
     "callback_url": {

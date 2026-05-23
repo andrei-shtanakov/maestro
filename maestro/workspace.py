@@ -1,7 +1,7 @@
 """Workspace management for multi-process orchestration.
 
 This module provides WorkspaceManager for creating and managing
-isolated git worktrees for each zadacha (independent work unit).
+isolated git worktrees for each workstream (independent work unit).
 """
 
 import shutil
@@ -26,9 +26,9 @@ class WorkspaceNotFoundError(WorkspaceError):
 
 
 class WorkspaceManager:
-    """Manages isolated workspaces for zadachi via git worktrees.
+    """Manages isolated workspaces for workstreams via git worktrees.
 
-    Each zadacha gets its own worktree directory with its own
+    Each workstream gets its own worktree directory with its own
     branch, providing filesystem-level isolation for parallel
     spec-runner processes.
     """
@@ -52,14 +52,14 @@ class WorkspaceManager:
         """Return the base directory for workspaces."""
         return self._workspace_base
 
-    def create_workspace(self, zadacha_id: str, branch: str) -> Path:
-        """Create an isolated workspace for a zadacha.
+    def create_workspace(self, workstream_id: str, branch: str) -> Path:
+        """Create an isolated workspace for a workstream.
 
-        Creates a git worktree at {workspace_base}/{zadacha_id}
+        Creates a git worktree at {workspace_base}/{workstream_id}
         on a new branch.
 
         Args:
-            zadacha_id: Unique identifier for the zadacha.
+            workstream_id: Unique identifier for the workstream.
             branch: Git branch name for this workspace.
 
         Returns:
@@ -69,7 +69,7 @@ class WorkspaceManager:
             WorkspaceExistsError: If workspace dir exists.
             WorkspaceError: If worktree creation fails.
         """
-        workspace_path = self._workspace_base / zadacha_id
+        workspace_path = self._workspace_base / workstream_id
 
         if workspace_path.exists():
             msg = f"Workspace directory already exists: {workspace_path}"
@@ -81,7 +81,7 @@ class WorkspaceManager:
         try:
             self._git.create_worktree(workspace_path, branch)
         except WorktreeError as e:
-            msg = f"Failed to create workspace for '{zadacha_id}': {e}"
+            msg = f"Failed to create workspace for '{workstream_id}': {e}"
             raise WorkspaceError(msg) from e
 
         return workspace_path
@@ -128,17 +128,17 @@ class WorkspaceManager:
         with config_file.open("w") as f:
             yaml.dump(config, f, default_flow_style=False)
 
-    def cleanup_workspace(self, zadacha_id: str, force: bool = True) -> None:
+    def cleanup_workspace(self, workstream_id: str, force: bool = True) -> None:
         """Remove a workspace and its worktree.
 
         Args:
-            zadacha_id: Identifier of the zadacha.
+            workstream_id: Identifier of the workstream.
             force: Force removal even if dirty.
 
         Raises:
             WorkspaceError: If cleanup fails.
         """
-        workspace_path = self._workspace_base / zadacha_id
+        workspace_path = self._workspace_base / workstream_id
 
         if not workspace_path.exists():
             return  # Already cleaned up
@@ -150,11 +150,11 @@ class WorkspaceManager:
             shutil.rmtree(workspace_path, ignore_errors=True)
             self._git.prune_worktrees()
 
-    def get_workspace_path(self, zadacha_id: str) -> Path:
-        """Get the workspace path for a zadacha.
+    def get_workspace_path(self, workstream_id: str) -> Path:
+        """Get the workspace path for a workstream.
 
         Args:
-            zadacha_id: Zadacha identifier.
+            workstream_id: Workstream identifier.
 
         Returns:
             Path to the workspace directory.
@@ -162,7 +162,7 @@ class WorkspaceManager:
         Raises:
             WorkspaceNotFoundError: If workspace not found.
         """
-        workspace_path = self._workspace_base / zadacha_id
+        workspace_path = self._workspace_base / workstream_id
 
         if not workspace_path.exists():
             msg = f"Workspace not found: {workspace_path}"
@@ -170,9 +170,9 @@ class WorkspaceManager:
 
         return workspace_path
 
-    def workspace_exists(self, zadacha_id: str) -> bool:
-        """Check if a workspace exists for a zadacha."""
-        return (self._workspace_base / zadacha_id).exists()
+    def workspace_exists(self, workstream_id: str) -> bool:
+        """Check if a workspace exists for a workstream."""
+        return (self._workspace_base / workstream_id).exists()
 
     def list_workspaces(self) -> list[Path]:
         """List all workspace directories.
@@ -192,5 +192,5 @@ class WorkspaceManager:
     def cleanup_all(self) -> None:
         """Remove all workspaces and their worktrees."""
         for workspace in self.list_workspaces():
-            zadacha_id = workspace.name
-            self.cleanup_workspace(zadacha_id, force=True)
+            workstream_id = workspace.name
+            self.cleanup_workspace(workstream_id, force=True)

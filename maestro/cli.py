@@ -43,7 +43,7 @@ from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
 from maestro.decomposer import ProjectDecomposer
 from maestro.git import GitManager
-from maestro.models import ArbiterMode, OrchestratorConfig, TaskStatus, ZadachaStatus
+from maestro.models import ArbiterMode, OrchestratorConfig, TaskStatus, WorkstreamStatus
 from maestro.orchestrator import Orchestrator
 from maestro.pr_manager import PRManager
 from maestro.spawners import AiderSpawner, AnnounceSpawner, CodexSpawner
@@ -816,29 +816,29 @@ def approve_command(
 # =================================================================
 
 
-def _get_zadacha_status_style(
-    status: ZadachaStatus,
+def _get_workstream_status_style(
+    status: WorkstreamStatus,
 ) -> str:
-    """Return Rich style for zadacha status."""
+    """Return Rich style for workstream status."""
     styles = {
-        ZadachaStatus.DONE: "green",
-        ZadachaStatus.RUNNING: "yellow",
-        ZadachaStatus.DECOMPOSING: "yellow",
-        ZadachaStatus.MERGING: "yellow",
-        ZadachaStatus.PR_CREATED: "blue",
-        ZadachaStatus.FAILED: "red",
-        ZadachaStatus.NEEDS_REVIEW: "red",
-        ZadachaStatus.PENDING: "dim",
-        ZadachaStatus.READY: "cyan",
-        ZadachaStatus.ABANDONED: "dim red",
+        WorkstreamStatus.DONE: "green",
+        WorkstreamStatus.RUNNING: "yellow",
+        WorkstreamStatus.DECOMPOSING: "yellow",
+        WorkstreamStatus.MERGING: "yellow",
+        WorkstreamStatus.PR_CREATED: "blue",
+        WorkstreamStatus.FAILED: "red",
+        WorkstreamStatus.NEEDS_REVIEW: "red",
+        WorkstreamStatus.PENDING: "dim",
+        WorkstreamStatus.READY: "cyan",
+        WorkstreamStatus.ABANDONED: "dim red",
     }
     return styles.get(status, "white")
 
 
-def _display_zadachi_table(zadachi: list, title: str = "Zadachi") -> None:
-    """Display zadachi in a rich table."""
-    if not zadachi:
-        console.print("[dim]No zadachi found.[/dim]")
+def _display_workstreams_table(workstreams: list, title: str = "Workstreams") -> None:
+    """Display workstreams in a rich table."""
+    if not workstreams:
+        console.print("[dim]No workstreams found.[/dim]")
         return
 
     table = Table(
@@ -853,8 +853,8 @@ def _display_zadachi_table(zadachi: list, title: str = "Zadachi") -> None:
     table.add_column("Progress", justify="center")
     table.add_column("PR", style="blue", max_width=30)
 
-    for z in zadachi:
-        style = _get_zadacha_status_style(z.status)
+    for z in workstreams:
+        style = _get_workstream_status_style(z.status)
         status_text = Text(z.status.value.upper(), style=style)
         pr_text = z.pr_url or ""
         if len(pr_text) > 30:
@@ -907,20 +907,20 @@ async def _run_orchestrator(
     db = await create_database(db_path)
 
     if resume:
-        existing_zadachi = await db.get_all_zadachi()
-        if existing_zadachi:
+        existing_workstreams = await db.get_all_workstreams()
+        if existing_workstreams:
             console.print(
-                f"[cyan]Resuming with {len(existing_zadachi)} existing zadachi[/cyan]"
+                f"[cyan]Resuming with {len(existing_workstreams)} existing workstreams[/cyan]"
             )
     else:
-        existing_zadachi = await db.get_all_zadachi()
-        if existing_zadachi:
+        existing_workstreams = await db.get_all_workstreams()
+        if existing_workstreams:
             console.print(
-                f"[yellow]Clearing {len(existing_zadachi)} existing zadachi "
+                f"[yellow]Clearing {len(existing_workstreams)} existing workstreams "
                 "state (use --resume to continue where you left off).[/yellow]"
             )
-            for zadacha in existing_zadachi:
-                await db.delete_zadacha(zadacha.id)
+            for workstream in existing_workstreams:
+                await db.delete_workstream(workstream.id)
 
     repo_path, workspace_base, log_dir = _resolve_orchestrator_paths(config, log_dir)
     lock_fd: int | None = None
@@ -969,13 +969,13 @@ async def _run_orchestrator(
         stats = await orchestrator.run()
 
         # Display final state
-        zadachi = await db.get_all_zadachi()
+        workstreams = await db.get_all_workstreams()
         console.print()
-        _display_zadachi_table(zadachi, "Final Status")
+        _display_workstreams_table(workstreams, "Final Status")
 
         console.print(
             Panel(
-                f"Total: {stats.total_zadachi}\n"
+                f"Total: {stats.total_workstreams}\n"
                 f"Completed: {stats.completed}\n"
                 f"Failed: {stats.failed}\n"
                 f"PRs created: {stats.prs_created}",
@@ -992,8 +992,8 @@ async def _run_orchestrator(
             _release_pid_lock(lock_fd)
 
 
-async def _show_zadachi_status(db_path: Path) -> None:
-    """Show status of all zadachi."""
+async def _show_workstreams_status(db_path: Path) -> None:
+    """Show status of all workstreams."""
     if not db_path.exists():  # noqa: ASYNC240
         err_console.print(f"[red]Database not found:[/red] {db_path}")
         raise typer.Exit(1)
@@ -1002,8 +1002,8 @@ async def _show_zadachi_status(db_path: Path) -> None:
     await db.connect()
 
     try:
-        zadachi = await db.get_all_zadachi()
-        _display_zadachi_table(zadachi, "Zadachi Status")
+        workstreams = await db.get_all_workstreams()
+        _display_workstreams_table(workstreams, "Workstreams Status")
     finally:
         await db.close()
 
@@ -1048,7 +1048,7 @@ def orchestrate_command(
 ) -> None:
     """Run multi-process orchestration from project config.
 
-    Decomposes the project into independent zadachi,
+    Decomposes the project into independent workstreams,
     creates isolated worktrees, and runs spec-runner
     in each one.
 
@@ -1066,8 +1066,8 @@ def orchestrate_command(
         raise typer.Exit(130) from None
 
 
-@app.command("zadachi")
-def zadachi_command(
+@app.command("workstreams")
+def workstreams_command(
     db: Annotated[
         Path | None,
         typer.Option(
@@ -1077,14 +1077,14 @@ def zadachi_command(
         ),
     ] = None,
 ) -> None:
-    """Show status of all zadachi.
+    """Show status of all workstreams.
 
     Examples:
-        maestro zadachi
-        maestro zadachi --db /path/to/state.db
+        maestro workstreams
+        maestro workstreams --db /path/to/state.db
     """
     db_path = db or DEFAULT_DB_PATH
-    asyncio.run(_show_zadachi_status(db_path))
+    asyncio.run(_show_workstreams_status(db_path))
 
 
 @app.command("workspaces")
@@ -1123,7 +1123,7 @@ def workspaces_command(
         show_header=True,
         header_style="bold",
     )
-    table.add_column("Zadacha", style="cyan")
+    table.add_column("Workstream", style="cyan")
     table.add_column("Path", style="dim")
 
     for d in dirs:

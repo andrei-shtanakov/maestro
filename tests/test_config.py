@@ -753,7 +753,7 @@ project: test
 repo_url: https://github.com/test/repo
 repo_path: /tmp/test-repo
 workspace_base: /tmp/test-ws
-zadachi: []
+workstreams: []
 """
 
 

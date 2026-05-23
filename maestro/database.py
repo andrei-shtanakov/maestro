@@ -24,8 +24,8 @@ from maestro.models import (
     TaskCost,
     TaskStatus,
     TaskType,
-    Zadacha,
-    ZadachaStatus,
+    Workstream,
+    WorkstreamStatus,
 )
 
 
@@ -139,7 +139,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_to_agent ON messages(to_agent, read);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_task_id ON agent_logs(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_costs_task_id ON task_costs(task_id);
 
-CREATE TABLE IF NOT EXISTS zadachi (
+CREATE TABLE IF NOT EXISTS workstreams (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     description TEXT NOT NULL,
@@ -159,15 +159,15 @@ CREATE TABLE IF NOT EXISTS zadachi (
     completed_at TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS zadacha_dependencies (
-    zadacha_id TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS workstream_dependencies (
+    workstream_id TEXT NOT NULL,
     depends_on TEXT NOT NULL,
-    PRIMARY KEY (zadacha_id, depends_on),
-    FOREIGN KEY (zadacha_id) REFERENCES zadachi(id) ON DELETE CASCADE,
-    FOREIGN KEY (depends_on) REFERENCES zadachi(id) ON DELETE CASCADE
+    PRIMARY KEY (workstream_id, depends_on),
+    FOREIGN KEY (workstream_id) REFERENCES workstreams(id) ON DELETE CASCADE,
+    FOREIGN KEY (depends_on) REFERENCES workstreams(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_zadachi_status ON zadachi(status);
+CREATE INDEX IF NOT EXISTS idx_workstreams_status ON workstreams(status);
 """
 
 
@@ -271,26 +271,26 @@ def _row_to_task_cost(row: aiosqlite.Row) -> TaskCost:
     )
 
 
-class ZadachaNotFoundError(DatabaseError):
-    """Raised when a zadacha is not found in the database."""
+class WorkstreamNotFoundError(DatabaseError):
+    """Raised when a workstream is not found in the database."""
 
 
-class ZadachaAlreadyExistsError(DatabaseError):
-    """Raised when attempting to create a zadacha that already exists."""
+class WorkstreamAlreadyExistsError(DatabaseError):
+    """Raised when attempting to create a workstream that already exists."""
 
 
-def _row_to_zadacha(row: aiosqlite.Row) -> Zadacha:
-    """Convert a database row to a Zadacha model."""
+def _row_to_workstream(row: aiosqlite.Row) -> Workstream:
+    """Convert a database row to a Workstream model."""
     scope_json = row["scope"]
     scope = json.loads(scope_json) if scope_json else []
 
-    return Zadacha(
+    return Workstream(
         id=row["id"],
         title=row["title"],
         description=row["description"],
         branch=row["branch"],
         workspace_path=row["workspace_path"],
-        status=ZadachaStatus(row["status"]),
+        status=WorkstreamStatus(row["status"]),
         scope=scope,
         priority=row["priority"],
         pr_url=row["pr_url"],
@@ -378,6 +378,11 @@ class Database:
         ordered: list[tuple[int, str, Callable[[], Awaitable[None]]]] = [
             (1, "r02_arbiter_columns", self._migrate_tasks_arbiter_columns),
             (2, "r03_arbiter_routing", self._migrate_tasks_arbiter_routing),
+            (
+                3,
+                "r06b_rename_zadachi_to_workstreams",
+                self._migrate_rename_zadachi_to_workstreams,
+            ),
         ]
 
         for version, name, fn in ordered:
@@ -450,6 +455,70 @@ class Database:
         for column, ddl in migrations:
             if column not in columns:
                 await self._connection.execute(ddl)
+
+    async def _migrate_rename_zadachi_to_workstreams(self) -> None:
+        """Migration 3: rename zadachi → workstreams tables (R-06b rename).
+
+        Handles three cases detected via sqlite_master:
+
+        1. Fresh DB — SCHEMA_SQL already created `workstreams`, no `zadachi`
+           exists → no-op.
+        2. Old DB migrated before SCHEMA_SQL ran — only `zadachi` exists →
+           rename in place.
+        3. Transitional case — SCHEMA_SQL already created an empty `workstreams`
+           AND the old `zadachi` table still holds data → copy rows, then drop
+           the old table.
+        """
+        assert self._connection is not None  # narrowed by caller
+        cursor = await self._connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name IN ('zadachi', 'workstreams')"
+        )
+        existing = {row["name"] for row in await cursor.fetchall()}
+
+        if "zadachi" not in existing:
+            return  # fresh DB or already fully migrated
+
+        if "workstreams" not in existing:
+            # Case 2: only zadachi exists — rename in place
+            await self._connection.execute("ALTER TABLE zadachi RENAME TO workstreams")
+            await self._connection.execute(
+                "ALTER TABLE zadacha_dependencies RENAME TO workstream_dependencies"
+            )
+            # SQLite 3.25.0+ supports RENAME COLUMN (aiosqlite requires 3.25+)
+            await self._connection.execute(
+                "ALTER TABLE workstream_dependencies "
+                "RENAME COLUMN zadacha_id TO workstream_id"
+            )
+        else:
+            # Case 3: both tables exist (SCHEMA_SQL created workstreams before
+            # migration ran). Copy any data from zadachi → workstreams and drop.
+            await self._connection.execute(
+                """
+                INSERT OR IGNORE INTO workstreams
+                SELECT * FROM zadachi
+                """
+            )
+            # Migrate dependency rows too
+            cursor_dep = await self._connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name IN ('zadacha_dependencies', 'workstream_dependencies')"
+            )
+            dep_tables = {row["name"] for row in await cursor_dep.fetchall()}
+            if "zadacha_dependencies" in dep_tables:
+                await self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO workstream_dependencies (workstream_id, depends_on)
+                    SELECT zadacha_id, depends_on FROM zadacha_dependencies
+                    """
+                )
+                await self._connection.execute("DROP TABLE zadacha_dependencies")
+            await self._connection.execute("DROP TABLE zadachi")
+
+        await self._connection.execute("DROP INDEX IF EXISTS idx_zadachi_status")
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_workstreams_status ON workstreams(status)"
+        )
 
     @asynccontextmanager
     async def transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:
@@ -1570,20 +1639,20 @@ class Database:
         }
 
     # =========================================================================
-    # Zadachi CRUD Operations
+    # Workstreams CRUD Operations
     # =========================================================================
 
-    async def create_zadacha(self, zadacha: Zadacha) -> Zadacha:
-        """Create a new zadacha in the database.
+    async def create_workstream(self, workstream: Workstream) -> Workstream:
+        """Create a new workstream in the database.
 
         Args:
-            zadacha: Zadacha model to persist.
+            workstream: Workstream model to persist.
 
         Returns:
-            The created zadacha.
+            The created workstream.
 
         Raises:
-            ZadachaAlreadyExistsError: If zadacha with same ID exists.
+            WorkstreamAlreadyExistsError: If workstream with same ID exists.
             DatabaseError: If database not connected.
         """
         if self._connection is None:
@@ -1593,7 +1662,7 @@ class Database:
         try:
             await self._connection.execute(
                 """
-                INSERT INTO zadachi (
+                INSERT INTO workstreams (
                     id, title, description, branch,
                     workspace_path, status, scope, priority,
                     pr_url, process_pid, subtask_progress,
@@ -1605,53 +1674,53 @@ class Database:
                 )
                 """,
                 (
-                    zadacha.id,
-                    zadacha.title,
-                    zadacha.description,
-                    zadacha.branch,
-                    zadacha.workspace_path,
-                    zadacha.status.value,
-                    json.dumps(zadacha.scope),
-                    zadacha.priority,
-                    zadacha.pr_url,
-                    zadacha.process_pid,
-                    zadacha.subtask_progress,
-                    zadacha.error_message,
-                    zadacha.retry_count,
-                    zadacha.max_retries,
-                    _format_datetime(zadacha.created_at),
-                    _format_datetime(zadacha.started_at),
-                    _format_datetime(zadacha.completed_at),
+                    workstream.id,
+                    workstream.title,
+                    workstream.description,
+                    workstream.branch,
+                    workstream.workspace_path,
+                    workstream.status.value,
+                    json.dumps(workstream.scope),
+                    workstream.priority,
+                    workstream.pr_url,
+                    workstream.process_pid,
+                    workstream.subtask_progress,
+                    workstream.error_message,
+                    workstream.retry_count,
+                    workstream.max_retries,
+                    _format_datetime(workstream.created_at),
+                    _format_datetime(workstream.started_at),
+                    _format_datetime(workstream.completed_at),
                 ),
             )
         except sqlite3.IntegrityError as e:
             if "UNIQUE" in str(e) or "PRIMARY KEY" in str(e):
-                msg = f"Zadacha with ID '{zadacha.id}' already exists"
-                raise ZadachaAlreadyExistsError(msg) from e
+                msg = f"Workstream with ID '{workstream.id}' already exists"
+                raise WorkstreamAlreadyExistsError(msg) from e
             raise
 
         # Insert dependencies
-        for dep_id in zadacha.depends_on:
+        for dep_id in workstream.depends_on:
             await self._connection.execute(
-                "INSERT INTO zadacha_dependencies "
-                "(zadacha_id, depends_on) VALUES (?, ?)",
-                (zadacha.id, dep_id),
+                "INSERT INTO workstream_dependencies "
+                "(workstream_id, depends_on) VALUES (?, ?)",
+                (workstream.id, dep_id),
             )
 
         await self._connection.commit()
-        return zadacha
+        return workstream
 
-    async def get_zadacha(self, zadacha_id: str) -> Zadacha:
-        """Get a zadacha by ID.
+    async def get_workstream(self, workstream_id: str) -> Workstream:
+        """Get a workstream by ID.
 
         Args:
-            zadacha_id: Zadacha identifier.
+            workstream_id: Workstream identifier.
 
         Returns:
-            Zadacha model with dependencies populated.
+            Workstream model with dependencies populated.
 
         Raises:
-            ZadachaNotFoundError: If zadacha not found.
+            WorkstreamNotFoundError: If workstream not found.
             DatabaseError: If database not connected.
         """
         if self._connection is None:
@@ -1659,32 +1728,32 @@ class Database:
             raise DatabaseError(msg)
 
         cursor = await self._connection.execute(
-            "SELECT * FROM zadachi WHERE id = ?",
-            (zadacha_id,),
+            "SELECT * FROM workstreams WHERE id = ?",
+            (workstream_id,),
         )
         row = await cursor.fetchone()
 
         if row is None:
-            msg = f"Zadacha with ID '{zadacha_id}' not found"
-            raise ZadachaNotFoundError(msg)
+            msg = f"Workstream with ID '{workstream_id}' not found"
+            raise WorkstreamNotFoundError(msg)
 
-        zadacha = _row_to_zadacha(row)
+        workstream = _row_to_workstream(row)
 
         # Fetch dependencies
         deps_cursor = await self._connection.execute(
-            "SELECT depends_on FROM zadacha_dependencies WHERE zadacha_id = ?",
-            (zadacha_id,),
+            "SELECT depends_on FROM workstream_dependencies WHERE workstream_id = ?",
+            (workstream_id,),
         )
         deps = await deps_cursor.fetchall()
         depends_on = [dep["depends_on"] for dep in deps]
 
-        return zadacha.model_copy(update={"depends_on": depends_on})
+        return workstream.model_copy(update={"depends_on": depends_on})
 
-    async def get_all_zadachi(self) -> list[Zadacha]:
-        """Get all zadachi from the database.
+    async def get_all_workstreams(self) -> list[Workstream]:
+        """Get all workstreams from the database.
 
         Returns:
-            List of all Zadacha models with dependencies.
+            List of all Workstream models with dependencies.
 
         Raises:
             DatabaseError: If database not connected.
@@ -1694,44 +1763,44 @@ class Database:
             raise DatabaseError(msg)
 
         cursor = await self._connection.execute(
-            "SELECT * FROM zadachi ORDER BY priority DESC, created_at"
+            "SELECT * FROM workstreams ORDER BY priority DESC, created_at"
         )
         rows = await cursor.fetchall()
 
-        zadachi = []
+        workstreams = []
         for row in rows:
-            z = _row_to_zadacha(row)
+            w = _row_to_workstream(row)
             deps_cursor = await self._connection.execute(
-                "SELECT depends_on FROM zadacha_dependencies WHERE zadacha_id = ?",
-                (z.id,),
+                "SELECT depends_on FROM workstream_dependencies WHERE workstream_id = ?",
+                (w.id,),
             )
             deps = await deps_cursor.fetchall()
             depends_on = [dep["depends_on"] for dep in deps]
-            zadachi.append(z.model_copy(update={"depends_on": depends_on}))
+            workstreams.append(w.model_copy(update={"depends_on": depends_on}))
 
-        return zadachi
+        return workstreams
 
-    async def update_zadacha_status(
+    async def update_workstream_status(
         self,
-        zadacha_id: str,
-        new_status: ZadachaStatus,
-        expected_status: ZadachaStatus | None = None,
+        workstream_id: str,
+        new_status: WorkstreamStatus,
+        expected_status: WorkstreamStatus | None = None,
         **extra_fields: Any,
-    ) -> Zadacha:
-        """Atomically update zadacha status.
+    ) -> Workstream:
+        """Atomically update workstream status.
 
         Args:
-            zadacha_id: Zadacha identifier.
+            workstream_id: Workstream identifier.
             new_status: New status to set.
             expected_status: If provided, update only if current
                 status matches.
             **extra_fields: Additional fields to update.
 
         Returns:
-            Updated zadacha.
+            Updated workstream.
 
         Raises:
-            ZadachaNotFoundError: If zadacha not found.
+            WorkstreamNotFoundError: If workstream not found.
             ConcurrentModificationError: If expected_status
                 doesn't match.
             DatabaseError: If database not connected.
@@ -1744,12 +1813,12 @@ class Database:
         params: list[Any] = [new_status.value]
 
         # Handle timestamp updates
-        if new_status == ZadachaStatus.RUNNING:
+        if new_status == WorkstreamStatus.RUNNING:
             set_clauses.append("started_at = COALESCE(started_at, ?)")
             params.append(_format_datetime(datetime.now(UTC)))
         elif new_status in (
-            ZadachaStatus.DONE,
-            ZadachaStatus.ABANDONED,
+            WorkstreamStatus.DONE,
+            WorkstreamStatus.ABANDONED,
         ):
             set_clauses.append("completed_at = ?")
             params.append(_format_datetime(datetime.now(UTC)))
@@ -1771,14 +1840,14 @@ class Database:
 
         # Build WHERE clause
         where_clauses = ["id = ?"]
-        params.append(zadacha_id)
+        params.append(workstream_id)
 
         if expected_status is not None:
             where_clauses.append("status = ?")
             params.append(expected_status.value)
 
         query = (
-            f"UPDATE zadachi SET {', '.join(set_clauses)} "
+            f"UPDATE workstreams SET {', '.join(set_clauses)} "
             f"WHERE {' AND '.join(where_clauses)}"
         )
 
@@ -1787,33 +1856,35 @@ class Database:
 
         if cursor.rowcount == 0:
             check = await self._connection.execute(
-                "SELECT status FROM zadachi WHERE id = ?",
-                (zadacha_id,),
+                "SELECT status FROM workstreams WHERE id = ?",
+                (workstream_id,),
             )
             row = await check.fetchone()
 
             if row is None:
-                msg = f"Zadacha with ID '{zadacha_id}' not found"
-                raise ZadachaNotFoundError(msg)
+                msg = f"Workstream with ID '{workstream_id}' not found"
+                raise WorkstreamNotFoundError(msg)
 
             if expected_status is not None:
                 msg = (
-                    f"Zadacha '{zadacha_id}' status is "
+                    f"Workstream '{workstream_id}' status is "
                     f"'{row['status']}', expected "
                     f"'{expected_status.value}'"
                 )
                 raise ConcurrentModificationError(msg)
 
-        return await self.get_zadacha(zadacha_id)
+        return await self.get_workstream(workstream_id)
 
-    async def get_zadachi_by_status(self, status: ZadachaStatus) -> list[Zadacha]:
-        """Get all zadachi with a specific status.
+    async def get_workstreams_by_status(
+        self, status: WorkstreamStatus
+    ) -> list[Workstream]:
+        """Get all workstreams with a specific status.
 
         Args:
             status: Status to filter by.
 
         Returns:
-            List of zadachi with the specified status.
+            List of workstreams with the specified status.
 
         Raises:
             DatabaseError: If database not connected.
@@ -1823,29 +1894,29 @@ class Database:
             raise DatabaseError(msg)
 
         cursor = await self._connection.execute(
-            "SELECT * FROM zadachi WHERE status = ? ORDER BY priority DESC, created_at",
+            "SELECT * FROM workstreams WHERE status = ? ORDER BY priority DESC, created_at",
             (status.value,),
         )
         rows = await cursor.fetchall()
 
-        zadachi = []
+        workstreams = []
         for row in rows:
-            z = _row_to_zadacha(row)
+            w = _row_to_workstream(row)
             deps_cursor = await self._connection.execute(
-                "SELECT depends_on FROM zadacha_dependencies WHERE zadacha_id = ?",
-                (z.id,),
+                "SELECT depends_on FROM workstream_dependencies WHERE workstream_id = ?",
+                (w.id,),
             )
             deps = await deps_cursor.fetchall()
             depends_on = [dep["depends_on"] for dep in deps]
-            zadachi.append(z.model_copy(update={"depends_on": depends_on}))
+            workstreams.append(w.model_copy(update={"depends_on": depends_on}))
 
-        return zadachi
+        return workstreams
 
-    async def delete_zadacha(self, zadacha_id: str) -> bool:
-        """Delete a zadacha by ID.
+    async def delete_workstream(self, workstream_id: str) -> bool:
+        """Delete a workstream by ID.
 
         Args:
-            zadacha_id: Zadacha identifier.
+            workstream_id: Workstream identifier.
 
         Returns:
             True if deleted, False if not found.
@@ -1858,8 +1929,8 @@ class Database:
             raise DatabaseError(msg)
 
         cursor = await self._connection.execute(
-            "DELETE FROM zadachi WHERE id = ?",
-            (zadacha_id,),
+            "DELETE FROM workstreams WHERE id = ?",
+            (workstream_id,),
         )
         await self._connection.commit()
 

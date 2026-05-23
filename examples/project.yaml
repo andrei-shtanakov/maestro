@@ -3,13 +3,13 @@
 # =============================================================================
 #
 # This file configures Maestro to decompose a project into independent
-# work units ("zadachi"), run each in an isolated git worktree via
+# work units ("workstreams"), run each in an isolated git worktree via
 # spec-runner, and auto-create PRs on completion.
 #
 # Usage:
 #   uv run maestro orchestrate project.yaml
 #   uv run maestro orchestrate project.yaml --resume
-#   uv run maestro zadachi                    # check progress
+#   uv run maestro workstreams                    # check progress
 #   uv run maestro workspaces                 # list worktrees
 #
 # =============================================================================
@@ -20,7 +20,7 @@
 project: my-web-app
 
 # Natural-language description of the project.
-# If `zadachi` section is omitted, Maestro uses this description
+# If `workstreams` section is omitted, Maestro uses this description
 # to auto-decompose the project via Claude CLI.
 description: |
   Build a REST API with:
@@ -39,28 +39,28 @@ repo_url: https://github.com/user/my-web-app
 repo_path: ~/projects/my-web-app
 
 # Base directory where git worktrees will be created.
-# Each zadacha gets its own subdirectory: {workspace_base}/{zadacha-id}/
+# Each workstream gets its own subdirectory: {workspace_base}/{workstream-id}/
 workspace_base: /tmp/maestro-ws/my-web-app
 
 # --- Execution settings ---
 
-# Maximum number of zadachi running in parallel (1-10)
+# Maximum number of workstreams running in parallel (1-10)
 max_concurrent: 3
 
-# Git base branch that zadachi branch from and PRs target
+# Git base branch that workstreams branch from and PRs target
 base_branch: main
 
-# Prefix for zadacha branch names.
-# Final branch: {branch_prefix}{zadacha-id}  e.g. "feature/auth-system"
+# Prefix for workstream branch names.
+# Final branch: {branch_prefix}{workstream-id}  e.g. "feature/auth-system"
 branch_prefix: "feature/"
 
-# Automatically create a GitHub PR when a zadacha completes.
+# Automatically create a GitHub PR when a workstream completes.
 # Requires gh CLI to be authenticated.
 auto_pr: true
 
 # --- Spec-runner configuration ---
 # These settings are written to executor.config.yaml in each worktree.
-# They control how spec-runner executes subtasks within a zadacha.
+# They control how spec-runner executes subtasks within a workstream.
 
 spec_runner:
   # Max retries per subtask within spec-runner
@@ -75,7 +75,7 @@ spec_runner:
   # Automatically commit changes after each subtask
   auto_commit: true
 
-  # Create a sub-branch per subtask (merged into zadacha branch)
+  # Create a sub-branch per subtask (merged into workstream branch)
   create_git_branch: true
 
   # Run tests after each subtask completes
@@ -86,11 +86,11 @@ spec_runner:
   run_lint_on_done: true
   lint_command: "uv run ruff check ."
 
-# --- Manual zadachi ---
+# --- Manual workstreams ---
 # Define work units explicitly for fine-grained control.
 # If omitted, Maestro auto-decomposes using `description` above.
 
-zadachi:
+workstreams:
   - id: auth-system
     title: "Authentication System"
     description: |

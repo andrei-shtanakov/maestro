@@ -1,8 +1,8 @@
-"""Project decomposition into independent zadachi.
+"""Project decomposition into independent workstreams.
 
 This module uses Claude CLI to analyze a project description
 and decompose it into independent, non-overlapping work units
-(zadachi). It also generates spec files for each zadacha.
+(workstreams). It also generates spec files for each workstream.
 """
 
 import json
@@ -11,7 +11,7 @@ import subprocess
 from fnmatch import fnmatch
 from pathlib import Path
 
-from maestro.models import ZadachaConfig
+from maestro.models import WorkstreamConfig
 
 
 class DecomposerError(Exception):
@@ -19,30 +19,30 @@ class DecomposerError(Exception):
 
 
 class ScopeOverlapWarning:
-    """Warning about overlapping scopes between zadachi."""
+    """Warning about overlapping scopes between workstreams."""
 
     def __init__(
         self,
-        zadacha_a: str,
-        zadacha_b: str,
+        workstream_a: str,
+        workstream_b: str,
         overlapping_patterns: list[str],
     ) -> None:
-        self.zadacha_a = zadacha_a
-        self.zadacha_b = zadacha_b
+        self.workstream_a = workstream_a
+        self.workstream_b = workstream_b
         self.overlapping_patterns = overlapping_patterns
 
     def __str__(self) -> str:
         patterns = ", ".join(self.overlapping_patterns)
         return (
-            f"Scope overlap between '{self.zadacha_a}' and "
-            f"'{self.zadacha_b}': {patterns}"
+            f"Scope overlap between '{self.workstream_a}' and "
+            f"'{self.workstream_b}': {patterns}"
         )
 
 
 DECOMPOSE_PROMPT = """\
 You are a project decomposition expert. Analyze the following \
 project description and decompose it into independent, \
-non-overlapping work units (zadachi).
+non-overlapping work units (workstreams).
 
 ## Project Description
 {description}
@@ -52,13 +52,13 @@ non-overlapping work units (zadachi).
 
 ## Requirements
 
-1. Each zadacha must be INDEPENDENT — it can be developed in \
+1. Each workstream must be INDEPENDENT — it can be developed in \
 parallel with others without conflicts.
 2. Scopes must NOT overlap — each file/directory should belong \
-to at most one zadacha.
-3. Each zadacha should be a meaningful, self-contained feature \
+to at most one workstream.
+3. Each workstream should be a meaningful, self-contained feature \
 or component.
-4. Include 3-8 zadachi (not too granular, not too coarse).
+4. Include 3-8 workstreams (not too granular, not too coarse).
 5. Assign priorities: higher priority = should be done first.
 
 ## Output Format
@@ -78,8 +78,8 @@ Return ONLY a JSON array (no markdown, no explanation):
 ```
 
 Priority: higher number = higher priority (0-100).
-depends_on: list of zadacha IDs that must complete first.
-scope: glob patterns for files/dirs this zadacha will modify.
+depends_on: list of workstream IDs that must complete first.
+scope: glob patterns for files/dirs this workstream will modify.
 """
 
 SPEC_GENERATION_PROMPT = """\
@@ -135,7 +135,7 @@ Rules for tasks.md:
 
 
 class ProjectDecomposer:
-    """Decomposes a project into independent zadachi.
+    """Decomposes a project into independent workstreams.
 
     Uses Claude CLI to analyze the project and produce
     non-overlapping task groups with spec files.
@@ -244,14 +244,14 @@ class ProjectDecomposer:
 
         return result.stdout
 
-    def _parse_decomposition(self, response: str) -> list[ZadachaConfig]:
-        """Parse Claude's JSON response into ZadachaConfigs.
+    def _parse_decomposition(self, response: str) -> list[WorkstreamConfig]:
+        """Parse Claude's JSON response into WorkstreamConfigs.
 
         Args:
             response: Claude's response containing JSON.
 
         Returns:
-            List of validated ZadachaConfig objects.
+            List of validated WorkstreamConfig objects.
 
         Raises:
             DecomposerError: If parsing fails.
@@ -276,17 +276,17 @@ class ProjectDecomposer:
             raise DecomposerError(msg) from e
 
         if not isinstance(data, list):
-            msg = "Expected JSON array of zadachi"
+            msg = "Expected JSON array of workstreams"
             raise DecomposerError(msg)
 
         try:
-            return [ZadachaConfig(**item) for item in data]
+            return [WorkstreamConfig(**item) for item in data]
         except Exception as e:
-            msg = f"Failed to validate zadachi: {e}"
+            msg = f"Failed to validate workstreams: {e}"
             raise DecomposerError(msg) from e
 
-    def decompose(self, project_description: str) -> list[ZadachaConfig]:
-        """Decompose project into independent zadachi.
+    def decompose(self, project_description: str) -> list[WorkstreamConfig]:
+        """Decompose project into independent workstreams.
 
         Uses Claude CLI to analyze the project and produce
         non-overlapping task groups.
@@ -295,7 +295,7 @@ class ProjectDecomposer:
             project_description: Text description of the project.
 
         Returns:
-            List of ZadachaConfig objects.
+            List of WorkstreamConfig objects.
 
         Raises:
             DecomposerError: If decomposition fails.
@@ -310,32 +310,32 @@ class ProjectDecomposer:
         self._logger.info("Decomposing project via Claude CLI")
         response = self._run_claude(prompt)
 
-        zadachi = self._parse_decomposition(response)
+        workstreams = self._parse_decomposition(response)
 
-        if not zadachi:
-            msg = "Decomposition produced no zadachi"
+        if not workstreams:
+            msg = "Decomposition produced no workstreams"
             raise DecomposerError(msg)
 
         # Validate non-overlap
-        warnings = self.validate_non_overlap(zadachi)
+        warnings = self.validate_non_overlap(workstreams)
         for w in warnings:
             self._logger.warning(str(w))
 
-        self._logger.info("Decomposed into %d zadachi", len(zadachi))
-        return zadachi
+        self._logger.info("Decomposed into %d workstreams", len(workstreams))
+        return workstreams
 
     def generate_spec(
         self,
-        zadacha: ZadachaConfig,
+        workstream: WorkstreamConfig,
         workspace_path: Path,
     ) -> None:
-        """Generate spec files for a zadacha.
+        """Generate spec files for a workstream.
 
         Creates spec/requirements.md, spec/design.md, and
         spec/tasks.md in the workspace directory.
 
         Args:
-            zadacha: The zadacha configuration.
+            workstream: The workstream configuration.
             workspace_path: Path to the workspace directory.
 
         Raises:
@@ -345,12 +345,12 @@ class ProjectDecomposer:
         spec_dir.mkdir(exist_ok=True)
 
         prompt = SPEC_GENERATION_PROMPT.format(
-            title=zadacha.title,
-            description=zadacha.description,
-            scope=", ".join(zadacha.scope),
+            title=workstream.title,
+            description=workstream.description,
+            scope=", ".join(workstream.scope),
         )
 
-        self._logger.info("Generating spec for zadacha '%s'", zadacha.id)
+        self._logger.info("Generating spec for workstream '%s'", workstream.id)
         response = self._run_claude(prompt)
 
         # Write tasks.md directly (prompt generates only tasks.md)
@@ -398,20 +398,20 @@ class ProjectDecomposer:
 
     @staticmethod
     def validate_non_overlap(
-        zadachi: list[ZadachaConfig],
+        workstreams: list[WorkstreamConfig],
     ) -> list[ScopeOverlapWarning]:
-        """Check that zadachi scopes don't overlap.
+        """Check that workstreams scopes don't overlap.
 
         Args:
-            zadachi: List of zadachi to check.
+            workstreams: List of workstreams to check.
 
         Returns:
             List of warnings for overlapping scopes.
         """
         warnings: list[ScopeOverlapWarning] = []
 
-        for i, a in enumerate(zadachi):
-            for b in zadachi[i + 1 :]:
+        for i, a in enumerate(workstreams):
+            for b in workstreams[i + 1 :]:
                 overlaps: list[str] = []
                 for pattern_a in a.scope:
                     for pattern_b in b.scope:

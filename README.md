@@ -59,18 +59,18 @@ uv run maestro retry <task-id>           # Retry a failed task
 
 ## Mode 2: Multi-Process Orchestrator
 
-Decompose a project into isolated work units ("zadachi"), each running in its own git worktree.
+Decompose a project into isolated work units ("workstreams"), each running in its own git worktree.
 
-- Auto-decompose a project description into zadachi, or define them manually
-- Each zadacha gets an isolated git worktree and feature branch
-- Task specs are generated per zadacha and executed via spec-runner
-- Completed zadachi are pushed and PRs are auto-created via `gh`
+- Auto-decompose a project description into workstreams, or define them manually
+- Each workstream gets an isolated git worktree and feature branch
+- Task specs are generated per workstream and executed via spec-runner
+- Completed workstreams are pushed and PRs are auto-created via `gh`
 
 See [`examples/project.yaml`](examples/project.yaml) for a fully annotated config.
 
 ```bash
 uv run maestro orchestrate project.yaml  # Run orchestrator
-uv run maestro zadachi                   # Check zadachi status
+uv run maestro workstreams                   # Check workstreams status
 uv run maestro workspaces                # List active worktrees
 ```
 
@@ -81,7 +81,7 @@ uv run maestro workspaces                # List active worktrees
 | [`hello.yaml`](examples/hello.yaml) | Minimal quick-start with the `announce` agent (no AI needed) |
 | [`tasks.yaml`](examples/tasks.yaml) | Full task scheduler config with dependencies, validation, and git settings |
 | [`parallel-refactor.yaml`](examples/parallel-refactor.yaml) | DAG-based parallel refactoring across multiple modules |
-| [`project.yaml`](examples/project.yaml) | Multi-process orchestrator with manual zadachi definitions |
+| [`project.yaml`](examples/project.yaml) | Multi-process orchestrator with manual workstreams definitions |
 | [`maestro-builds-maestro.yaml`](examples/maestro-builds-maestro.yaml) | Meta-dogfooding — Maestro implements its own backlog |
 | [`with-arbiter.yaml`](examples/with-arbiter.yaml) | Optional Arbiter-driven routing (advisory mode) — `agent_type: auto` lets the policy engine pick the best agent |
 
