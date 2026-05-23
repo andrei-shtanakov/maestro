@@ -22,10 +22,7 @@ from maestro.benchmark import (
     report_benchmark_to_arbiter,
 )
 from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
-from maestro.coordination.arbiter_errors import (
-    ArbiterContractError,
-    ArbiterUnavailable,
-)
+from maestro.coordination.arbiter_errors import ArbiterContractError
 
 
 # ---------------------------------------------------------------------------
@@ -211,13 +208,11 @@ async def test_report_benchmark_duplicate_end_to_end(
 async def test_report_benchmark_contract_break_end_to_end(
     real_arbiter_client: ArbiterClient, tmp_path: Path
 ) -> None:
-    """Send malformed payload → validation error, 0 rows in DB.
+    """Send malformed payload via raw _call_tool → ArbiterContractError, 0 rows.
 
     Maestro's outbound Pydantic path can't produce a missing-required payload
     (ReportBenchmarkPayload has all required fields with type checks); this
     test exercises arbiter's server-side strict validation directly.
-    When arbiter rejects (missing agent_id), the error is treated by
-    ArbiterClient as a protocol error, no row persists.
     """
     client = real_arbiter_client
     # Build a payload with agent_id deliberately removed.
@@ -234,22 +229,20 @@ async def test_report_benchmark_contract_break_end_to_end(
         "per_task_total_count": 0,
         "per_task_truncated": False,
     }
-    # Arbiter returns error (either ArbiterContractError or ArbiterUnavailable
-    # depending on the code). Either way, the request fails.
-    try:
+    with pytest.raises(ArbiterContractError) as exc_info:
         await client.report_benchmark_raw(bad_payload)
-        pytest.fail("Expected ArbiterContractError or ArbiterUnavailable")
-    except (ArbiterContractError, ArbiterUnavailable):
-        pass  # Expected
+    assert exc_info.value.code in (-32600, -32602, -32603), (
+        f"expected contract-class code, got {exc_info.value.code}"
+    )
 
     # Verify nothing landed in the DB.
     db_path = tmp_path / "arbiter-bench-test.db"
-    if db_path.exists():
-        conn = sqlite3.connect(str(db_path))
-        try:
-            count = conn.execute(
-                "SELECT COUNT(*) FROM benchmark_runs WHERE run_id=?", ("cb-1",)
-            ).fetchone()[0]
-        finally:
-            conn.close()
-        assert count == 0, f"validation error must not insert (got {count})"
+    assert db_path.exists(), "arbiter should have created db before failing the insert"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM benchmark_runs WHERE run_id=?", ("cb-1",)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 0, f"contract break must not insert (got {count})"
