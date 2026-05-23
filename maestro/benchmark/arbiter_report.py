@@ -257,13 +257,19 @@ async def report_benchmark_to_arbiter(
                 timeout=REPORT_TIMEOUT_S,
             )
             status = response.get("status") if isinstance(response, dict) else None
+            if status not in ("created", "duplicate"):
+                # Unknown / malformed response — treat as contract break.
+                raise ArbiterContractError(
+                    -1,
+                    f"unexpected arbiter response status: {status!r} (full: {response!r})",
+                )
             if status == "duplicate":
                 _obs_log.info("benchmark.report.duplicate", **event_attrs)
             else:
                 _obs_log.info(
                     "benchmark.report.succeeded", score=result.score, **event_attrs
                 )
-            return result.model_copy(update={"report_status": "ok"})
+            return result.model_copy(update={"report_status": "ok", "report_error": None})
         except asyncio.CancelledError:
             raise
         except Exception as exc:

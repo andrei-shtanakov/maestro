@@ -451,3 +451,37 @@ async def test_emits_failed_on_unavailable_with_warning_severity(captured_obs_ev
         and e.get("error_class") == "unavailable"
         for e in captured_obs_events
     )
+
+
+# ---------------------------------------------------------------------------
+# Copilot follow-up #1 — strict status whitelist (forward-compat hole)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_helper_treats_unknown_status_as_contract_break(captured_obs_events):
+    """Forward-compat hole: arbiter v1.2 returning 'rejected' must not silently
+    map to 'ok'."""
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(
+        return_value={"status": "rejected", "run_id": "x"}
+    )
+    returned = await report_benchmark_to_arbiter(_result(run_id="x"), mock_client)
+    assert returned.report_status == "failed"
+    assert "contract_break" in returned.report_error
+    assert "rejected" in returned.report_error
+    assert any(
+        e["event"] == "benchmark.report.contract_break" for e in captured_obs_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_helper_treats_missing_status_as_contract_break(captured_obs_events):
+    """Malformed response (status field absent) → contract break."""
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(
+        return_value={"run_id": "x"}  # no status
+    )
+    returned = await report_benchmark_to_arbiter(_result(run_id="x"), mock_client)
+    assert returned.report_status == "failed"
+    assert "contract_break" in returned.report_error
