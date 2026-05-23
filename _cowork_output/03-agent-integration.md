@@ -1,5 +1,7 @@
 # Maestro — Анализ интеграции с агентами
 
+> **⚠️ HISTORICAL DOCUMENT (2026-04-05).** Pre-rename — references Zadacha/ZadachaConfig/create_zadacha() which were renamed to Workstream/WorkstreamConfig/create_workstream() in Maestro v0.4.0 (PR #22, 2026-05-23). Kept verbatim for archival accuracy.
+
 **Дата:** 2026-04-05
 **Базовые документы:** `_cowork_output/01-architecture-map.md`, `_cowork_output/02-dag-scheduler-analysis.md`
 **Анализируемые файлы:** `spawners/base.py` (102), `spawners/claude_code.py` (80), `spawners/codex.py` (79), `spawners/aider.py` (86), `spawners/announce.py` (75), `spawners/registry.py` (365), `workspace.py` (184), `git.py` (551), `orchestrator.py` (647), `scheduler.py` (903), `coordination/mcp_server.py` (760), `config.py` (317)

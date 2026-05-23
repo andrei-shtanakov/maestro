@@ -1,5 +1,7 @@
 # Maestro — Архитектурные улучшения
 
+> **⚠️ HISTORICAL DOCUMENT (2026-04-05).** Pre-rename — references Zadacha/ZadachaConfig/create_zadacha() which were renamed to Workstream/WorkstreamConfig/create_workstream() in Maestro v0.4.0 (PR #22, 2026-05-23). Kept verbatim for archival accuracy.
+
 **Дата:** 2026-04-05
 **Базовые документы:** `01-architecture-map.md`, `02-dag-scheduler-analysis.md`, `03-agent-integration.md`, `04-code-quality-ops.md`
 **Анализируемые файлы:** весь пакет `maestro/` (33 файла), `COWORK_CONTEXT.md`, `pyproject.toml`

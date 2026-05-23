@@ -1,5 +1,7 @@
 # Maestro — Глубокий анализ DAG-планировщика
 
+> **⚠️ HISTORICAL DOCUMENT (2026-04-05).** Pre-rename — references Zadacha/ZadachaConfig/create_zadacha() which were renamed to Workstream/WorkstreamConfig/create_workstream() in Maestro v0.4.0 (PR #22, 2026-05-23). Kept verbatim for archival accuracy.
+
 **Дата:** 2026-04-05
 **Базовый документ:** `_cowork_output/01-architecture-map.md`
 **Анализируемые файлы:** `dag.py` (427 строк), `scheduler.py` (903), `orchestrator.py` (646), `config.py` (316), `models.py` (893), `retry.py` (98), `recovery.py` (185), `workspace.py` (183)

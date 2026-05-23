@@ -1,5 +1,7 @@
 # Maestro — Structured Task Backlog
 
+> **⚠️ HISTORICAL DOCUMENT (2026-04-05).** Pre-rename — references Zadacha/ZadachaConfig/create_zadacha() which were renamed to Workstream/WorkstreamConfig/create_workstream() in Maestro v0.4.0 (PR #22, 2026-05-23). Kept verbatim for archival accuracy.
+
 **Дата:** 2026-04-05
 **Источник:** `06-roadmap.md`
 

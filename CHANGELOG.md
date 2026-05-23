@@ -41,7 +41,7 @@
 - Extended: `tests/test_arbiter_client.py` (+5 method/error-classification tests), `tests/test_benchmark_runner.py` (+4 run_id/task_type tests), `tests/test_benchmark_atp_client.py` (+3 task_type extraction tests).
 
 ### Cross-repo
-- Requires `arbiter-mcp` at SHA `7aeb6b1a987a2610c9f2cddb38d90f42d849da42` or later (advertises `protocolVersion="1.1.0"`, new `report_benchmark` MCP tool, `benchmark_runs` table migration).
+- Requires `arbiter-mcp` at SHA `151004b` (PR #13 merge — latest behavioural change for `report_benchmark`: validation/runtime error classification, non-empty IDs, RFC3339 `ts`) or later. Earliest compatible SHA is `7aeb6b1` (initial M4 baseline) but `151004b` includes the input-validation hardening pinned today. Advertises `protocolVersion="1.1.0"`, new `report_benchmark` MCP tool, `benchmark_runs` table migration.
 
 Design: `docs/superpowers/specs/2026-05-23-r06b-m4-arbiter-wiring-design.md`.
 Plan: `docs/superpowers/plans/2026-05-23-r06b-m4-arbiter-wiring.md`.
