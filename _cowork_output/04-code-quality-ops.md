@@ -1,5 +1,7 @@
 # Maestro — Качество кода и операционная зрелость
 
+> **⚠️ HISTORICAL DOCUMENT (2026-04-05).** Pre-rename — references Zadacha/ZadachaConfig/create_zadacha() which were renamed to Workstream/WorkstreamConfig/create_workstream() in Maestro v0.4.0 (PR #22, 2026-05-23). Kept verbatim for archival accuracy.
+
 **Дата:** 2026-04-05
 **Базовые документы:** `_cowork_output/01-architecture-map.md`, `02-dag-scheduler-analysis.md`, `03-agent-integration.md`
 **Анализируемые файлы:** весь пакет `maestro/` (33 файла) + `tests/` (27 файлов)
