@@ -394,6 +394,28 @@ class ArbiterClient:
             arguments["agent_id"] = agent_id
         return await self._call_tool("get_agent_status", arguments)
 
+    async def report_benchmark_raw(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Send a benchmark result to arbiter (low-level dict-taking method).
+
+        Prefer the typed wrapper
+        ``maestro.benchmark.arbiter_report.report_benchmark_to_arbiter``,
+        which constructs a validated ``ReportBenchmarkPayload`` and never
+        raises. This raw method is exposed for tests and advanced callers
+        that want to bypass the helper layer.
+
+        Args:
+            payload: Pre-serialized dict (typically from
+                ``ReportBenchmarkPayload.model_dump(mode="json")``).
+
+        Returns:
+            Response dict from arbiter: ``{"status": "created"|"duplicate", "run_id": ...}``.
+
+        Raises:
+            ArbiterUnavailable: On transient transport errors (after one retry).
+            ArbiterContractError: On JSON-RPC contract errors (-32600/-32602/-32603).
+        """
+        return await self._call_tool("report_benchmark", payload)
+
     # ------------------------------------------------------------------
     # Typed convenience methods
     # ------------------------------------------------------------------
