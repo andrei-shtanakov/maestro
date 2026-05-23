@@ -126,3 +126,59 @@ def test_response_unknown_status_fails(
     resp = {"status": "weird", "run_id": "r1"}
     errors = list(response_validator.iter_errors(resp))
     assert errors
+
+
+def test_unknown_optional_fields_in_payload_accepted(
+    request_validator: Draft202012Validator,
+) -> None:
+    """Adding optional fields in v1.1+ must not break v1.0 validation.
+
+    Policy: additive optional fields don't require payload_version bump.
+    Producer is strict (Pydantic extra='forbid'); consumer (arbiter JSONSchema
+    additionalProperties: true) is liberal. Asymmetric trust = safe evolution.
+    """
+    payload = {
+        "payload_version": "1.0.0",
+        "run_id": "r",
+        "benchmark_id": "b",
+        "agent_id": "a",
+        "ts": "2026-05-23T12:00:00Z",
+        "score": 0.5,
+        "score_components": {},
+        "duration_seconds": 1.0,
+        "per_task": [],
+        "per_task_total_count": 0,
+        "per_task_truncated": False,
+        "future_field": "added in v1.1",
+    }
+    errors = list(request_validator.iter_errors(payload))
+    assert not errors, f"unknown optional field rejected: {[e.message for e in errors]}"
+
+
+def test_unknown_response_fields_dont_crash_helper() -> None:
+    """Helper must tolerate arbiter responses with extra info fields."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from maestro.benchmark.arbiter_report import report_benchmark_to_arbiter
+    from maestro.benchmark.models import BenchmarkResult
+
+    mock_client = MagicMock()
+    mock_client.report_benchmark_raw = AsyncMock(
+        return_value={
+            "status": "created",
+            "run_id": "x",
+            "server_advice": "future info",
+            "queue_depth": 42,
+        }
+    )
+    result = BenchmarkResult(
+        run_id="x",
+        benchmark_id="b",
+        agent_id="a",
+        score=0.5,
+        per_task=[],
+        duration_seconds=1.0,
+    )
+    returned = asyncio.run(report_benchmark_to_arbiter(result, mock_client))
+    assert returned.report_status == "ok"
