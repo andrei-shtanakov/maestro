@@ -12,13 +12,16 @@ Design: docs/superpowers/specs/2026-05-23-r06b-m4-arbiter-wiring-design.md
 
 from __future__ import annotations
 
+import os
+import random
+from datetime import UTC
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict
 
 
 if TYPE_CHECKING:
-    from maestro.benchmark.models import BenchmarkTaskResult
+    from maestro.benchmark.models import BenchmarkResult, BenchmarkTaskResult
 
 
 ErrorClassBucket = Literal["timeout", "crash", "test_failure", "other"]
@@ -73,3 +76,81 @@ class WireTaskResult(BaseModel):
             duration_seconds=task.duration_seconds,
             error_class=_bucket_error(task.error),
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 4.2 — ReportBenchmarkPayload, _sample_per_task, _build_wire_payload
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MAX_PER_TASK = 200
+REPORT_MAX_PER_TASK: int = int(
+    os.getenv("MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK", _DEFAULT_MAX_PER_TASK)
+)
+
+
+class ReportBenchmarkPayload(BaseModel):
+    """Wire payload for the arbiter ``report_benchmark`` MCP tool (v1.0.0).
+
+    Frozen and ``extra="forbid"`` — any drift requires a
+    ``payload_version`` bump + contract test update on both sides.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    payload_version: Literal["1.0.0"] = "1.0.0"
+    run_id: str
+    benchmark_id: str
+    agent_id: str
+    ts: str  # RFC3339 UTC
+    score: float
+    score_components: dict[str, float]
+    total_tokens: int | None
+    total_cost_usd: float | None
+    duration_seconds: float
+    per_task: list[WireTaskResult]
+    per_task_total_count: int
+    per_task_truncated: bool
+
+
+def _sample_per_task(
+    tasks: list[BenchmarkTaskResult],
+    cap: int,
+    run_id: str,
+) -> tuple[list[WireTaskResult], bool]:
+    """Project tasks → WireTaskResult, applying deterministic sample if oversize.
+
+    Seed = ``run_id`` so re-runs with the same id pick the same sub-sample
+    (reproducible debug). Random sample (not head-N) avoids systematic
+    bias when benchmarks order tasks by difficulty.
+    """
+    if len(tasks) <= cap:
+        return [WireTaskResult.from_domain(t) for t in tasks], False
+    rng = random.Random(run_id)
+    sampled = sorted(rng.sample(tasks, cap), key=lambda t: t.task_index)
+    return [WireTaskResult.from_domain(t) for t in sampled], True
+
+
+def _build_wire_payload(
+    result: BenchmarkResult,
+    max_per_task: int,
+) -> ReportBenchmarkPayload:
+    """Project a domain ``BenchmarkResult`` into a wire ``ReportBenchmarkPayload``."""
+    per_task_wire, truncated = _sample_per_task(
+        result.per_task, max_per_task, result.run_id
+    )
+    ts_str = result.ts.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return ReportBenchmarkPayload(
+        payload_version="1.0.0",
+        run_id=result.run_id,
+        benchmark_id=result.benchmark_id,
+        agent_id=result.agent_id,
+        ts=ts_str,
+        score=result.score,
+        score_components=dict(result.score_components),
+        total_tokens=result.total_tokens,
+        total_cost_usd=result.total_cost_usd,
+        duration_seconds=result.duration_seconds,
+        per_task=per_task_wire,
+        per_task_total_count=len(result.per_task),
+        per_task_truncated=truncated,
+    )

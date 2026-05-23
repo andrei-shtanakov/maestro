@@ -2,7 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from maestro.benchmark.arbiter_report import WireTaskResult
-from maestro.benchmark.models import BenchmarkTaskResult
+from maestro.benchmark.models import BenchmarkResult, BenchmarkTaskResult
 
 
 def _domain_task(**kwargs):
@@ -77,3 +77,114 @@ def test_wire_task_result_forbids_extra_fields():
             error_class=None,
             surprise="boom",
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 4.2 — ReportBenchmarkPayload, _sample_per_task, _build_wire_payload
+# ---------------------------------------------------------------------------
+
+from maestro.benchmark.arbiter_report import (  # noqa: E402
+    _build_wire_payload,
+)
+
+
+def _result(run_id: str = "r", per_task: list | None = None, score: float = 0.5):
+    return BenchmarkResult(
+        run_id=run_id,
+        benchmark_id="b",
+        agent_id="a",
+        score=score,
+        per_task=per_task or [],
+        duration_seconds=1.0,
+    )
+
+
+def _tasks(n: int) -> list[BenchmarkTaskResult]:
+    return [
+        BenchmarkTaskResult(
+            task_index=i, prompt=f"p{i}", response=f"r{i}", duration_seconds=1.0
+        )
+        for i in range(n)
+    ]
+
+
+def test_payload_version_pinned_to_1_0_0():
+    p = _build_wire_payload(_result(), max_per_task=200)
+    assert p.payload_version == "1.0.0"
+
+
+def test_payload_maps_all_aggregate_fields():
+    result = _result(run_id="x", per_task=_tasks(3), score=0.85)
+    p = _build_wire_payload(result, max_per_task=200)
+    assert p.run_id == "x"
+    assert p.benchmark_id == "b"
+    assert p.agent_id == "a"
+    assert p.score == 0.85
+    assert p.per_task_total_count == 3
+    assert p.per_task_truncated is False
+    assert len(p.per_task) == 3
+
+
+def test_truncation_under_cap_no_change():
+    p = _build_wire_payload(_result(per_task=_tasks(50)), max_per_task=200)
+    assert p.per_task_truncated is False
+    assert len(p.per_task) == 50
+    assert p.per_task_total_count == 50
+
+
+def test_truncation_at_cap_boundary_not_truncated():
+    p = _build_wire_payload(_result(per_task=_tasks(200)), max_per_task=200)
+    assert p.per_task_truncated is False
+    assert len(p.per_task) == 200
+
+
+def test_truncation_above_cap_samples():
+    p = _build_wire_payload(_result(per_task=_tasks(500)), max_per_task=200)
+    assert p.per_task_truncated is True
+    assert len(p.per_task) == 200
+    assert p.per_task_total_count == 500
+
+
+def test_truncation_deterministic_same_run_id_same_sample():
+    tasks = _tasks(500)
+    p1 = _build_wire_payload(_result(run_id="same", per_task=tasks), max_per_task=200)
+    p2 = _build_wire_payload(_result(run_id="same", per_task=tasks), max_per_task=200)
+    assert [t.task_index for t in p1.per_task] == [t.task_index for t in p2.per_task]
+
+
+def test_truncation_different_run_ids_different_samples():
+    """Guard against global-seed regression (e.g. random.seed(0))."""
+    tasks = _tasks(500)
+    p1 = _build_wire_payload(_result(run_id="run-A", per_task=tasks), max_per_task=200)
+    p2 = _build_wire_payload(_result(run_id="run-B", per_task=tasks), max_per_task=200)
+    assert [t.task_index for t in p1.per_task] != [t.task_index for t in p2.per_task]
+
+
+def test_empty_per_task_handled():
+    p = _build_wire_payload(_result(per_task=[]), max_per_task=200)
+    assert p.per_task == []
+    assert p.per_task_total_count == 0
+    assert p.per_task_truncated is False
+
+
+def test_payload_excludes_free_form_in_per_task():
+    p = _build_wire_payload(_result(per_task=_tasks(1)), max_per_task=200)
+    dumped = p.per_task[0].model_dump()
+    assert "prompt" not in dumped
+    assert "response" not in dumped
+
+
+def test_env_override_for_max_per_task(monkeypatch):
+    monkeypatch.setenv("MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK", "5")
+    # Re-import to pick up env at module load
+    import importlib
+
+    import maestro.benchmark.arbiter_report as ar
+
+    importlib.reload(ar)
+    try:
+        assert ar.REPORT_MAX_PER_TASK == 5
+    finally:
+        # Restore default for subsequent tests
+        monkeypatch.delenv("MAESTRO_BENCHMARK_REPORT_MAX_PER_TASK", raising=False)
+        importlib.reload(ar)
