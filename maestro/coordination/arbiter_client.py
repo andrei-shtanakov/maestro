@@ -624,9 +624,16 @@ class ArbiterClient:
 
         if "error" in response and response["error"] is not None:
             err = response["error"]
+            code = err.get("code", -32000)
+            msg_text = err.get("message", "Unknown error")
+            data = err.get("data")
+            if code in (-32600, -32602, -32603):
+                # Hard contract break: invalid request / invalid params / internal.
+                # Retry is meaningless; surfaces to caller for fix-or-bail.
+                raise ArbiterContractError(code, msg_text, data)
+            # Other codes (e.g. -32000 server error) treated as transient.
             raise ArbiterUnavailable(
-                f"protocol error: JSON-RPC error {err.get('code', -32000)}: "
-                f"{err.get('message', 'Unknown error')}"
+                f"protocol error: JSON-RPC error {code}: {msg_text}"
             )
 
         return response.get("result", {})  # type: ignore[no-any-return]
