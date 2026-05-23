@@ -8,8 +8,13 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 from maestro.benchmark import (
     BenchmarkResult,
@@ -17,6 +22,10 @@ from maestro.benchmark import (
     report_benchmark_to_arbiter,
 )
 from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
+from maestro.coordination.arbiter_errors import (
+    ArbiterContractError,
+    ArbiterUnavailable,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +71,9 @@ real_arbiter_only = pytest.mark.skipif(
 
 
 @pytest.fixture
-async def real_arbiter_client(tmp_path: Path) -> object:
+async def real_arbiter_client(
+    tmp_path: Path,
+) -> AsyncGenerator[ArbiterClient, None]:
     """Spawn an arbiter-mcp subprocess pointing at a per-test temp DB.
 
     Yields a started, handshaken ArbiterClient ready for tool calls.
@@ -193,3 +204,52 @@ async def test_report_benchmark_duplicate_end_to_end(
         conn.close()
 
     assert count == 1, f"duplicate must not insert a second row (got {count})"
+
+
+@real_arbiter_only
+@pytest.mark.anyio
+async def test_report_benchmark_contract_break_end_to_end(
+    real_arbiter_client: ArbiterClient, tmp_path: Path
+) -> None:
+    """Send malformed payload → validation error, 0 rows in DB.
+
+    Maestro's outbound Pydantic path can't produce a missing-required payload
+    (ReportBenchmarkPayload has all required fields with type checks); this
+    test exercises arbiter's server-side strict validation directly.
+    When arbiter rejects (missing agent_id), the error is treated by
+    ArbiterClient as a protocol error, no row persists.
+    """
+    client = real_arbiter_client
+    # Build a payload with agent_id deliberately removed.
+    bad_payload = {
+        "payload_version": "1.0.0",
+        "run_id": "cb-1",
+        # "agent_id" deliberately omitted
+        "benchmark_id": "b",
+        "ts": "2026-05-23T12:00:00Z",
+        "score": 0.5,
+        "score_components": {},
+        "duration_seconds": 1.0,
+        "per_task": [],
+        "per_task_total_count": 0,
+        "per_task_truncated": False,
+    }
+    # Arbiter returns error (either ArbiterContractError or ArbiterUnavailable
+    # depending on the code). Either way, the request fails.
+    try:
+        await client.report_benchmark_raw(bad_payload)
+        pytest.fail("Expected ArbiterContractError or ArbiterUnavailable")
+    except (ArbiterContractError, ArbiterUnavailable):
+        pass  # Expected
+
+    # Verify nothing landed in the DB.
+    db_path = tmp_path / "arbiter-bench-test.db"
+    if db_path.exists():
+        conn = sqlite3.connect(str(db_path))
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM benchmark_runs WHERE run_id=?", ("cb-1",)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert count == 0, f"validation error must not insert (got {count})"
