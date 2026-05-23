@@ -156,3 +156,40 @@ async def test_report_benchmark_created_end_to_end(
     assert abs(score - 0.75) < 1e-6, f"expected score≈0.75, got {score}"
     assert per_task_total_count == 2
     assert per_task_truncated == 0  # 2 tasks well below cap
+
+
+@real_arbiter_only
+@pytest.mark.anyio
+async def test_report_benchmark_duplicate_end_to_end(
+    real_arbiter_client: ArbiterClient, tmp_path: Path
+) -> None:
+    """Same run_id twice → both report_status='ok', exactly 1 row.
+
+    Validates the ON CONFLICT DO NOTHING contract for idempotency:
+    sequential duplicate report_benchmark calls with the same run_id
+    both return ok status, but only one row persists in the DB.
+    """
+    client = real_arbiter_client
+    result = _build_result(run_id="e2e-dup")
+
+    r1 = await report_benchmark_to_arbiter(result, client)
+    r2 = await report_benchmark_to_arbiter(result, client)
+
+    assert r1.report_status == "ok"
+    assert r2.report_status == "ok"  # duplicate still maps to ok status
+    assert r1.report_error is None
+    assert r2.report_error is None
+
+    # Verify exactly 1 row in SQLite.
+    db_path = tmp_path / "arbiter-bench-test.db"
+    assert db_path.exists(), "arbiter DB file not created"
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM benchmark_runs WHERE run_id=?", ("e2e-dup",)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert count == 1, f"duplicate must not insert a second row (got {count})"
