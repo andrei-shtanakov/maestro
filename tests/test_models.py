@@ -251,6 +251,36 @@ class TestAgentType:
         assert AgentType.CLAUDE_CODE == "claude_code"
 
 
+class TestHarnessOfAgentId:
+    """Tests for harness_of_agent_id (2026-06-19 <harness>@<model> convention)."""
+
+    def test_fused_id_reduced_to_harness(self) -> None:
+        from maestro.models import harness_of_agent_id
+
+        assert harness_of_agent_id("claude_code@claude-opus-4-8") == "claude_code"
+        assert harness_of_agent_id("codex_cli@gpt-5-codex") == "codex_cli"
+
+    def test_plain_harness_id_unchanged(self) -> None:
+        from maestro.models import harness_of_agent_id
+
+        # Backward compatible: pre-change ids and static/advisory values.
+        assert harness_of_agent_id("claude_code") == "claude_code"
+        assert harness_of_agent_id("aider") == "aider"
+
+    def test_only_first_at_splits(self) -> None:
+        from maestro.models import harness_of_agent_id
+
+        # Model id may contain '@'/':'/'.'; only the first '@' separates.
+        assert harness_of_agent_id("ollama@qwen2.5:14b@x") == "ollama"
+
+    def test_harness_round_trips_to_agent_type(self) -> None:
+        from maestro.models import AgentType, harness_of_agent_id
+
+        assert AgentType(harness_of_agent_id("claude_code@claude-opus-4-8")) is (
+            AgentType.CLAUDE_CODE
+        )
+
+
 class TestAgentTypeAuto:
     """Tests for AgentType.AUTO sentinel added in R-03."""
 

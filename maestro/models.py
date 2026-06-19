@@ -86,6 +86,23 @@ class AgentType(StrEnum):
     """
 
 
+def harness_of_agent_id(agent_id: str) -> str:
+    """Recover the harness (spawner key) from an arbiter agent id.
+
+    Since the 2026-06-19 convention change, arbiter agent ids may be
+    ``"<harness>@<model>"`` (e.g. ``"claude_code@claude-opus-4-8"``) so that a
+    model is a first-class routing dimension. Maestro registers spawners by
+    harness only (``AgentType`` values: ``"claude_code"``, ``"codex_cli"``),
+    so the harness is the part left of the first ``@``.
+
+    Backward compatible: a plain harness id with no ``@`` (the pre-change
+    format, and the values used by static/advisory routing) is returned
+    unchanged. The full id is retained elsewhere (``routed_agent_type``) for
+    correlation and per-model ``report_outcome`` stats.
+    """
+    return agent_id.split("@", 1)[0]
+
+
 class TaskType(StrEnum):
     """Arbiter-compatible task type classification.
 

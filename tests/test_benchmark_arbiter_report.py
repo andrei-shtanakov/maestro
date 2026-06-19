@@ -77,7 +77,7 @@ def test_wire_task_result_forbids_extra_fields():
             tokens_used=None,
             duration_seconds=1.0,
             error_class=None,
-            surprise="boom",
+            surprise="boom",  # type: ignore[unexpected-keyword]
         )
 
 
