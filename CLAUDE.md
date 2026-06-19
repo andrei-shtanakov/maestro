@@ -24,6 +24,9 @@ uv run maestro orchestrate <project.yaml>   # Run orchestrator
 uv run maestro workstreams --db maestro.db       # Show workstreams status
 uv run maestro workspaces <project.yaml>     # List active worktrees
 
+# === Log utilities ===
+uv run maestro merge-logs <pipeline-dir>     # Time-sort per-pid JSONL into merged.jsonl
+
 # === Tests ===
 uv run pytest
 uv run pytest tests/test_models.py -v       # Single file
@@ -52,13 +55,15 @@ uv add --dev <package>
 - **database.py**: SQLite layer with async CRUD, WAL mode (tasks + workstreams tables)
 - **dag.py**: DAG building, cycle detection, topological sort, scope overlap warnings
 - **git.py**: Git operations (branch, rebase, push, worktree, merge)
-- **cli.py**: Typer CLI (run, status, retry, stop, approve, orchestrate, workstreams, workspaces)
+- **cli.py**: Typer CLI (run, status, retry, stop, approve, orchestrate, workstreams, workspaces, merge-logs)
 - **scheduler.py**: Main scheduler loop — polls DAG, spawns agents, monitors completion
 - **validator.py**: Post-task validation (run validation_cmd)
 - **retry.py**: Exponential backoff retry logic with jitter
 - **recovery.py**: State recovery after crash
 - **cost_tracker.py**: Token usage parsing and cost calculation
 - **event_log.py**: Structured event logging for task lifecycle
+- **merge_logs.py**: Standalone merge-logs CLI — time-sorts per-pid JSONL into merged.jsonl
+- **spec_runner.py**: Integration boundary between Maestro and the external spec-runner
 
 **Multi-process orchestration (new):**
 - **orchestrator.py**: Main async loop — decompose, spawn, monitor, PR creation
@@ -67,10 +72,12 @@ uv add --dev <package>
 - **pr_manager.py**: GitHub PR creation via `gh` CLI
 
 **Subpackages:**
-- **spawners/**: AgentSpawner ABC + implementations (claude_code, codex, aider, announce) + registry
-- **coordination/**: MCP server (FastMCP) + REST API (FastAPI) with /workstreams endpoints
+- **spawners/**: AgentSpawner ABC + implementations (claude_code, codex_cli, aider, announce) + registry
+- **coordination/**: MCP server (FastMCP) + REST API (FastAPI) with /workstreams endpoints; Arbiter routing (`routing.py` strategies, vendored `arbiter_client.py` MCP client, `arbiter_errors.py`)
+- **benchmark/**: R-06b/R-07 benchmark-aware routing — async runner, ATP client, spawner→responder adapter, and Arbiter feedback wiring (`arbiter_report.py`)
 - **notifications/**: Desktop notifications (macOS/Linux)
 - **dashboard/**: Web UI with DAG visualization (Mermaid.js) + SSE updates
+- **schemas/**: JSON-schema generation for config/contract artifacts
 
 ### Task State Machine (scheduler mode)
 

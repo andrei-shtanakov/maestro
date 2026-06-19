@@ -83,7 +83,9 @@ uv run maestro workspaces                # List active worktrees
 | [`parallel-refactor.yaml`](examples/parallel-refactor.yaml) | DAG-based parallel refactoring across multiple modules |
 | [`project.yaml`](examples/project.yaml) | Multi-process orchestrator with manual workstreams definitions |
 | [`maestro-builds-maestro.yaml`](examples/maestro-builds-maestro.yaml) | Meta-dogfooding — Maestro implements its own backlog |
+| [`dogfood-maestro.yaml`](examples/dogfood-maestro.yaml) | Dogfooding config — Maestro runs quick wins from its own backlog in parallel |
 | [`with-arbiter.yaml`](examples/with-arbiter.yaml) | Optional Arbiter-driven routing (advisory mode) — `agent_type: auto` lets the policy engine pick the best agent |
+| [`with-atp-validation.yaml`](examples/with-atp-validation.yaml) | Post-task validation via the ATP Platform CLI through `validation_cmd` |
 
 ## Optional: Arbiter routing
 
@@ -94,7 +96,7 @@ Add an `arbiter:` section to your project YAML to delegate per-task agent select
 | Agent | Key | Notes |
 |-------|-----|-------|
 | Claude Code | `claude_code` | Default. Requires `claude` CLI |
-| Codex | `codex` | Requires `codex` CLI |
+| Codex | `codex_cli` | Requires `codex` CLI |
 | Aider | `aider` | Requires `aider` CLI |
 | Announce | `announce` | Dry-run mode — logs tasks without running an agent |
 
