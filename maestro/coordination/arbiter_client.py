@@ -1,8 +1,12 @@
 """Vendored Arbiter MCP client for Maestro.
 
-VENDORED FROM: arbiter@7aeb6b1 (R-06b M4 baseline) — extended in M4 with
-               version-axis negotiation + report_benchmark surface; see
-               maestro/benchmark/arbiter_report.py.
+VENDORED FROM: arbiter@f3c955c (agent-id <harness>@<model> convention, #24) —
+               extended in M4 with version-axis negotiation + report_benchmark
+               surface; see maestro/benchmark/arbiter_report.py. Re-validated
+               against f3c955c: wire contract (protocolVersion 1.1.0, tool
+               field shapes) unchanged vs the prior 7aeb6b1 pin; only the
+               chosen_agent/agent_id value format gained the "@" suffix, which
+               is handled in maestro/models.py (passthrough str here).
 TARGET ARBITER VERSION: 0.2.0 (enforced by _handshake against
                         serverInfo.version).
 
@@ -58,7 +62,7 @@ ARBITER_MCP_REQUIRED_VERSION = "0.2.0"  # bumped for R-06b M4 (arbiter Phase 1)
 # arbiter build/release version. They are independent axes — see spec §6.
 ARBITER_PROTOCOL_VERSION = "1.1.0"
 MIN_ARBITER_PROTOCOL: tuple[int, int] = (1, 1)
-ARBITER_VENDORED_FROM_SHA = "7aeb6b1a987a2610c9f2cddb38d90f42d849da42"
+ARBITER_VENDORED_FROM_SHA = "f3c955cd152cab0293195b71bd7e602f00736354"
 
 
 def _parse_version(v: str) -> tuple[int, int]:

@@ -12,7 +12,7 @@ class TestVendoringHeader:
         # ARBITER_VENDORED_FROM_SHA is the single source of truth for the
         # vendored commit; the legacy ARBITER_VENDOR_COMMIT alias was removed
         # in R-06b M4 Copilot polish #5.
-        assert arbiter_client.ARBITER_VENDORED_FROM_SHA.startswith("7aeb6b1")
+        assert arbiter_client.ARBITER_VENDORED_FROM_SHA.startswith("f3c955c")
 
     def test_required_version_pinned(self) -> None:
         assert arbiter_client.ARBITER_MCP_REQUIRED_VERSION == "0.2.0"
