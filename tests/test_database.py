@@ -1781,7 +1781,7 @@ class TestMigrationRenameZadachiToWorkstreams:
 
             # Data preserved
             cursor = await db._connection.execute("SELECT id, status FROM workstreams")
-            rows = await cursor.fetchall()
+            rows = list(await cursor.fetchall())
             assert len(rows) == 1
             assert rows[0]["id"] == "w1"
             assert rows[0]["status"] == "pending"
