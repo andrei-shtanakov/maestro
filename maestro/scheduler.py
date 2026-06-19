@@ -41,6 +41,7 @@ from maestro.models import (
     TaskOutcome,
     TaskOutcomeStatus,
     TaskStatus,
+    harness_of_agent_id,
 )
 from maestro.notifications.base import Notification, NotificationEvent
 from maestro.notifications.manager import NotificationManager
@@ -747,8 +748,12 @@ class Scheduler:
         if decision.chosen_agent is None:
             logger.error("assign with None chosen_agent for task %s", task_id)
             return False
+        # arbiter may return "<harness>@<model>" (2026-06-19 convention); the
+        # harness validates against AgentType / selects the spawner, while the
+        # full id is retained in routed_agent_type for correlation + per-model
+        # report_outcome stats.
         try:
-            chosen = AgentType(decision.chosen_agent)
+            chosen = AgentType(harness_of_agent_id(decision.chosen_agent))
         except ValueError:
             logger.warning(
                 "arbiter chose unknown agent %r for task %s — HOLD",
@@ -781,7 +786,9 @@ class Scheduler:
 
         task = task.model_copy(
             update={
-                "routed_agent_type": chosen.value,
+                # Store the full arbiter id (may be "<harness>@<model>") so
+                # report_outcome echoes it back and per-model stats line up.
+                "routed_agent_type": decision.chosen_agent,
                 "arbiter_decision_id": decision.decision_id,
                 "arbiter_route_reason": decision.reason,
             }
@@ -792,13 +799,18 @@ class Scheduler:
             {
                 "task_id": task_id,
                 "decision_id": decision.decision_id,
-                "chosen_agent": chosen.value,
+                "chosen_agent": decision.chosen_agent,
                 "reason": decision.reason,
             },
         )
 
-        # Get spawner using routed_agent_type when present, else agent_type.
-        spawner_key = task.routed_agent_type or task.agent_type.value
+        # Spawners are keyed by harness; routed_agent_type may carry a model
+        # suffix, so reduce it to the harness for lookup.
+        spawner_key = (
+            harness_of_agent_id(task.routed_agent_type)
+            if task.routed_agent_type
+            else task.agent_type.value
+        )
         spawner = self._spawners.get(spawner_key)
         if spawner is None:
             msg = f"No spawner available for agent type '{spawner_key}'"
