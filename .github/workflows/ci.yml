@@ -9,9 +9,11 @@ on:
     - cron: "0 6 * * 1"
 
 env:
-  # Pin arbiter to the commit that closed arbiter#9 + shipped obs v1.
+  # Pin arbiter to the on-master commit for the <harness>@<model> agent-id
+  # convention (arbiter#24). Must match ARBITER_VENDORED_FROM_SHA — the
+  # "Verify vendored arbiter_client matches pinned SHA" step enforces it.
   # Bump when the Maestro↔arbiter contract evolves.
-  ARBITER_PINNED_SHA: 7aeb6b1a987a2610c9f2cddb38d90f42d849da42
+  ARBITER_PINNED_SHA: f3c955cd152cab0293195b71bd7e602f00736354
 
 jobs:
   lint:
