@@ -695,11 +695,12 @@ class TestCodexSpawner:
         cmd = call_args[0][0]
 
         assert cmd[0] == "codex"
+        assert cmd[1] == "exec"
         assert "-m" in cmd
         assert cmd[cmd.index("-m") + 1] == DEFAULT_CODEX_MODEL
-        assert "--quiet" in cmd
-        assert "--approval-mode" in cmd
-        assert "auto-edit" in cmd
+        assert "--sandbox" in cmd
+        assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
+        assert "--skip-git-repo-check" in cmd
         assert call_args[1]["cwd"] == workdir
         assert call_args[1]["stdout"] == 42
         assert call_args[1]["stderr"] == subprocess.STDOUT
@@ -1079,7 +1080,7 @@ class TestSpawnIntegrationAdditional:
 
             cmd = mock_popen.call_args[0][0]
             assert cmd[0] == "codex"
-            assert "--quiet" in cmd
+            assert cmd[1] == "exec"
             assert process.wait() == 0
 
     @pytest.mark.integration
