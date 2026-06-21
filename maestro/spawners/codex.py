@@ -23,9 +23,10 @@ DEFAULT_CODEX_MODEL = "gpt-5.5"
 class CodexSpawner(AgentSpawner):
     """Spawner for OpenAI Codex CLI.
 
-    Runs Codex in non-interactive (quiet) mode with approval set
-    to auto-edit so it can operate without user interaction. The model
-    is pinned to ``DEFAULT_CODEX_MODEL`` (override via ``MAESTRO_CODEX_MODEL``).
+    Runs Codex non-interactively via ``codex exec`` with the
+    ``workspace-write`` sandbox so it can edit files in the workdir without
+    user interaction. The model is pinned to ``DEFAULT_CODEX_MODEL``
+    (override via ``MAESTRO_CODEX_MODEL``).
     """
 
     @property
@@ -51,7 +52,7 @@ class CodexSpawner(AgentSpawner):
     ) -> subprocess.Popen[bytes]:
         """Spawn Codex process.
 
-        Runs Codex in quiet mode with auto-edit approval for
+        Runs ``codex exec`` with the ``workspace-write`` sandbox for
         non-interactive execution. Output is captured to the log file.
 
         Args:
@@ -72,11 +73,12 @@ class CodexSpawner(AgentSpawner):
             process = subprocess.Popen(
                 [
                     "codex",
+                    "exec",
                     "-m",
                     model,
-                    "--quiet",
-                    "--approval-mode",
-                    "auto-edit",
+                    "--sandbox",
+                    "workspace-write",
+                    "--skip-git-repo-check",
                     prompt,
                 ],
                 cwd=workdir,
