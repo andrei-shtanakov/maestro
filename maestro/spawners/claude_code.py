@@ -13,11 +13,19 @@ from maestro.models import Task
 from maestro.spawners.base import AgentSpawner, spawn_env
 
 
+# R-07: interim harness-default model (ADR-ECO-002 D1 will supersede this by
+# reading the model from routed_agent_type). Pinned to the model the R-07
+# sweep benchmarked so the executed model matches the routing decision.
+# Override with MAESTRO_CLAUDE_MODEL.
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+
+
 class ClaudeCodeSpawner(AgentSpawner):
     """Spawner for Claude Code in headless mode.
 
     Runs Claude Code with --print and --output-format json flags
-    for non-interactive execution.
+    for non-interactive execution. The model is pinned to
+    ``DEFAULT_CLAUDE_MODEL`` (override via ``MAESTRO_CLAUDE_MODEL``).
     """
 
     @property
@@ -61,6 +69,7 @@ class ClaudeCodeSpawner(AgentSpawner):
             Subprocess handle for monitoring.
         """
         prompt = self.build_prompt(task, context, retry_context)
+        model = os.environ.get("MAESTRO_CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL
 
         # Open log file and duplicate the fd for subprocess
         # This allows us to close the Python file object without affecting
@@ -68,7 +77,16 @@ class ClaudeCodeSpawner(AgentSpawner):
         fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         try:
             process = subprocess.Popen(
-                ["claude", "--print", "--output-format", "json", "-p", prompt],
+                [
+                    "claude",
+                    "--model",
+                    model,
+                    "--print",
+                    "--output-format",
+                    "json",
+                    "-p",
+                    prompt,
+                ],
                 cwd=workdir,
                 env=spawn_env(),
                 stdout=fd,

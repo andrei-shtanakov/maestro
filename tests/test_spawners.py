@@ -15,6 +15,8 @@ from maestro.spawners import (
     ClaudeCodeSpawner,
     CodexSpawner,
 )
+from maestro.spawners.claude_code import DEFAULT_CLAUDE_MODEL
+from maestro.spawners.codex import DEFAULT_CODEX_MODEL
 
 
 # =============================================================================
@@ -270,6 +272,8 @@ class TestClaudeCodeSpawner:
         # Verify command structure
         cmd = call_args[0][0]
         assert cmd[0] == "claude"
+        assert "--model" in cmd
+        assert cmd[cmd.index("--model") + 1] == DEFAULT_CLAUDE_MODEL
         assert "--print" in cmd
         assert "--output-format" in cmd
         assert "json" in cmd
@@ -289,6 +293,31 @@ class TestClaudeCodeSpawner:
 
         # Verify return value
         assert result == mock_process
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_model_override_from_env(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        claude_spawner: ClaudeCodeSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """MAESTRO_CLAUDE_MODEL overrides the default model passed to --model."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+
+        log_file = temp_dir / "task.log"
+        workdir = Path(sample_task.workdir)
+
+        with patch.dict(os.environ, {"MAESTRO_CLAUDE_MODEL": "claude-opus-4-8"}):
+            claude_spawner.spawn(sample_task, "", workdir, log_file)
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("--model") + 1] == "claude-opus-4-8"
 
     @patch("subprocess.Popen")
     @patch("os.close")
@@ -666,6 +695,8 @@ class TestCodexSpawner:
         cmd = call_args[0][0]
 
         assert cmd[0] == "codex"
+        assert "-m" in cmd
+        assert cmd[cmd.index("-m") + 1] == DEFAULT_CODEX_MODEL
         assert "--quiet" in cmd
         assert "--approval-mode" in cmd
         assert "auto-edit" in cmd
@@ -674,6 +705,31 @@ class TestCodexSpawner:
         assert call_args[1]["stderr"] == subprocess.STDOUT
         mock_os_close.assert_called_once_with(42)
         assert result == mock_process
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_model_override_from_env(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        codex_spawner: CodexSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """MAESTRO_CODEX_MODEL overrides the default model passed to -m."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+
+        log_file = temp_dir / "task.log"
+        workdir = Path(sample_task.workdir)
+
+        with patch.dict(os.environ, {"MAESTRO_CODEX_MODEL": "gpt-5-codex"}):
+            codex_spawner.spawn(sample_task, "", workdir, log_file)
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("-m") + 1] == "gpt-5-codex"
 
     @patch("subprocess.Popen")
     @patch("os.close")

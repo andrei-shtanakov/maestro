@@ -13,11 +13,19 @@ from maestro.models import Task
 from maestro.spawners.base import AgentSpawner, spawn_env
 
 
+# R-07: interim harness-default model (ADR-ECO-002 D1 will supersede this by
+# reading the model from routed_agent_type). Pinned to the model the R-07
+# sweep benchmarked so the executed model matches the routing decision.
+# Override with MAESTRO_CODEX_MODEL.
+DEFAULT_CODEX_MODEL = "gpt-5.5"
+
+
 class CodexSpawner(AgentSpawner):
     """Spawner for OpenAI Codex CLI.
 
     Runs Codex in non-interactive (quiet) mode with approval set
-    to auto-edit so it can operate without user interaction.
+    to auto-edit so it can operate without user interaction. The model
+    is pinned to ``DEFAULT_CODEX_MODEL`` (override via ``MAESTRO_CODEX_MODEL``).
     """
 
     @property
@@ -57,12 +65,15 @@ class CodexSpawner(AgentSpawner):
             Subprocess handle for monitoring.
         """
         prompt = self.build_prompt(task, context, retry_context)
+        model = os.environ.get("MAESTRO_CODEX_MODEL") or DEFAULT_CODEX_MODEL
 
         fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         try:
             process = subprocess.Popen(
                 [
                     "codex",
+                    "-m",
+                    model,
                     "--quiet",
                     "--approval-mode",
                     "auto-edit",
