@@ -1521,3 +1521,50 @@ class TestSchedulerRoutingInjection:
             assert scheduler._arbiter_mode is ArbiterMode.AUTHORITATIVE
         finally:
             await db.close()
+
+
+class TestSchedulerModelPassthrough:
+    """D1: the arbiter-routed model reaches the spawner."""
+
+    @pytest.mark.anyio
+    async def test_routed_model_passed_to_spawner(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from maestro.models import (
+            ArbiterMode,
+            RouteAction,
+            RouteDecision,
+            Task,
+            TaskConfig,
+        )
+
+        db = await create_database(temp_db_path)
+        try:
+            config = TaskConfig(id="t", title="T", prompt="do it")
+            await db.create_task(Task.from_config(config, str(temp_db_path.parent)))
+
+            spawner = MockSpawner("claude_code")
+            routing = AsyncMock()
+            routing.route.return_value = RouteDecision(
+                action=RouteAction.ASSIGN,
+                chosen_agent="claude_code@claude-opus-4-8",
+                decision_id="d1",
+                reason="test",
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([config]),
+                spawners={"claude_code": spawner},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                routing=routing,
+                arbiter_mode=ArbiterMode.AUTHORITATIVE,
+            )
+
+            await scheduler._spawn_ready_tasks(["t"])
+
+            assert spawner.spawn_count == 1
+            assert spawner.spawned_models == ["claude-opus-4-8"]
+        finally:
+            await db.close()

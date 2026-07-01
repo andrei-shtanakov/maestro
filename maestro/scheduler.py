@@ -42,6 +42,7 @@ from maestro.models import (
     TaskOutcomeStatus,
     TaskStatus,
     harness_of_agent_id,
+    model_of_agent_id,
 )
 from maestro.notifications.base import Notification, NotificationEvent
 from maestro.notifications.manager import NotificationManager
@@ -76,6 +77,8 @@ class SpawnerProtocol(Protocol):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,
     ) -> Popen[bytes]:
         """Spawn agent process."""
         ...
@@ -874,7 +877,14 @@ class Scheduler:
             self._retry_ready_times.pop(task_id, None)
 
             # Spawn the process with retry context
-            process = spawner.spawn(task, context, workdir, log_file, retry_context)
+            routed_model = (
+                model_of_agent_id(task.routed_agent_type)
+                if task.routed_agent_type
+                else None
+            )
+            process = spawner.spawn(
+                task, context, workdir, log_file, retry_context, model=routed_model
+            )
 
             # Track running task
             self._running_tasks[task_id] = RunningTask(
