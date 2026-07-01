@@ -24,6 +24,28 @@ def spawn_env() -> dict[str, str]:
     return {**os.environ, **child_env()}
 
 
+def resolve_model(routed: str | None, env_var: str, default: str) -> tuple[str, str]:
+    """Resolve the model to execute and its source, precedence routed > env > default.
+
+    Args:
+        routed: Model from the arbiter decision (``None`` in scheduler mode).
+        env_var: Operator fallback env var name (e.g. ``"MAESTRO_CLAUDE_MODEL"``).
+        default: Compiled-in default model for this harness.
+
+    Returns:
+        ``(model, source)`` where ``source`` is one of ``"routed"``, ``"env"``,
+        ``"default"``. An empty ``routed`` string is treated as absent (falls
+        through to env/default), so a degenerate ``"<harness>@"`` id cannot
+        produce an empty ``--model`` value.
+    """
+    if routed:
+        return routed, "routed"
+    env_val = os.environ.get(env_var)
+    if env_val:
+        return env_val, "env"
+    return default, "default"
+
+
 class AgentSpawner(ABC):
     """Abstract base class for agent spawners.
 

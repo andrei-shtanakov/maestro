@@ -11,13 +11,13 @@ from pathlib import Path
 
 from maestro._vendor import obs
 from maestro.models import Task
-from maestro.spawners.base import AgentSpawner, spawn_env
+from maestro.spawners.base import AgentSpawner, resolve_model, spawn_env
 
 
 # R-07: interim harness-default model (ADR-ECO-002 D1 will supersede this by
 # reading the model from routed_agent_type). Pinned to the model the R-07
 # sweep benchmarked so the executed model matches the routing decision.
-# Override with MAESTRO_CODEX_MODEL.
+# Fallback via MAESTRO_CODEX_MODEL when routing supplies no model.
 DEFAULT_CODEX_MODEL = "gpt-5.5"
 
 _obs_log = obs.get_logger("maestro.spawners.codex")
@@ -75,12 +75,9 @@ class CodexSpawner(AgentSpawner):
             Subprocess handle for monitoring.
         """
         prompt = self.build_prompt(task, context, retry_context)
-        if model:
-            resolved, source = model, "routed"
-        elif os.environ.get("MAESTRO_CODEX_MODEL"):
-            resolved, source = os.environ["MAESTRO_CODEX_MODEL"], "env"
-        else:
-            resolved, source = DEFAULT_CODEX_MODEL, "default"
+        resolved, source = resolve_model(
+            model, "MAESTRO_CODEX_MODEL", DEFAULT_CODEX_MODEL
+        )
         _obs_log.info(
             "agent.model_resolved",
             harness="codex_cli",

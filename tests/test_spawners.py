@@ -56,6 +56,48 @@ def claude_spawner() -> ClaudeCodeSpawner:
 
 
 # =============================================================================
+# Unit Tests: resolve_model helper
+# =============================================================================
+
+
+class TestResolveModel:
+    """Unit tests for the shared routed>env>default resolver."""
+
+    def test_routed_wins(self) -> None:
+        from maestro.spawners.base import resolve_model
+
+        with patch.dict(os.environ, {"MAESTRO_X": "env-m"}):
+            assert resolve_model("routed-m", "MAESTRO_X", "def-m") == (
+                "routed-m",
+                "routed",
+            )
+
+    def test_env_when_no_routed(self) -> None:
+        from maestro.spawners.base import resolve_model
+
+        with patch.dict(os.environ, {"MAESTRO_X": "env-m"}):
+            assert resolve_model(None, "MAESTRO_X", "def-m") == ("env-m", "env")
+
+    def test_default_when_neither(self) -> None:
+        from maestro.spawners.base import resolve_model
+
+        with patch.dict(os.environ, {}, clear=True):
+            assert resolve_model(None, "MAESTRO_X", "def-m") == (
+                "def-m",
+                "default",
+            )
+
+    def test_empty_routed_treated_as_absent(self) -> None:
+        from maestro.spawners.base import resolve_model
+
+        with patch.dict(os.environ, {}, clear=True):
+            assert resolve_model("", "MAESTRO_X", "def-m") == (
+                "def-m",
+                "default",
+            )
+
+
+# =============================================================================
 # Unit Tests: AgentSpawner ABC
 # =============================================================================
 
