@@ -103,6 +103,24 @@ def harness_of_agent_id(agent_id: str) -> str:
     return agent_id.split("@", 1)[0]
 
 
+def model_of_agent_id(agent_id: str) -> str | None:
+    """Recover the model from an arbiter agent id, or ``None`` if absent.
+
+    Symmetric with :func:`harness_of_agent_id`: where that returns the part
+    left of the first ``@``, this returns the part right of it. A plain harness
+    id with no ``@`` (the pre-change format and static/advisory routing) carries
+    no model, so this returns ``None`` and the spawner falls back to its
+    env/default model.
+
+    Examples:
+        ``"claude_code@claude-opus-4-8"`` -> ``"claude-opus-4-8"``
+        ``"claude_code"`` -> ``None``
+        ``"ollama@qwen2.5:14b@x"`` -> ``"qwen2.5:14b@x"`` (split on first ``@``)
+    """
+    _harness, sep, model = agent_id.partition("@")
+    return model if sep else None
+
+
 class TaskType(StrEnum):
     """Arbiter-compatible task type classification.
 

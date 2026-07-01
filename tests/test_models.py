@@ -281,6 +281,32 @@ class TestHarnessOfAgentId:
         )
 
 
+class TestModelOfAgentId:
+    """Tests for model_of_agent_id (2026-06-19 <harness>@<model> convention)."""
+
+    def test_extracts_model_after_at(self) -> None:
+        from maestro.models import model_of_agent_id
+
+        assert model_of_agent_id("claude_code@claude-opus-4-8") == "claude-opus-4-8"
+        assert model_of_agent_id("codex_cli@gpt-5.5") == "gpt-5.5"
+
+    def test_none_when_no_at(self) -> None:
+        from maestro.models import model_of_agent_id
+
+        assert model_of_agent_id("claude_code") is None
+        assert model_of_agent_id("aider") is None
+
+    def test_none_when_empty(self) -> None:
+        from maestro.models import model_of_agent_id
+
+        assert model_of_agent_id("") is None
+
+    def test_splits_on_first_at(self) -> None:
+        from maestro.models import model_of_agent_id
+
+        assert model_of_agent_id("ollama@qwen2.5:14b@x") == "qwen2.5:14b@x"
+
+
 class TestAgentTypeAuto:
     """Tests for AgentType.AUTO sentinel added in R-03."""
 
