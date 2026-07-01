@@ -45,6 +45,8 @@ class MockSpawner(AgentSpawner):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,
     ) -> subprocess.Popen[bytes]:
         return MagicMock()
 
@@ -66,6 +68,8 @@ class AnotherMockSpawner(AgentSpawner):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,
     ) -> subprocess.Popen[bytes]:
         return MagicMock()
 

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from maestro._vendor import obs
 from maestro.models import Task
 from maestro.spawners.base import AgentSpawner, spawn_env
 
@@ -19,14 +20,17 @@ from maestro.spawners.base import AgentSpawner, spawn_env
 # Override with MAESTRO_CODEX_MODEL.
 DEFAULT_CODEX_MODEL = "gpt-5.5"
 
+_obs_log = obs.get_logger("maestro.spawners.codex")
+
 
 class CodexSpawner(AgentSpawner):
     """Spawner for OpenAI Codex CLI.
 
     Runs Codex non-interactively via ``codex exec`` with the
     ``workspace-write`` sandbox so it can edit files in the workdir without
-    user interaction. The model is pinned to ``DEFAULT_CODEX_MODEL``
-    (override via ``MAESTRO_CODEX_MODEL``).
+    user interaction. The model is pinned to ``DEFAULT_CODEX_MODEL``;
+    routed model wins; ``MAESTRO_CODEX_MODEL`` is the fallback when
+    routing supplies none.
     """
 
     @property
@@ -49,6 +53,8 @@ class CodexSpawner(AgentSpawner):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,
     ) -> subprocess.Popen[bytes]:
         """Spawn Codex process.
 
@@ -61,12 +67,26 @@ class CodexSpawner(AgentSpawner):
             workdir: Working directory for the process.
             log_file: Path to write process output.
             retry_context: Error context from previous failed attempt.
+            model: Routed model from the arbiter. Wins over
+                ``MAESTRO_CODEX_MODEL`` and ``DEFAULT_CODEX_MODEL``
+                (precedence: routed > env > default).
 
         Returns:
             Subprocess handle for monitoring.
         """
         prompt = self.build_prompt(task, context, retry_context)
-        model = os.environ.get("MAESTRO_CODEX_MODEL") or DEFAULT_CODEX_MODEL
+        if model:
+            resolved, source = model, "routed"
+        elif os.environ.get("MAESTRO_CODEX_MODEL"):
+            resolved, source = os.environ["MAESTRO_CODEX_MODEL"], "env"
+        else:
+            resolved, source = DEFAULT_CODEX_MODEL, "default"
+        _obs_log.info(
+            "agent.model_resolved",
+            harness="codex_cli",
+            model=resolved,
+            source=source,
+        )
 
         fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         try:
@@ -75,7 +95,7 @@ class CodexSpawner(AgentSpawner):
                     "codex",
                     "exec",
                     "-m",
-                    model,
+                    resolved,
                     "--sandbox",
                     "workspace-write",
                     "--skip-git-repo-check",

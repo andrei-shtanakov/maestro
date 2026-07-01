@@ -82,6 +82,8 @@ class TestAgentSpawnerABC:
                 workdir: Path,
                 log_file: Path,
                 retry_context: str = "",
+                *,
+                model: str | None = None,
             ) -> subprocess.Popen[bytes]:
                 return MagicMock()
 
@@ -103,6 +105,8 @@ class TestAgentSpawnerABC:
                 workdir: Path,
                 log_file: Path,
                 retry_context: str = "",
+                *,
+                model: str | None = None,
             ) -> subprocess.Popen[bytes]:
                 return MagicMock()
 
@@ -322,6 +326,97 @@ class TestClaudeCodeSpawner:
     @patch("subprocess.Popen")
     @patch("os.close")
     @patch("os.open")
+    def test_spawn_uses_routed_model(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        claude_spawner: ClaudeCodeSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """An explicit routed model wins and reaches --model."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+        workdir = Path(sample_task.workdir)
+
+        claude_spawner.spawn(
+            sample_task, "", workdir, temp_dir / "t.log", model="claude-opus-4-8"
+        )
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("--model") + 1] == "claude-opus-4-8"
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_routed_model_beats_env(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        claude_spawner: ClaudeCodeSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """Precedence routed > env: routed model overrides MAESTRO_CLAUDE_MODEL."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+        workdir = Path(sample_task.workdir)
+
+        with patch.dict(os.environ, {"MAESTRO_CLAUDE_MODEL": "env-model"}):
+            claude_spawner.spawn(
+                sample_task, "", workdir, temp_dir / "t.log", model="routed-model"
+            )
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("--model") + 1] == "routed-model"
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_emits_model_resolved_source(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        claude_spawner: ClaudeCodeSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """agent.model_resolved reports the correct source for each origin."""
+        from structlog.testing import capture_logs
+
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+        workdir = Path(sample_task.workdir)
+
+        with capture_logs() as logs:
+            claude_spawner.spawn(
+                sample_task, "", workdir, temp_dir / "t.log", model="routed-x"
+            )
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "routed"
+        assert ev["model"] == "routed-x"
+
+        with (
+            capture_logs() as logs,
+            patch.dict(os.environ, {"MAESTRO_CLAUDE_MODEL": "env-y"}),
+        ):
+            claude_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "env"
+        assert ev["model"] == "env-y"
+
+        with capture_logs() as logs, patch.dict(os.environ, {}, clear=True):
+            claude_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "default"
+        assert ev["model"] == DEFAULT_CLAUDE_MODEL
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
     def test_spawn_prompt_contains_task_info(
         self,
         mock_os_open: MagicMock,
@@ -406,6 +501,8 @@ class TestSpawnIntegration:
                 workdir: Path,
                 log_file: Path,
                 retry_context: str = "",
+                *,
+                model: str | None = None,
             ) -> subprocess.Popen[bytes]:
                 prompt = self.build_prompt(task, context, retry_context)
                 return _spawn_with_log_fd(["echo", prompt], workdir, log_file)
@@ -460,6 +557,8 @@ class TestSpawnIntegration:
                 workdir: Path,
                 log_file: Path,
                 retry_context: str = "",
+                *,
+                model: str | None = None,
             ) -> subprocess.Popen[bytes]:
                 return _spawn_with_log_fd(
                     ["sh", "-c", "echo 'error message' >&2"],
@@ -504,6 +603,8 @@ class TestSpawnIntegration:
                 workdir: Path,
                 log_file: Path,
                 retry_context: str = "",
+                *,
+                model: str | None = None,
             ) -> subprocess.Popen[bytes]:
                 return _spawn_with_log_fd(
                     ["sh", "-c", "exit 42"],
@@ -553,6 +654,8 @@ class TestSpawnerInheritance:
                 workdir: Path,
                 log_file: Path,
                 retry_context: str = "",
+                *,
+                model: str | None = None,
             ) -> subprocess.Popen[bytes]:
                 return MagicMock()
 
@@ -587,6 +690,8 @@ class TestSpawnerInheritance:
                 workdir: Path,
                 log_file: Path,
                 retry_context: str = "",
+                *,
+                model: str | None = None,
             ) -> subprocess.Popen[bytes]:
                 return MagicMock()
 

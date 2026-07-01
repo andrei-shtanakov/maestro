@@ -47,6 +47,7 @@ class MockSpawner(BaseSpawner):
         self._spawned_tasks: list[Task] = []
         self._spawned_contexts: list[str] = []
         self._spawned_retry_contexts: list[str] = []
+        self._spawned_models: list[str | None] = []
         self._mock_processes: list[MagicMock] = []
 
     @property
@@ -65,6 +66,10 @@ class MockSpawner(BaseSpawner):
     def spawned_contexts(self) -> list[str]:
         return self._spawned_contexts
 
+    @property
+    def spawned_models(self) -> list[str | None]:
+        return self._spawned_models
+
     def is_available(self) -> bool:
         return self._available
 
@@ -75,11 +80,14 @@ class MockSpawner(BaseSpawner):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,
     ) -> subprocess.Popen[bytes]:
         self._spawn_count += 1
         self._spawned_tasks.append(task)
         self._spawned_contexts.append(context)
         self._spawned_retry_contexts.append(retry_context)
+        self._spawned_models.append(model)
 
         # Create mock process
         mock_process = MagicMock(spec=subprocess.Popen)
@@ -126,6 +134,8 @@ class FailingSpawner(BaseSpawner):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,
     ) -> subprocess.Popen[bytes]:
         msg = "Spawn failed intentionally"
         raise RuntimeError(msg)

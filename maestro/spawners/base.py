@@ -61,6 +61,8 @@ class AgentSpawner(ABC):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,
     ) -> Popen[bytes]:
         """Spawn agent process.
 
@@ -70,6 +72,10 @@ class AgentSpawner(ABC):
             workdir: Working directory for the process.
             log_file: Path to write process output.
             retry_context: Error context from previous failed attempt.
+            model: Routed model from the arbiter (``model_of_agent_id`` of
+                ``routed_agent_type``). ``None`` in scheduler mode; model-aware
+                spawners then fall back to env/default. Ignored by spawners with
+                no model concept (aider, announce).
 
         Returns:
             Subprocess handle for monitoring.
