@@ -752,12 +752,21 @@ class Scheduler:
             logger.error("assign with None chosen_agent for task %s", task_id)
             return False
         # arbiter may return "<harness>@<model>" (2026-06-19 convention); the
-        # harness validates against AgentType / selects the spawner, while the
-        # full id is retained in routed_agent_type for correlation + per-model
-        # report_outcome stats.
-        try:
-            chosen = AgentType(harness_of_agent_id(decision.chosen_agent))
-        except ValueError:
+        # harness validates against the spawner registry (D2) / selects the
+        # spawner, while the full id is retained in routed_agent_type for
+        # correlation + per-model report_outcome stats.
+        harness = harness_of_agent_id(decision.chosen_agent)
+        if harness == AgentType.AUTO.value:
+            logger.error(
+                "routing returned AUTO for task %s — refusing to spawn", task_id
+            )
+            if self._hold_throttle.should_log(task_id, "auto_not_resolved"):
+                self._emit_event(
+                    EventType.ARBITER_ROUTE_HOLD,
+                    {"task_id": task_id, "reason": "auto_not_resolved"},
+                )
+            return False
+        if harness not in self._spawners:
             logger.warning(
                 "arbiter chose unknown agent %r for task %s — HOLD",
                 decision.chosen_agent,
@@ -767,16 +776,6 @@ class Scheduler:
                 self._emit_event(
                     EventType.ARBITER_ROUTE_HOLD,
                     {"task_id": task_id, "reason": "unknown_agent"},
-                )
-            return False
-        if chosen is AgentType.AUTO:
-            logger.error(
-                "routing returned AUTO for task %s — refusing to spawn", task_id
-            )
-            if self._hold_throttle.should_log(task_id, "auto_not_resolved"):
-                self._emit_event(
-                    EventType.ARBITER_ROUTE_HOLD,
-                    {"task_id": task_id, "reason": "auto_not_resolved"},
                 )
             return False
 

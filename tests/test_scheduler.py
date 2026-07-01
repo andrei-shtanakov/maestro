@@ -1268,12 +1268,24 @@ class TestSpawnerErrorHandling:
     """Tests for spawner error handling."""
 
     @pytest.mark.anyio
-    async def test_missing_spawner_raises_error(
+    async def test_missing_spawner_holds_task(
         self,
         temp_db_path: Path,
         temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Test that missing spawner raises SchedulerError."""
+        """D2: a harness with no registered spawner HOLDs, it doesn't crash.
+
+        Before D2 this raised SchedulerError (chosen_agent="claude_code" is a
+        valid AgentType member, so the enum gate passed and the downstream
+        ``self._spawners.get()`` lookup failed instead). The D2 gate checks
+        registry membership up front, so an unregistered harness is now
+        caught as the same "unknown_agent" HOLD as any other unregistered
+        harness, and the task stays READY for a later retry once the
+        spawner is registered.
+        """
+        import logging
+
         configs = [
             TaskConfig(
                 id="unknown-agent-task",
@@ -1305,12 +1317,13 @@ class TestSpawnerErrorHandling:
             )
 
             ready = scheduler._resolve_ready_tasks(set())
-            await scheduler._spawn_ready_tasks(ready)
+            with caplog.at_level(logging.WARNING):
+                await scheduler._spawn_ready_tasks(ready)
 
-            # Task should be marked as FAILED due to missing spawner
+            # Task should HOLD (stay READY) rather than crash.
             task = await db.get_task("unknown-agent-task")
-            assert task.status == TaskStatus.FAILED
-            assert "No spawner available" in (task.error_message or "")
+            assert task.status == TaskStatus.READY
+            assert "unknown agent" in caplog.text
         finally:
             await db.close()
 
@@ -1566,5 +1579,95 @@ class TestSchedulerModelPassthrough:
 
             assert spawner.spawn_count == 1
             assert spawner.spawned_models == ["claude-opus-4-8"]
+        finally:
+            await db.close()
+
+
+class TestSchedulerD2Gate:
+    """D2: routing gate validates against the spawner registry, not the enum."""
+
+    async def _run(
+        self, temp_db_path: Path, temp_dir: Path, spawners: dict, chosen: str
+    ):
+        from unittest.mock import AsyncMock
+
+        from maestro.models import (
+            ArbiterMode,
+            RouteAction,
+            RouteDecision,
+            Task,
+            TaskConfig,
+        )
+
+        db = await create_database(temp_db_path)
+        config = TaskConfig(id="t", title="T", prompt="do it")
+        await db.create_task(Task.from_config(config, str(temp_db_path.parent)))
+        routing = AsyncMock()
+        routing.route.return_value = RouteDecision(
+            action=RouteAction.ASSIGN, chosen_agent=chosen, decision_id="d", reason="t"
+        )
+        scheduler = Scheduler(
+            db=db,
+            dag=DAG([config]),
+            spawners=spawners,
+            config=SchedulerConfig(log_dir=temp_dir / "logs"),
+            routing=routing,
+            arbiter_mode=ArbiterMode.AUTHORITATIVE,
+        )
+        await scheduler._spawn_ready_tasks(["t"])
+        return db, scheduler
+
+    @pytest.mark.anyio
+    async def test_non_enum_harness_with_spawner_spawns(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        """PROOF OF D2: 'opencode' is not an AgentType member, but has a spawner."""
+        spawner = MockSpawner("opencode")
+        db, _ = await self._run(
+            temp_db_path, temp_dir, {"opencode": spawner}, "opencode@glm-5.1"
+        )
+        try:
+            assert spawner.spawn_count == 1  # previously HOLD via ValueError
+            assert spawner.spawned_models == ["glm-5.1"]
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_unknown_harness_holds(
+        self, temp_db_path: Path, temp_dir: Path, caplog
+    ) -> None:
+        """A harness with no registered spawner → HOLD (unknown_agent), stays READY."""
+        import logging
+
+        from maestro.models import TaskStatus
+
+        spawner = MockSpawner("claude_code")
+        with caplog.at_level(logging.WARNING):
+            db, _ = await self._run(
+                temp_db_path, temp_dir, {"claude_code": spawner}, "ghost@x"
+            )
+        try:
+            assert spawner.spawn_count == 0
+            assert "unknown agent" in caplog.text
+            task = await db.get_task("t")
+            assert task.status == TaskStatus.READY
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_auto_sentinel_refused(
+        self, temp_db_path: Path, temp_dir: Path, caplog
+    ) -> None:
+        """chosen_agent 'auto' → refuse (auto_not_resolved), not spawned."""
+        import logging
+
+        spawner = MockSpawner("claude_code")
+        with caplog.at_level(logging.ERROR):
+            db, _ = await self._run(
+                temp_db_path, temp_dir, {"claude_code": spawner}, "auto"
+            )
+        try:
+            assert spawner.spawn_count == 0
+            assert "refusing to spawn" in caplog.text
         finally:
             await db.close()
