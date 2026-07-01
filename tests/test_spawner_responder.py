@@ -89,6 +89,8 @@ class FakeSpawner(AgentSpawner):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,
     ) -> Any:
         self.spawn_calls.append((task.id, task.prompt))
         log_file.write_text(self._log_content)

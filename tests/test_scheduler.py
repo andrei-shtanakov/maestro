@@ -47,6 +47,7 @@ class MockSpawner(BaseSpawner):
         self._spawned_tasks: list[Task] = []
         self._spawned_contexts: list[str] = []
         self._spawned_retry_contexts: list[str] = []
+        self._spawned_models: list[str | None] = []
         self._mock_processes: list[MagicMock] = []
 
     @property
@@ -65,6 +66,10 @@ class MockSpawner(BaseSpawner):
     def spawned_contexts(self) -> list[str]:
         return self._spawned_contexts
 
+    @property
+    def spawned_models(self) -> list[str | None]:
+        return self._spawned_models
+
     def is_available(self) -> bool:
         return self._available
 
@@ -75,11 +80,14 @@ class MockSpawner(BaseSpawner):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,
     ) -> subprocess.Popen[bytes]:
         self._spawn_count += 1
         self._spawned_tasks.append(task)
         self._spawned_contexts.append(context)
         self._spawned_retry_contexts.append(retry_context)
+        self._spawned_models.append(model)
 
         # Create mock process
         mock_process = MagicMock(spec=subprocess.Popen)
@@ -126,6 +134,8 @@ class FailingSpawner(BaseSpawner):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,
     ) -> subprocess.Popen[bytes]:
         msg = "Spawn failed intentionally"
         raise RuntimeError(msg)
@@ -1263,7 +1273,15 @@ class TestSpawnerErrorHandling:
         temp_db_path: Path,
         temp_dir: Path,
     ) -> None:
-        """Test that missing spawner raises SchedulerError."""
+        """Static/scheduler-mode unregistered spawner fails terminally.
+
+        StaticRouting always returns ``decision_id=None`` (no arbiter to
+        re-route later), so an unregistered harness here is a config error,
+        not a retryable condition. It must fail the task terminally
+        (pre-D2 behaviour) rather than HOLD — a HOLD in static mode would
+        leave the task READY forever and hang the run, since there is no
+        arbiter tick to ever re-route it.
+        """
         configs = [
             TaskConfig(
                 id="unknown-agent-task",
@@ -1297,10 +1315,57 @@ class TestSpawnerErrorHandling:
             ready = scheduler._resolve_ready_tasks(set())
             await scheduler._spawn_ready_tasks(ready)
 
-            # Task should be marked as FAILED due to missing spawner
+            # Task should be marked FAILED (terminal), not HOLD/READY.
             task = await db.get_task("unknown-agent-task")
             assert task.status == TaskStatus.FAILED
             assert "No spawner available" in (task.error_message or "")
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_static_mode_unregistered_harness_fails_not_hangs(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """Regression guard: static-mode unregistered harness must not hang.
+
+        Drives ``_spawn_task`` directly (bypassing the try/except in
+        ``_spawn_ready_tasks``) to prove the gate itself raises
+        ``SchedulerError`` synchronously instead of returning a HOLD
+        (``False``) that would leave the task READY indefinitely and stall
+        ``_main_loop`` (READY is non-terminal for
+        ``_all_tasks_complete()``).
+        """
+        configs = [
+            TaskConfig(
+                id="unknown-agent-task",
+                title="Task with unknown agent",
+                prompt="Test prompt",
+                agent_type=AgentType.CLAUDE_CODE,
+            )
+        ]
+
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(configs[0], str(temp_dir))
+            await db.create_task(task)
+
+            dag = DAG(configs)
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                log_dir=temp_dir / "logs",
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={},  # No spawners registered — static mode.
+                config=scheduler_config,
+            )
+
+            with pytest.raises(SchedulerError, match="No spawner available"):
+                await scheduler._spawn_task("unknown-agent-task")
         finally:
             await db.close()
 
@@ -1509,5 +1574,193 @@ class TestSchedulerRoutingInjection:
             )
             assert scheduler._routing is routing
             assert scheduler._arbiter_mode is ArbiterMode.AUTHORITATIVE
+        finally:
+            await db.close()
+
+
+class TestSchedulerModelPassthrough:
+    """D1: the arbiter-routed model reaches the spawner."""
+
+    @pytest.mark.anyio
+    async def test_routed_model_passed_to_spawner(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from maestro.models import (
+            ArbiterMode,
+            RouteAction,
+            RouteDecision,
+            Task,
+            TaskConfig,
+        )
+
+        db = await create_database(temp_db_path)
+        try:
+            config = TaskConfig(id="t", title="T", prompt="do it")
+            await db.create_task(Task.from_config(config, str(temp_db_path.parent)))
+
+            spawner = MockSpawner("claude_code")
+            routing = AsyncMock()
+            routing.route.return_value = RouteDecision(
+                action=RouteAction.ASSIGN,
+                chosen_agent="claude_code@claude-opus-4-8",
+                decision_id="d1",
+                reason="test",
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([config]),
+                spawners={"claude_code": spawner},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                routing=routing,
+                arbiter_mode=ArbiterMode.AUTHORITATIVE,
+            )
+
+            await scheduler._spawn_ready_tasks(["t"])
+
+            assert spawner.spawn_count == 1
+            assert spawner.spawned_models == ["claude-opus-4-8"]
+        finally:
+            await db.close()
+
+
+class TestSchedulerD2Gate:
+    """D2: routing gate validates against the spawner registry, not the enum."""
+
+    async def _run(
+        self, temp_db_path: Path, temp_dir: Path, spawners: dict, chosen: str
+    ):
+        from unittest.mock import AsyncMock
+
+        from maestro.models import (
+            ArbiterMode,
+            RouteAction,
+            RouteDecision,
+            Task,
+            TaskConfig,
+        )
+
+        db = await create_database(temp_db_path)
+        config = TaskConfig(id="t", title="T", prompt="do it")
+        await db.create_task(Task.from_config(config, str(temp_db_path.parent)))
+        routing = AsyncMock()
+        routing.route.return_value = RouteDecision(
+            action=RouteAction.ASSIGN, chosen_agent=chosen, decision_id="d", reason="t"
+        )
+        scheduler = Scheduler(
+            db=db,
+            dag=DAG([config]),
+            spawners=spawners,
+            config=SchedulerConfig(log_dir=temp_dir / "logs"),
+            routing=routing,
+            arbiter_mode=ArbiterMode.AUTHORITATIVE,
+        )
+        await scheduler._spawn_ready_tasks(["t"])
+        return db, scheduler
+
+    @pytest.mark.anyio
+    async def test_non_enum_harness_with_spawner_spawns(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        """PROOF OF D2: 'opencode' is not an AgentType member, but has a spawner."""
+        spawner = MockSpawner("opencode")
+        db, _ = await self._run(
+            temp_db_path, temp_dir, {"opencode": spawner}, "opencode@glm-5.1"
+        )
+        try:
+            assert spawner.spawn_count == 1  # previously HOLD via ValueError
+            assert spawner.spawned_models == ["glm-5.1"]
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_unknown_harness_holds(
+        self, temp_db_path: Path, temp_dir: Path, caplog
+    ) -> None:
+        """A harness with no registered spawner → HOLD (unknown_agent), stays READY."""
+        import logging
+
+        from maestro.models import TaskStatus
+
+        spawner = MockSpawner("claude_code")
+        with caplog.at_level(logging.WARNING):
+            db, _ = await self._run(
+                temp_db_path, temp_dir, {"claude_code": spawner}, "ghost@x"
+            )
+        try:
+            assert spawner.spawn_count == 0
+            assert "unknown agent" in caplog.text
+            task = await db.get_task("t")
+            assert task.status == TaskStatus.READY
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_arbiter_missing_decision_id_holds_not_fails(
+        self, temp_db_path: Path, temp_dir: Path, caplog
+    ) -> None:
+        """Arbiter ASSIGN with decision_id=None but a non-static reason → HOLD,
+        not terminal fail.
+
+        Guards the reason-based static/arbiter discriminator: _extract_decision_id
+        can legitimately return None for a real arbiter decision (metadata omits
+        it), which must still be retryable rather than the hang-avoiding terminal
+        fail reserved for truly-static routing.
+        """
+        import logging
+        from unittest.mock import AsyncMock
+
+        from maestro.models import (
+            ArbiterMode,
+            RouteAction,
+            RouteDecision,
+            Task,
+            TaskConfig,
+            TaskStatus,
+        )
+
+        db = await create_database(temp_db_path)
+        try:
+            config = TaskConfig(id="t", title="T", prompt="do it")
+            await db.create_task(Task.from_config(config, str(temp_db_path.parent)))
+            routing = AsyncMock()
+            routing.route.return_value = RouteDecision(
+                action=RouteAction.ASSIGN,
+                chosen_agent="ghost@x",
+                decision_id=None,  # arbiter omitted it
+                reason="dt_inference",  # but NOT the static marker
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([config]),
+                spawners={"claude_code": MockSpawner("claude_code")},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                routing=routing,
+                arbiter_mode=ArbiterMode.AUTHORITATIVE,
+            )
+            with caplog.at_level(logging.WARNING):
+                await scheduler._spawn_ready_tasks(["t"])
+            task = await db.get_task("t")
+            assert "unknown agent" in caplog.text
+            assert task.status == TaskStatus.READY  # retryable HOLD, not FAILED
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_auto_sentinel_refused(
+        self, temp_db_path: Path, temp_dir: Path, caplog
+    ) -> None:
+        """chosen_agent 'auto' → refuse (auto_not_resolved), not spawned."""
+        import logging
+
+        spawner = MockSpawner("claude_code")
+        with caplog.at_level(logging.ERROR):
+            db, _ = await self._run(
+                temp_db_path, temp_dir, {"claude_code": spawner}, "auto"
+            )
+        try:
+            assert spawner.spawn_count == 0
+            assert "refusing to spawn" in caplog.text
         finally:
             await db.close()

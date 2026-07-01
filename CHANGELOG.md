@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- **Routing (D2):** the arbiter can now route to any harness that has a
+  registered spawner; the closed `AgentType` enum no longer gates spawns
+  (`scheduler.py`). Under **arbiter routing**, an unknown harness → retryable
+  HOLD (`unknown_agent`); `auto` → refuse (`auto_not_resolved`) — semantics
+  unchanged. Under **static/scheduler routing** (no arbiter to re-route), an
+  unregistered harness fails **terminally** (`SchedulerError`, task FAILED) —
+  a HOLD there would leave the task READY forever and hang the run.
+- **Model execution (D1):** the arbiter-routed model (`<harness>@<model>`) is now
+  passed into `spawn()` and executed. Precedence is **routed > env > default**.
+  **Behaviour change:** `MAESTRO_CLAUDE_MODEL` / `MAESTRO_CODEX_MODEL` are now a
+  *fallback* used only when routing supplies no model — they no longer override a
+  routed decision. Each spawn emits an `agent.model_resolved {harness, model,
+  source}` log for observability. Catalog-membership validation of the routed
+  model is deferred to ADR-ECO-003 AI#4.
+
+---
+
 ## v0.4.0 — Rename Zadacha → Workstream (2026-05-23)
 
 **Breaking changes** (no backward compatibility):

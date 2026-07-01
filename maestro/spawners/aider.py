@@ -40,6 +40,8 @@ class AiderSpawner(AgentSpawner):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,  # noqa: ARG002 - kept for API consistency
     ) -> subprocess.Popen[bytes]:
         """Spawn Aider process.
 
@@ -53,6 +55,7 @@ class AiderSpawner(AgentSpawner):
             workdir: Working directory for the process.
             log_file: Path to write process output.
             retry_context: Error context from previous failed attempt.
+            model: Accepted for interface parity; unused (no model concept).
 
         Returns:
             Subprocess handle for monitoring.

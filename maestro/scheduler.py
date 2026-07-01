@@ -24,6 +24,7 @@ from typing import Protocol
 from maestro._vendor import obs
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.coordination.routing import (
+    STATIC_ROUTING_REASON,
     RoutingStrategy,
     StaticRouting,
     task_status_to_outcome_status,
@@ -42,6 +43,7 @@ from maestro.models import (
     TaskOutcomeStatus,
     TaskStatus,
     harness_of_agent_id,
+    model_of_agent_id,
 )
 from maestro.notifications.base import Notification, NotificationEvent
 from maestro.notifications.manager import NotificationManager
@@ -76,6 +78,8 @@ class SpawnerProtocol(Protocol):
         workdir: Path,
         log_file: Path,
         retry_context: str = "",
+        *,
+        model: str | None = None,
     ) -> Popen[bytes]:
         """Spawn agent process."""
         ...
@@ -749,12 +753,30 @@ class Scheduler:
             logger.error("assign with None chosen_agent for task %s", task_id)
             return False
         # arbiter may return "<harness>@<model>" (2026-06-19 convention); the
-        # harness validates against AgentType / selects the spawner, while the
-        # full id is retained in routed_agent_type for correlation + per-model
-        # report_outcome stats.
-        try:
-            chosen = AgentType(harness_of_agent_id(decision.chosen_agent))
-        except ValueError:
+        # harness validates against the spawner registry (D2) / selects the
+        # spawner, while the full id is retained in routed_agent_type for
+        # correlation + per-model report_outcome stats.
+        harness = harness_of_agent_id(decision.chosen_agent)
+        if harness == AgentType.AUTO.value:
+            logger.error(
+                "routing returned AUTO for task %s — refusing to spawn", task_id
+            )
+            if self._hold_throttle.should_log(task_id, "auto_not_resolved"):
+                self._emit_event(
+                    EventType.ARBITER_ROUTE_HOLD,
+                    {"task_id": task_id, "reason": "auto_not_resolved"},
+                )
+            return False
+        if harness not in self._spawners:
+            if decision.reason == STATIC_ROUTING_REASON:
+                # Static/scheduler mode (incl. the arbiter-unavailable
+                # fallback): no live arbiter will re-route. An unregistered
+                # harness is a config error — fail terminally (pre-D2
+                # behaviour) rather than an unrecoverable HOLD that hangs the
+                # run. An arbiter ASSIGN merely missing decision_id carries the
+                # arbiter's own reason, so it falls through to the HOLD below.
+                msg = f"No spawner available for agent type '{harness}'"
+                raise SchedulerError(msg)
             logger.warning(
                 "arbiter chose unknown agent %r for task %s — HOLD",
                 decision.chosen_agent,
@@ -764,16 +786,6 @@ class Scheduler:
                 self._emit_event(
                     EventType.ARBITER_ROUTE_HOLD,
                     {"task_id": task_id, "reason": "unknown_agent"},
-                )
-            return False
-        if chosen is AgentType.AUTO:
-            logger.error(
-                "routing returned AUTO for task %s — refusing to spawn", task_id
-            )
-            if self._hold_throttle.should_log(task_id, "auto_not_resolved"):
-                self._emit_event(
-                    EventType.ARBITER_ROUTE_HOLD,
-                    {"task_id": task_id, "reason": "auto_not_resolved"},
                 )
             return False
 
@@ -874,7 +886,14 @@ class Scheduler:
             self._retry_ready_times.pop(task_id, None)
 
             # Spawn the process with retry context
-            process = spawner.spawn(task, context, workdir, log_file, retry_context)
+            routed_model = (
+                model_of_agent_id(task.routed_agent_type)
+                if task.routed_agent_type
+                else None
+            )
+            process = spawner.spawn(
+                task, context, workdir, log_file, retry_context, model=routed_model
+            )
 
             # Track running task
             self._running_tasks[task_id] = RunningTask(
