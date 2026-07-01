@@ -18,6 +18,8 @@ uv run maestro run <config.yaml>
 uv run maestro run config.yaml --resume  # Resume after crash
 uv run maestro status --db maestro.db
 uv run maestro retry <task-id> --db maestro.db
+uv run maestro stop                          # Stop the running scheduler
+uv run maestro approve <task-id> --db maestro.db  # Approve an AWAITING_APPROVAL task
 
 # === Multi-Process Orchestrator (new mode) ===
 uv run maestro orchestrate <project.yaml>   # Run orchestrator
@@ -78,25 +80,31 @@ uv add --dev <package>
 - **notifications/**: Desktop notifications (macOS/Linux)
 - **dashboard/**: Web UI with DAG visualization (Mermaid.js) + SSE updates
 - **schemas/**: JSON-schema generation for config/contract artifacts
+- **_vendor/**: Vendored observability lib (`obs.py`) — structlog-based spans, trace propagation, and `child_env()` for cross-process trace continuity
 
 ### Task State Machine (scheduler mode)
 
 ```
 PENDING -> READY -> RUNNING -> VALIDATING -> DONE
-                      |            |
-                   FAILED <- (validation failed)
-                      |
-               NEEDS_REVIEW -> (manual) -> READY
+             |        |            |
+             |        |            └-> FAILED -> READY (retry)
+             |        |                  |
+             |        └-> FAILED --------┴-> NEEDS_REVIEW -> READY
+             |                                    |
+             |                                    └-> ABANDONED
+             |
+             └-> AWAITING_APPROVAL -> RUNNING   (tasks with requires_approval;
+                       |              gated by `maestro approve <task-id>`)
+                       └-> ABANDONED
 ```
 
 ### Workstream State Machine (orchestrator mode)
 
 ```
 PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
-                                     |                       |
-                                  FAILED                  FAILED
-                                     |
-                              NEEDS_REVIEW -> (manual) -> READY
+                            |         └-> FAILED -> READY (retry)
+                            |                         └-> NEEDS_REVIEW -> READY
+                            └-> ABANDONED
 ```
 
 ### Key Design Decisions
