@@ -93,8 +93,8 @@ PENDING -> READY -> RUNNING -> VALIDATING -> DONE
              |                                    |
              |                                    └-> ABANDONED
              |
-             └-> AWAITING_APPROVAL -> RUNNING   (tasks with requires_approval;
-                       |              gated by `maestro approve <task-id>`)
+             └-> AWAITING_APPROVAL -> READY   (requires_approval; `maestro approve
+                       |             <task-id>` sets READY, then scheduler runs it)
                        └-> ABANDONED
 ```
 
@@ -102,8 +102,11 @@ PENDING -> READY -> RUNNING -> VALIDATING -> DONE
 
 ```
 PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
+                            |         |
                             |         └-> FAILED -> READY (retry)
-                            |                         └-> NEEDS_REVIEW -> READY
+                            |               |
+                            |               └-> NEEDS_REVIEW -> READY
+                            |
                             └-> ABANDONED
 ```
 
