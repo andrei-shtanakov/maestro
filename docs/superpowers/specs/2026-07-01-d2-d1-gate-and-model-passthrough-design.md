@@ -80,14 +80,46 @@ Rejected alternatives:
   `SpawnerProtocol.spawn` in `scheduler.py`.
 - At the spawn call (`scheduler.py:877`), pass
   `model=model_of_agent_id(task.routed_agent_type)`.
-- Model-aware spawners resolve **routed > env > default**:
-  `model = model or os.environ.get("MAESTRO_<H>_MODEL") or DEFAULT_<H>_MODEL`
-  (claude_code, codex). Because `model` is `None` when there is no routing (scheduler mode),
-  this falls through to env/default exactly as before.
+- Model-aware spawners resolve **routed > env > default** and record the outcome
+  (claude_code, codex):
+  ```python
+  if model:
+      resolved, source = model, "routed"
+  elif os.environ.get("MAESTRO_CLAUDE_MODEL"):
+      resolved, source = os.environ["MAESTRO_CLAUDE_MODEL"], "env"
+  else:
+      resolved, source = DEFAULT_CLAUDE_MODEL, "default"
+  _obs_log.info("agent.model_resolved", harness="claude_code",
+                model=resolved, source=source)
+  ```
+  Because `model` is `None` when there is no routing (scheduler mode), this falls through to
+  env/default exactly as before.
 - `aider.py` / `announce.py` accept the param and ignore it (no model concept).
 
 Rejected alternative **B** (spawners read `task.routed_agent_type` themselves): couples every
 executor to the `@` convention and routing, duplicates parsing, and worsens boundaries.
+
+### Observability of the executed model (closes review P1 + P3)
+
+The point of D1 is to kill "routed ≠ executed" drift — so the executed model must be
+*observable*, not merely asserted in a unit test. Model resolution happens inside the spawner,
+which runs within the scheduler's active `task.spawn` obs span (propagated via
+`structlog.contextvars`). Each model-aware spawner therefore emits one trace-correlated
+structured event at resolution time:
+
+```
+agent.model_resolved  { harness, model, source ∈ {routed, env, default} }
+```
+
+This closes two gaps the review flagged: (a) the resolved model + its source are now logged
+(ADR-ECO-002 D1 option-A Cons: *"нужна валидация неизвестной модели"* — partially satisfied
+here via observability); (b) the **scheduler-mode** path — where `report_outcome` records only
+`agent_used = task.agent_type.value` (harness, no model, `scheduler.py:385`) — now still has the
+executed model in the log stream. Full **catalog-membership validation** of the routed model
+(warn/reject a model absent from `agents-catalog.toml`) is **deferred to AI#4**, when Maestro
+reads the catalog; the spawner has no catalog access in this PR and pulling it in would be
+scope creep. Until then, an unsupported routed model surfaces as the CLI's own failure →
+FAILED/retry, with the `agent.model_resolved` log making the culprit explicit.
 
 ## Components changed
 
@@ -98,8 +130,8 @@ executor to the `@` convention and routing, duplicates parsing, and worsens boun
 | `maestro/scheduler.py` (spawn call ~877) | compute routed model, pass `model=` to `spawn()` |
 | `maestro/scheduler.py` (`SpawnerProtocol.spawn`) | + `model: str \| None = None` |
 | `maestro/spawners/base.py` (`spawn` ABC) | + `model: str \| None = None` + docstring |
-| `maestro/spawners/claude_code.py` | `model = model or env or DEFAULT_CLAUDE_MODEL` |
-| `maestro/spawners/codex.py` | `model = model or env or DEFAULT_CODEX_MODEL` |
+| `maestro/spawners/claude_code.py` | resolve `routed > env > default`; emit `agent.model_resolved`; update docstring (env is now a **fallback**, not an override) |
+| `maestro/spawners/codex.py` | same, CODEX vars + `-m` flag; update docstring |
 | `maestro/spawners/aider.py`, `announce.py` | accept `model`, ignore |
 
 ## Data flow
@@ -127,6 +159,19 @@ spawner falls back to `env or DEFAULT` (unchanged behavior).
   check (`_cowork_output/devtools/check-agent-id-conformance.py`).
 - A garbage harness now yields HOLD (`unknown_agent`) instead of `ValueError → HOLD` — same
   net retryable outcome, cleaner path.
+- **Behaviour change — `MAESTRO_<H>_MODEL` semantics (review P2).** With `routed > env`, the
+  env var goes from "override/pin" (its role in #32) to "fallback when routing supplies no
+  model." An operator who set it in an arbiter deployment to *force* a model is now silently
+  overridden by the routed decision. This is intentional (it is the R-07 correctness property),
+  but the docstrings at `claude_code.py:28` / `codex.py:28` ("override via `MAESTRO_CLAUDE_MODEL`")
+  must be corrected to "fallback," and it belongs in the PR changelog.
+- **Behaviour change — built-in harness without a spawner (review P4).** A valid `AgentType`
+  (e.g. `announce`) that is *not* registered in `self._spawners` previously passed the enum gate
+  and failed loudly at `SchedulerError` (`scheduler.py:817`); it now takes the `unknown_agent`
+  HOLD path. Net acceptable (both are config errors; HOLD is retryable and names the harness in
+  the log), but `unknown_agent` now conflates two causes — a typo/unregistered custom harness and
+  a mis-wired built-in. Accepted knowingly; the log message names the offending harness either
+  way.
 
 ## Testing
 
@@ -142,6 +187,8 @@ spawner falls back to `env or DEFAULT` (unchanged behavior).
 3. `model=None` + `MAESTRO_CLAUDE_MODEL=Y` → argv = `Y` (env, scheduler mode).
 4. `model=None` + no env → argv = `DEFAULT_CLAUDE_MODEL`.
 5. Same matrix for codex (`-m` flag).
+6. `agent.model_resolved` log carries the correct `source` for each of cases 1–4
+   (`routed` / `routed` / `env` / `default`) — capture via `caplog`/structlog capture.
 
 **Unit** (`tests/test_models.py`): `model_of_agent_id` on `"h@m"` → `"m"`, `"h"` → `None`,
 `""` → `None`, `"h@m@n"` → `"m@n"` (split on first `@`, symmetric with `harness_of_agent_id`).
