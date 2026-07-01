@@ -1697,6 +1697,57 @@ class TestSchedulerD2Gate:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_arbiter_missing_decision_id_holds_not_fails(
+        self, temp_db_path: Path, temp_dir: Path, caplog
+    ) -> None:
+        """Arbiter ASSIGN with decision_id=None but a non-static reason → HOLD,
+        not terminal fail.
+
+        Guards the reason-based static/arbiter discriminator: _extract_decision_id
+        can legitimately return None for a real arbiter decision (metadata omits
+        it), which must still be retryable rather than the hang-avoiding terminal
+        fail reserved for truly-static routing.
+        """
+        import logging
+        from unittest.mock import AsyncMock
+
+        from maestro.models import (
+            ArbiterMode,
+            RouteAction,
+            RouteDecision,
+            Task,
+            TaskConfig,
+            TaskStatus,
+        )
+
+        db = await create_database(temp_db_path)
+        try:
+            config = TaskConfig(id="t", title="T", prompt="do it")
+            await db.create_task(Task.from_config(config, str(temp_db_path.parent)))
+            routing = AsyncMock()
+            routing.route.return_value = RouteDecision(
+                action=RouteAction.ASSIGN,
+                chosen_agent="ghost@x",
+                decision_id=None,  # arbiter omitted it
+                reason="dt_inference",  # but NOT the static marker
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([config]),
+                spawners={"claude_code": MockSpawner("claude_code")},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                routing=routing,
+                arbiter_mode=ArbiterMode.AUTHORITATIVE,
+            )
+            with caplog.at_level(logging.WARNING):
+                await scheduler._spawn_ready_tasks(["t"])
+            task = await db.get_task("t")
+            assert "unknown agent" in caplog.text
+            assert task.status == TaskStatus.READY  # retryable HOLD, not FAILED
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_auto_sentinel_refused(
         self, temp_db_path: Path, temp_dir: Path, caplog
     ) -> None:

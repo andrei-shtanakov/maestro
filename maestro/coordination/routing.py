@@ -31,6 +31,13 @@ from maestro.models import (
 
 logger = logging.getLogger(__name__)
 
+# Marker `reason` set by StaticRouting (and its use as ArbiterRouting's
+# fallback delegate). Identifies a decision that no live arbiter will re-route,
+# so the scheduler can fail terminally on an unregistered harness instead of an
+# unrecoverable HOLD. An arbiter ASSIGN whose metadata merely omits decision_id
+# carries the arbiter's own reason, NOT this marker — so it still HOLDs.
+STATIC_ROUTING_REASON = "static"
+
 
 class RoutingStrategy(Protocol):
     """Protocol implemented by every routing strategy."""
@@ -67,7 +74,7 @@ class StaticRouting:
             action=RouteAction.ASSIGN,
             chosen_agent=task.agent_type.value,
             decision_id=None,
-            reason="static",
+            reason=STATIC_ROUTING_REASON,
         )
 
     async def report_outcome(

@@ -24,6 +24,7 @@ from typing import Protocol
 from maestro._vendor import obs
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.coordination.routing import (
+    STATIC_ROUTING_REASON,
     RoutingStrategy,
     StaticRouting,
     task_status_to_outcome_status,
@@ -767,11 +768,13 @@ class Scheduler:
                 )
             return False
         if harness not in self._spawners:
-            if decision.decision_id is None:
-                # Static/scheduler mode: no arbiter to re-route. An
-                # unregistered harness is a config error — fail terminally
-                # (pre-D2 behaviour) rather than an unrecoverable HOLD that
-                # hangs the run.
+            if decision.reason == STATIC_ROUTING_REASON:
+                # Static/scheduler mode (incl. the arbiter-unavailable
+                # fallback): no live arbiter will re-route. An unregistered
+                # harness is a config error — fail terminally (pre-D2
+                # behaviour) rather than an unrecoverable HOLD that hangs the
+                # run. An arbiter ASSIGN merely missing decision_id carries the
+                # arbiter's own reason, so it falls through to the HOLD below.
                 msg = f"No spawner available for agent type '{harness}'"
                 raise SchedulerError(msg)
             logger.warning(
