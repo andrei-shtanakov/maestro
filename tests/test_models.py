@@ -64,9 +64,14 @@ class TestTaskStatus:
         assert not TaskStatus.READY.can_transition_to(TaskStatus.PENDING)
 
     def test_valid_transitions_from_awaiting_approval(self) -> None:
-        """Test valid transitions from AWAITING_APPROVAL."""
-        assert TaskStatus.AWAITING_APPROVAL.can_transition_to(TaskStatus.RUNNING)
+        """Test valid transitions from AWAITING_APPROVAL.
+
+        `maestro approve` sets an approved task back to READY (the scheduler
+        then spawns it via READY → RUNNING); RUNNING is not a direct target.
+        """
+        assert TaskStatus.AWAITING_APPROVAL.can_transition_to(TaskStatus.READY)
         assert TaskStatus.AWAITING_APPROVAL.can_transition_to(TaskStatus.ABANDONED)
+        assert not TaskStatus.AWAITING_APPROVAL.can_transition_to(TaskStatus.RUNNING)
         assert not TaskStatus.AWAITING_APPROVAL.can_transition_to(TaskStatus.DONE)
 
     def test_valid_transitions_from_running(self) -> None:
