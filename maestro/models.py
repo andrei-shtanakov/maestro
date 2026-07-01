@@ -26,7 +26,7 @@ class TaskStatus(StrEnum):
                     │                                │
                     │                                └→ ABANDONED
                     │
-                    └→ AWAITING_APPROVAL → RUNNING
+                    └→ AWAITING_APPROVAL → READY (via `maestro approve`)
                               │
                               └→ ABANDONED
     """
@@ -47,7 +47,7 @@ class TaskStatus(StrEnum):
         return {
             cls.PENDING: {cls.READY},
             cls.READY: {cls.RUNNING, cls.AWAITING_APPROVAL},
-            cls.AWAITING_APPROVAL: {cls.RUNNING, cls.ABANDONED},
+            cls.AWAITING_APPROVAL: {cls.READY, cls.ABANDONED},
             cls.RUNNING: {cls.VALIDATING, cls.FAILED},
             cls.VALIDATING: {cls.DONE, cls.FAILED},
             cls.FAILED: {cls.READY, cls.NEEDS_REVIEW},
