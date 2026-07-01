@@ -882,6 +882,73 @@ class TestCodexSpawner:
     @patch("subprocess.Popen")
     @patch("os.close")
     @patch("os.open")
+    def test_spawn_routed_model_beats_env(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        codex_spawner: CodexSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """Precedence routed > env: routed model overrides MAESTRO_CODEX_MODEL."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+        workdir = Path(sample_task.workdir)
+
+        with patch.dict(os.environ, {"MAESTRO_CODEX_MODEL": "env-model"}):
+            codex_spawner.spawn(
+                sample_task, "", workdir, temp_dir / "t.log", model="routed-model"
+            )
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("-m") + 1] == "routed-model"
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_emits_model_resolved_source(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        codex_spawner: CodexSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """agent.model_resolved reports the correct source for each origin."""
+        from structlog.testing import capture_logs
+
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+        workdir = Path(sample_task.workdir)
+
+        with capture_logs() as logs:
+            codex_spawner.spawn(
+                sample_task, "", workdir, temp_dir / "t.log", model="routed-x"
+            )
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "routed"
+        assert ev["model"] == "routed-x"
+
+        with (
+            capture_logs() as logs,
+            patch.dict(os.environ, {"MAESTRO_CODEX_MODEL": "env-y"}),
+        ):
+            codex_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "env"
+        assert ev["model"] == "env-y"
+
+        with capture_logs() as logs, patch.dict(os.environ, {}, clear=True):
+            codex_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "default"
+        assert ev["model"] == DEFAULT_CODEX_MODEL
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
     def test_spawn_prompt_contains_task_info(
         self,
         mock_os_open: MagicMock,

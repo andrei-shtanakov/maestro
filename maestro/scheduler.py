@@ -767,6 +767,13 @@ class Scheduler:
                 )
             return False
         if harness not in self._spawners:
+            if decision.decision_id is None:
+                # Static/scheduler mode: no arbiter to re-route. An
+                # unregistered harness is a config error — fail terminally
+                # (pre-D2 behaviour) rather than an unrecoverable HOLD that
+                # hangs the run.
+                msg = f"No spawner available for agent type '{harness}'"
+                raise SchedulerError(msg)
             logger.warning(
                 "arbiter chose unknown agent %r for task %s — HOLD",
                 decision.chosen_agent,

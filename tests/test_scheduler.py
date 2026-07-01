@@ -1268,24 +1268,20 @@ class TestSpawnerErrorHandling:
     """Tests for spawner error handling."""
 
     @pytest.mark.anyio
-    async def test_missing_spawner_holds_task(
+    async def test_missing_spawner_raises_error(
         self,
         temp_db_path: Path,
         temp_dir: Path,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """D2: a harness with no registered spawner HOLDs, it doesn't crash.
+        """Static/scheduler-mode unregistered spawner fails terminally.
 
-        Before D2 this raised SchedulerError (chosen_agent="claude_code" is a
-        valid AgentType member, so the enum gate passed and the downstream
-        ``self._spawners.get()`` lookup failed instead). The D2 gate checks
-        registry membership up front, so an unregistered harness is now
-        caught as the same "unknown_agent" HOLD as any other unregistered
-        harness, and the task stays READY for a later retry once the
-        spawner is registered.
+        StaticRouting always returns ``decision_id=None`` (no arbiter to
+        re-route later), so an unregistered harness here is a config error,
+        not a retryable condition. It must fail the task terminally
+        (pre-D2 behaviour) rather than HOLD — a HOLD in static mode would
+        leave the task READY forever and hang the run, since there is no
+        arbiter tick to ever re-route it.
         """
-        import logging
-
         configs = [
             TaskConfig(
                 id="unknown-agent-task",
@@ -1317,13 +1313,59 @@ class TestSpawnerErrorHandling:
             )
 
             ready = scheduler._resolve_ready_tasks(set())
-            with caplog.at_level(logging.WARNING):
-                await scheduler._spawn_ready_tasks(ready)
+            await scheduler._spawn_ready_tasks(ready)
 
-            # Task should HOLD (stay READY) rather than crash.
+            # Task should be marked FAILED (terminal), not HOLD/READY.
             task = await db.get_task("unknown-agent-task")
-            assert task.status == TaskStatus.READY
-            assert "unknown agent" in caplog.text
+            assert task.status == TaskStatus.FAILED
+            assert "No spawner available" in (task.error_message or "")
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_static_mode_unregistered_harness_fails_not_hangs(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """Regression guard: static-mode unregistered harness must not hang.
+
+        Drives ``_spawn_task`` directly (bypassing the try/except in
+        ``_spawn_ready_tasks``) to prove the gate itself raises
+        ``SchedulerError`` synchronously instead of returning a HOLD
+        (``False``) that would leave the task READY indefinitely and stall
+        ``_main_loop`` (READY is non-terminal for
+        ``_all_tasks_complete()``).
+        """
+        configs = [
+            TaskConfig(
+                id="unknown-agent-task",
+                title="Task with unknown agent",
+                prompt="Test prompt",
+                agent_type=AgentType.CLAUDE_CODE,
+            )
+        ]
+
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(configs[0], str(temp_dir))
+            await db.create_task(task)
+
+            dag = DAG(configs)
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                log_dir=temp_dir / "logs",
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={},  # No spawners registered — static mode.
+                config=scheduler_config,
+            )
+
+            with pytest.raises(SchedulerError, match="No spawner available"):
+                await scheduler._spawn_task("unknown-agent-task")
         finally:
             await db.close()
 

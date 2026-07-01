@@ -165,20 +165,29 @@ spawner falls back to `env or DEFAULT` (unchanged behavior).
   overridden by the routed decision. This is intentional (it is the R-07 correctness property),
   but the docstrings at `claude_code.py:28` / `codex.py:28` ("override via `MAESTRO_CLAUDE_MODEL`")
   must be corrected to "fallback," and it belongs in the PR changelog.
-- **Behaviour change — built-in harness without a spawner (review P4).** A valid `AgentType`
-  (e.g. `announce`) that is *not* registered in `self._spawners` previously passed the enum gate
-  and failed loudly at `SchedulerError` (`scheduler.py:817`); it now takes the `unknown_agent`
-  HOLD path. Net acceptable (both are config errors; HOLD is retryable and names the harness in
-  the log), but `unknown_agent` now conflates two causes — a typo/unregistered custom harness and
-  a mis-wired built-in. Accepted knowingly; the log message names the offending harness either
-  way.
+- **Behaviour change — built-in harness without a spawner (review P4), mode-split (final-review
+  fix).** A valid `AgentType` (e.g. `announce`) that is *not* registered in `self._spawners`
+  previously passed the enum gate and failed loudly at `SchedulerError` (`scheduler.py:817`).
+  The gate is now discriminated by `decision.decision_id`: in **static/scheduler mode**
+  (`decision_id is None` — `StaticRouting.route` always sets this, and so does the arbiter-down
+  fallback, since neither has an arbiter available to re-route) an unregistered harness is a
+  terminal config error and raises `SchedulerError` immediately — this restores the pre-D2
+  behaviour and avoids a run hang, since a HOLD in static mode leaves the task READY forever
+  (no arbiter tick will ever re-route it, and READY is non-terminal for
+  `_all_tasks_complete()`). In **arbiter mode** (`decision_id is not None`) the unregistered
+  harness still takes the retryable `unknown_agent` HOLD path, since the arbiter may re-route on
+  a later tick. The log message names the offending harness in both cases.
 
 ## Testing
 
 **D2** (in `tests/test_scheduler.py`, matching existing routing tests):
 1. Register a dummy spawner keyed with a non-enum harness (`"opencode"`); arbiter returns
    `"opencode@glm-5.1"` → spawn proceeds (previously HOLD). This is the proof D2 works.
-2. Harness with no registered spawner → HOLD, event `unknown_agent`.
+2. Harness with no registered spawner, arbiter mode (`decision_id` set) → HOLD, event
+   `unknown_agent`.
+2b. Harness with no registered spawner, static/scheduler mode (`decision_id is None`,
+   `StaticRouting` default) → terminal `SchedulerError`, task FAILED (final-review fix; prevents
+   an unrecoverable HOLD from hanging the run).
 3. `chosen_agent = "auto"` → refuse, event `auto_not_resolved`.
 
 **D1** (in `tests/test_spawners.py`, reusing `test_spawn_creates_process_with_correct_args`):
