@@ -135,3 +135,56 @@ def load_catalog() -> Catalog | None:
         return Catalog.model_validate(data)
     except (tomllib.TOMLDecodeError, ValidationError, OSError) as exc:
         raise CatalogMalformed(f"catalog is corrupt ({path}): {exc}") from exc
+
+
+def resolve_model(
+    routed: str | None,
+    env_var: str,
+    harness: str,
+    catalog: Catalog | None,
+) -> tuple[str, str]:
+    """Resolve the model to run and its source. Precedence: routed > env >
+    catalog-default. An empty ``routed`` is treated as absent (guards against a
+    degenerate ``"<harness>@"`` id producing an empty ``--model``).
+
+    Raises CatalogNotConfigured (GLOBAL → halt) when the default path is reached
+    with no catalog. Propagates HarnessModelUnresolved (PER-TASK) from
+    default_model_for_harness for no-routable / ambiguous harnesses.
+    """
+    if routed:
+        return routed, "routed"
+    env_val = os.environ.get(env_var)
+    if env_val:
+        return env_val, "env"
+    if catalog is None:
+        raise CatalogNotConfigured(_NOT_CONFIGURED_MSG)
+    return catalog.default_model_for_harness(harness), "catalog"
+
+
+def warn_on_model_status(model: str, source: str, catalog: Catalog | None) -> None:
+    """Coherence check against the catalog only (never provider reality — that is
+    the CLI's job). No-op when catalog is None. Grades by status: retired → loud,
+    deprecated → light, active → silent — for every source. The unknown → soft
+    branch is the only source-gated one (skipped for source == 'catalog', where
+    membership is tautological). Never blocks the spawn.
+    """
+    if catalog is None:
+        return
+    status = catalog.status_of(model)
+    if status == "retired":
+        _obs_log.warning(
+            "agent.model_retired",
+            model=model,
+            source=source,
+            nearest=catalog.nearest_models(model),
+        )
+    elif status == "deprecated":
+        _obs_log.warning("agent.model_deprecated", model=model, source=source)
+    elif status is None and source != "catalog":
+        _obs_log.info(
+            "agent.model_unknown",
+            model=model,
+            source=source,
+            nearest=catalog.nearest_models(model),
+        )
+    # active → silent

@@ -3,14 +3,18 @@
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from maestro.catalog import (
     Catalog,
     CatalogError,
     CatalogMalformed,
+    CatalogNotConfigured,
     HarnessModelUnresolved,
     load_catalog,
     resolve_catalog_path,
+    resolve_model,
+    warn_on_model_status,
 )
 
 
@@ -101,3 +105,102 @@ def test_fixture_matches_sibling_ssot() -> None:
     cat = Catalog.model_validate(data)
     assert cat.default_model_for_harness("claude_code") == "claude-sonnet-4-6"
     assert cat.default_model_for_harness("codex_cli") == "gpt-5.5"
+
+
+def _catalog(monkeypatch: pytest.MonkeyPatch, name: str = "agents-catalog.toml"):
+    _use_catalog(monkeypatch, name)
+    return load_catalog()
+
+
+def test_resolve_precedence_routed_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    cat = _catalog(monkeypatch)
+    monkeypatch.setenv("MAESTRO_CLAUDE_MODEL", "env-x")
+    assert resolve_model("routed-x", "MAESTRO_CLAUDE_MODEL", "claude_code", cat) == (
+        "routed-x",
+        "routed",
+    )
+
+
+def test_resolve_env_then_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    cat = _catalog(monkeypatch)
+    monkeypatch.setenv("MAESTRO_CLAUDE_MODEL", "env-x")
+    assert resolve_model(None, "MAESTRO_CLAUDE_MODEL", "claude_code", cat) == (
+        "env-x",
+        "env",
+    )
+    monkeypatch.delenv("MAESTRO_CLAUDE_MODEL", raising=False)
+    assert resolve_model(None, "MAESTRO_CLAUDE_MODEL", "claude_code", cat) == (
+        "claude-sonnet-4-6",
+        "catalog",
+    )
+
+
+def test_resolve_empty_routed_treated_as_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cat = _catalog(monkeypatch)
+    monkeypatch.delenv("MAESTRO_CLAUDE_MODEL", raising=False)
+    assert resolve_model("", "MAESTRO_CLAUDE_MODEL", "claude_code", cat) == (
+        "claude-sonnet-4-6",
+        "catalog",
+    )
+
+
+def test_resolve_no_catalog_default_path_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MAESTRO_CLAUDE_MODEL", raising=False)
+    with pytest.raises(CatalogNotConfigured):
+        resolve_model(None, "MAESTRO_CLAUDE_MODEL", "claude_code", None)
+
+
+def test_resolve_routed_selfsufficient_without_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Routed does not need a catalog — no raise even when catalog is None.
+    assert resolve_model("routed-x", "MAESTRO_CLAUDE_MODEL", "claude_code", None) == (
+        "routed-x",
+        "routed",
+    )
+
+
+def test_warn_retired_fires_even_for_catalog_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cat = _catalog(monkeypatch)
+    with capture_logs() as logs:
+        warn_on_model_status("ancient-1", "catalog", cat)
+    assert any(e["event"] == "agent.model_retired" for e in logs)
+
+
+def test_warn_deprecated_fires(monkeypatch: pytest.MonkeyPatch) -> None:
+    cat = _catalog(monkeypatch)
+    with capture_logs() as logs:
+        warn_on_model_status("legacy-mini", "routed", cat)
+    assert any(e["event"] == "agent.model_deprecated" for e in logs)
+
+
+def test_warn_unknown_soft_for_routed_but_skipped_for_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cat = _catalog(monkeypatch)
+    with capture_logs() as logs:
+        warn_on_model_status("mystery", "routed", cat)
+    assert any(e["event"] == "agent.model_unknown" for e in logs)
+
+    with capture_logs() as logs:
+        warn_on_model_status("mystery", "catalog", cat)  # tautological → skip
+    assert not any(e["event"] == "agent.model_unknown" for e in logs)
+
+
+def test_warn_active_silent_and_no_catalog_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cat = _catalog(monkeypatch)
+    with capture_logs() as logs:
+        warn_on_model_status("claude-sonnet-4-6", "routed", cat)
+    assert not [e for e in logs if e["event"].startswith("agent.model_")]
+
+    with capture_logs() as logs:
+        warn_on_model_status("anything", "routed", None)  # no catalog → no-op
+    assert not [e for e in logs if e["event"].startswith("agent.model_")]
