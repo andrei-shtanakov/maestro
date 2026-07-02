@@ -15,8 +15,6 @@ from maestro.spawners import (
     ClaudeCodeSpawner,
     CodexSpawner,
 )
-from maestro.spawners.claude_code import DEFAULT_CLAUDE_MODEL
-from maestro.spawners.codex import DEFAULT_CODEX_MODEL
 
 
 # =============================================================================
@@ -53,48 +51,6 @@ def sample_task_no_scope(temp_dir: Path) -> Task:
 def claude_spawner() -> ClaudeCodeSpawner:
     """Provide a Claude Code spawner instance."""
     return ClaudeCodeSpawner()
-
-
-# =============================================================================
-# Unit Tests: resolve_model helper
-# =============================================================================
-
-
-class TestResolveModel:
-    """Unit tests for the shared routed>env>default resolver."""
-
-    def test_routed_wins(self) -> None:
-        from maestro.spawners.base import resolve_model
-
-        with patch.dict(os.environ, {"MAESTRO_X": "env-m"}):
-            assert resolve_model("routed-m", "MAESTRO_X", "def-m") == (
-                "routed-m",
-                "routed",
-            )
-
-    def test_env_when_no_routed(self) -> None:
-        from maestro.spawners.base import resolve_model
-
-        with patch.dict(os.environ, {"MAESTRO_X": "env-m"}):
-            assert resolve_model(None, "MAESTRO_X", "def-m") == ("env-m", "env")
-
-    def test_default_when_neither(self) -> None:
-        from maestro.spawners.base import resolve_model
-
-        with patch.dict(os.environ, {}, clear=True):
-            assert resolve_model(None, "MAESTRO_X", "def-m") == (
-                "def-m",
-                "default",
-            )
-
-    def test_empty_routed_treated_as_absent(self) -> None:
-        from maestro.spawners.base import resolve_model
-
-        with patch.dict(os.environ, {}, clear=True):
-            assert resolve_model("", "MAESTRO_X", "def-m") == (
-                "def-m",
-                "default",
-            )
 
 
 # =============================================================================
@@ -291,8 +247,11 @@ class TestClaudeCodeSpawner:
         claude_spawner: ClaudeCodeSpawner,
         sample_task: Task,
         temp_dir: Path,
+        catalog_env: Path,
     ) -> None:
         """Test that spawn creates process with correct arguments."""
+        from maestro.catalog import load_catalog
+
         mock_process = MagicMock()
         mock_popen.return_value = mock_process
         mock_os_open.return_value = 42  # Mock file descriptor
@@ -317,9 +276,12 @@ class TestClaudeCodeSpawner:
 
         # Verify command structure
         cmd = call_args[0][0]
+        cat = load_catalog()
+        assert cat is not None
+        expected = cat.default_model_for_harness("claude_code")
         assert cmd[0] == "claude"
         assert "--model" in cmd
-        assert cmd[cmd.index("--model") + 1] == DEFAULT_CLAUDE_MODEL
+        assert cmd[cmd.index("--model") + 1] == expected
         assert "--print" in cmd
         assert "--output-format" in cmd
         assert "json" in cmd
@@ -425,9 +387,12 @@ class TestClaudeCodeSpawner:
         claude_spawner: ClaudeCodeSpawner,
         sample_task: Task,
         temp_dir: Path,
+        catalog_env: Path,
     ) -> None:
         """agent.model_resolved reports the correct source for each origin."""
         from structlog.testing import capture_logs
+
+        from maestro.catalog import load_catalog
 
         mock_popen.return_value = MagicMock()
         mock_os_open.return_value = 42
@@ -451,10 +416,13 @@ class TestClaudeCodeSpawner:
         assert ev["model"] == "env-y"
 
         with capture_logs() as logs, patch.dict(os.environ, {}, clear=True):
+            os.environ["ATP_CATALOG"] = str(catalog_env)
             claude_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
         ev = next(e for e in logs if e["event"] == "agent.model_resolved")
-        assert ev["source"] == "default"
-        assert ev["model"] == DEFAULT_CLAUDE_MODEL
+        assert ev["source"] == "catalog"
+        cat = load_catalog()
+        assert cat is not None
+        assert ev["model"] == cat.default_model_for_harness("claude_code")
 
     @patch("subprocess.Popen")
     @patch("os.close")
@@ -467,6 +435,7 @@ class TestClaudeCodeSpawner:
         claude_spawner: ClaudeCodeSpawner,
         sample_task: Task,
         temp_dir: Path,
+        catalog_env: Path,
     ) -> None:
         """Test that spawn passes prompt with task information."""
         mock_popen.return_value = MagicMock()
@@ -825,8 +794,11 @@ class TestCodexSpawner:
         codex_spawner: CodexSpawner,
         sample_task: Task,
         temp_dir: Path,
+        catalog_env: Path,
     ) -> None:
         """Test that spawn creates process with correct arguments."""
+        from maestro.catalog import load_catalog
+
         mock_process = MagicMock()
         mock_popen.return_value = mock_process
         mock_os_open.return_value = 42
@@ -841,10 +813,13 @@ class TestCodexSpawner:
         call_args = mock_popen.call_args
         cmd = call_args[0][0]
 
+        cat = load_catalog()
+        assert cat is not None
+        expected = cat.default_model_for_harness("codex_cli")
         assert cmd[0] == "codex"
         assert cmd[1] == "exec"
         assert "-m" in cmd
-        assert cmd[cmd.index("-m") + 1] == DEFAULT_CODEX_MODEL
+        assert cmd[cmd.index("-m") + 1] == expected
         assert "--sandbox" in cmd
         assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
         assert "--skip-git-repo-check" in cmd
@@ -915,9 +890,12 @@ class TestCodexSpawner:
         codex_spawner: CodexSpawner,
         sample_task: Task,
         temp_dir: Path,
+        catalog_env: Path,
     ) -> None:
         """agent.model_resolved reports the correct source for each origin."""
         from structlog.testing import capture_logs
+
+        from maestro.catalog import load_catalog
 
         mock_popen.return_value = MagicMock()
         mock_os_open.return_value = 42
@@ -941,10 +919,13 @@ class TestCodexSpawner:
         assert ev["model"] == "env-y"
 
         with capture_logs() as logs, patch.dict(os.environ, {}, clear=True):
+            os.environ["ATP_CATALOG"] = str(catalog_env)
             codex_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
         ev = next(e for e in logs if e["event"] == "agent.model_resolved")
-        assert ev["source"] == "default"
-        assert ev["model"] == DEFAULT_CODEX_MODEL
+        assert ev["source"] == "catalog"
+        cat = load_catalog()
+        assert cat is not None
+        assert ev["model"] == cat.default_model_for_harness("codex_cli")
 
     @patch("subprocess.Popen")
     @patch("os.close")
@@ -957,6 +938,7 @@ class TestCodexSpawner:
         codex_spawner: CodexSpawner,
         sample_task: Task,
         temp_dir: Path,
+        catalog_env: Path,
     ) -> None:
         """Test that spawn passes prompt with task information."""
         mock_popen.return_value = MagicMock()
@@ -1267,7 +1249,7 @@ class TestSpawnIntegrationAdditional:
     """Integration tests for new spawners with real subprocess."""
 
     @pytest.mark.integration
-    def test_codex_spawn_with_mock(self, temp_dir: Path) -> None:
+    def test_codex_spawn_with_mock(self, temp_dir: Path, catalog_env: Path) -> None:
         """Test CodexSpawner with mocked Popen arguments."""
         spawner = CodexSpawner()
         task = Task(

@@ -10,15 +10,10 @@ import subprocess
 from pathlib import Path
 
 from maestro._vendor import obs
+from maestro.catalog import load_catalog, resolve_model, warn_on_model_status
 from maestro.models import Task
-from maestro.spawners.base import AgentSpawner, resolve_model, spawn_env
+from maestro.spawners.base import AgentSpawner, spawn_env
 
-
-# R-07: interim harness-default model (ADR-ECO-002 D1 will supersede this by
-# reading the model from routed_agent_type). Pinned to the model the R-07
-# sweep benchmarked so the executed model matches the routing decision.
-# Fallback via MAESTRO_CLAUDE_MODEL when routing supplies no model.
-DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 
 _obs_log = obs.get_logger("maestro.spawners.claude_code")
 
@@ -27,9 +22,9 @@ class ClaudeCodeSpawner(AgentSpawner):
     """Spawner for Claude Code in headless mode.
 
     Runs Claude Code with --print and --output-format json flags
-    for non-interactive execution. The model is pinned to
-    ``DEFAULT_CLAUDE_MODEL``; routed model wins; ``MAESTRO_CLAUDE_MODEL``
-    is the fallback when routing supplies none.
+    for non-interactive execution. The model is resolved from the
+    catalog; routed model wins, then ``MAESTRO_CLAUDE_MODEL``, then the
+    catalog default.
     """
 
     @property
@@ -71,15 +66,16 @@ class ClaudeCodeSpawner(AgentSpawner):
             log_file: Path to write process output.
             retry_context: Error context from previous failed attempt.
             model: Routed model from the arbiter. Wins over
-                ``MAESTRO_CLAUDE_MODEL`` and ``DEFAULT_CLAUDE_MODEL``
-                (precedence: routed > env > default).
+                ``MAESTRO_CLAUDE_MODEL`` and the catalog default
+                (precedence: routed > env > catalog).
 
         Returns:
             Subprocess handle for monitoring.
         """
         prompt = self.build_prompt(task, context, retry_context)
+        catalog = load_catalog()
         resolved, source = resolve_model(
-            model, "MAESTRO_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL
+            model, "MAESTRO_CLAUDE_MODEL", "claude_code", catalog
         )
         _obs_log.info(
             "agent.model_resolved",
@@ -87,6 +83,7 @@ class ClaudeCodeSpawner(AgentSpawner):
             model=resolved,
             source=source,
         )
+        warn_on_model_status(resolved, source, catalog)
 
         # Open log file and duplicate the fd for subprocess
         # This allows us to close the Python file object without affecting

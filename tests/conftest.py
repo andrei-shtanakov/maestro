@@ -210,3 +210,12 @@ def cleanup_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in list(os.environ.keys()):
         if key.startswith("MAESTRO_"):
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("ATP_CATALOG", raising=False)
+
+
+@pytest.fixture
+def catalog_env(monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point $ATP_CATALOG at the test fixture catalog; return its path."""
+    fixture = Path(__file__).parent / "fixtures" / "agents-catalog.toml"
+    monkeypatch.setenv("ATP_CATALOG", str(fixture))
+    return fixture
