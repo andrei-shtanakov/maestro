@@ -11,6 +11,13 @@ uv run maestro run examples/hello.yaml
 
 Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/), git. Mode 2 also needs [gh CLI](https://cli.github.com/).
 
+**A model source is required.** Maestro no longer bakes in a default model, so
+one of the following must be true or the run fails loud: set `$ATP_CATALOG` to
+a model catalog (or run `atp models init`), set `MAESTRO_CLAUDE_MODEL` /
+`MAESTRO_CODEX_MODEL`, or let arbiter routing supply a model. With none of
+these, `maestro run` halts with a clear `CatalogNotConfigured` error before
+spawning any agent.
+
 ## What It Does
 
 Maestro coordinates AI coding agents (Claude Code, Codex, Aider) on complex multi-part tasks. It resolves dependencies between tasks as a DAG, runs independent tasks in parallel, and handles retries, validation, and crash recovery. Two modes cover different workflows:

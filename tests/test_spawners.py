@@ -427,6 +427,38 @@ class TestClaudeCodeSpawner:
     @patch("subprocess.Popen")
     @patch("os.close")
     @patch("os.open")
+    def test_spawn_routed_model_halts_on_malformed_catalog(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        claude_spawner: ClaudeCodeSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A routed model can't dodge a malformed catalog.
+
+        load_catalog() runs before resolve_model() in spawn(), so even a
+        routed task halts when $ATP_CATALOG points at a malformed file.
+        """
+        from maestro.catalog import CatalogMalformed
+
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+        workdir = Path(sample_task.workdir)
+
+        fixture = Path(__file__).parent / "fixtures" / "agents-catalog-malformed.toml"
+        monkeypatch.setenv("ATP_CATALOG", str(fixture))
+
+        with pytest.raises(CatalogMalformed):
+            claude_spawner.spawn(
+                sample_task, "", workdir, temp_dir / "t.log", model="routed-x"
+            )
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
     def test_spawn_prompt_contains_task_info(
         self,
         mock_os_open: MagicMock,
