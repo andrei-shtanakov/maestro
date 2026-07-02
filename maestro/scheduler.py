@@ -22,6 +22,7 @@ from subprocess import Popen
 from typing import Protocol
 
 from maestro._vendor import obs
+from maestro.catalog import CatalogError, HarnessModelUnresolved
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.coordination.routing import (
     STATIC_ROUTING_REASON,
@@ -669,6 +670,12 @@ class Scheduler:
 
             try:
                 launched = await self._spawn_task(task_id)
+            except CatalogError:
+                # GLOBAL (NotConfigured / Malformed) -> halt the run
+                raise
+            except HarnessModelUnresolved as e:
+                # PER-TASK, deterministic -> NEEDS_REVIEW, no retry
+                await self._handle_unresolvable_task(task_id, e)
             except Exception as e:
                 # Log error and mark task as failed
                 await self._handle_spawn_error(task_id, e)
@@ -891,6 +898,16 @@ class Scheduler:
                 if task.routed_agent_type
                 else None
             )
+            # `routed_model is None` is the normal, expected case for a plain
+            # harness id with no "@" (static/advisory routing without a
+            # model). Only an explicit empty model after "@" (e.g.
+            # "claude_code@") is the degenerate case worth flagging.
+            if task.routed_agent_type and routed_model == "":
+                _obs_log.warning(
+                    "agent.routed_model_empty",
+                    task_id=task_id,
+                    agent_id=task.routed_agent_type,
+                )
             process = spawner.spawn(
                 task, context, workdir, log_file, retry_context, model=routed_model
             )
@@ -976,6 +993,20 @@ class Scheduler:
             error_message=str(error),
         )
         self._report_status_change(task_id, "running", "failed")
+
+    async def _handle_unresolvable_task(self, task_id: str, error: Exception) -> None:
+        """Send a task to NEEDS_REVIEW without retry.
+
+        Used for deterministic per-task faults (HarnessModelUnresolved) where a
+        retry cannot help — the operator must fix the catalog or set
+        MAESTRO_<H>_MODEL.
+        """
+        await self._db.update_task_status(
+            task_id,
+            TaskStatus.NEEDS_REVIEW,
+            error_message=str(error),
+        )
+        self._report_status_change(task_id, "running", "needs_review")
 
     async def _monitor_running_tasks(self) -> None:
         """Monitor all running tasks for completion or timeout."""
