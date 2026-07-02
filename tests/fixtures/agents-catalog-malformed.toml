@@ -1,0 +1,8 @@
+[models."broken"]
+vendor = "anthropic"
+status = "not-a-valid-status"
+
+[[agents]]
+harness  = "claude_code"
+model    = "broken"
+routable = true
