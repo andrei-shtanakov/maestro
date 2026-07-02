@@ -54,6 +54,7 @@ uv add --dev <package>
 **Shared infrastructure:**
 - **models.py**: Pydantic models (Task, TaskStatus, Workstream, WorkstreamStatus, OrchestratorConfig)
 - **config.py**: YAML parsing with defaults merging, env var substitution, `load_orchestrator_config()`
+- **catalog.py**: Model catalog loader (ADR-ECO-003b). Resolves the model from `$ATP_CATALOG` (no baked default); precedence `routed > MAESTRO_<H>_MODEL > catalog-default > fail-loud`, plus a status-graded coherence warning. Fault taxonomy by blast radius: `CatalogError` (global — halts the run) vs `HarnessModelUnresolved` (per-task — sends that task to `NEEDS_REVIEW`)
 - **database.py**: SQLite layer with async CRUD, WAL mode (tasks + workstreams tables)
 - **dag.py**: DAG building, cycle detection, topological sort, scope overlap warnings
 - **git.py**: Git operations (branch, rebase, push, worktree, merge)
