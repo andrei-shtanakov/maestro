@@ -52,6 +52,13 @@ it reads the user-config catalog. Maestro's explicit 003b action (line 150-152):
      **raise** (corrupt data cannot be silently ignored).
    - **Fail-loud fires only when the default path hits `None`** — i.e. no routed,
      no env, and no catalog. Not on the routed/env paths.
+   - **Deliberate asymmetry (review P2):** an *absent* catalog spares a routed task
+     (→ `None`, routed self-sufficient), but a *malformed* catalog halts everything
+     including routed tasks (`load_catalog` runs unconditionally in `spawn()` and
+     raises `CatalogMalformed`). This is intended: absent = "nothing to say",
+     safe to skip; malformed = a config the operator *believes* is live but is
+     corrupt — we cannot trust it even for a best-effort warn, so fail-fast for the
+     whole run rather than act on garbage.
 4. **Validation (old "item 2"):** warn-only, folded in now, with three refinements:
    - **Source-aware, but only the `unknown` branch is source-gated** (review
      P1.4). Membership is tautological for a `catalog`-sourced model, so the
@@ -80,7 +87,7 @@ it reads the user-config catalog. Maestro's explicit 003b action (line 150-152):
      ├─ CatalogNotConfigured           # no catalog at all AND a default is needed
      └─ CatalogMalformed               # $ATP_CATALOG set, file present, but corrupt/schema-invalid
 
-   HarnessModelUnresolved(RuntimeError)  # PER-TASK — separate hierarchy → FAIL this task, run continues
+   HarnessModelUnresolved(RuntimeError)  # PER-TASK — separate hierarchy → this task NEEDS_REVIEW, run continues
    ```
 
    - **Global (`CatalogError` and subclasses) → halt.** `_spawn_ready_tasks`
@@ -95,10 +102,10 @@ it reads the user-config catalog. Maestro's explicit 003b action (line 150-152):
      `tomllib`/pydantic errors in `CatalogMalformed` so corrupt data actually
      takes the halt path instead of falling through to per-task retry-churn.
    - **Per-task (`HarnessModelUnresolved`, deliberately NOT a `CatalogError`) →
-     fail one task.** It falls through to the catch-all → `_handle_spawn_error` →
-     FAILED for that task; the run continues. Kept outside `CatalogError` on
-     purpose so a later "tidy-up" can't re-parent it and silently turn a local
-     fault back into a global halt.
+     one task to `NEEDS_REVIEW`.** A dedicated handler (§3, Decision #6) sets that
+     task `NEEDS_REVIEW` (deterministic → no retry); the run continues. Kept
+     outside `CatalogError` on purpose so a later "tidy-up" can't re-parent it and
+     silently turn a local fault back into a global halt.
 6. **Per-task default faults (review P0-2 blast radius):** both "no routable model
    for this harness" and "**>1** routable for this harness" (the ADR-003a A/B
    window, e.g. `claude_code@claude-sonnet-4-6` + `@claude-sonnet-5` both routable
@@ -107,10 +114,13 @@ it reads the user-config catalog. Maestro's explicit 003b action (line 150-152):
    non-routed `codex` task while `claude_code` work proceeds; and the A/B window
    fails only non-routed tasks of the ambiguous harness (routed tasks are
    unaffected — arbiter supplies the model). The message tells the operator to
-   disambiguate via `MAESTRO_<H>_MODEL`; never silently pick one. Bounded retry
-   applies (FAILED → retry → NEEDS_REVIEW), consistent with existing per-task spawn
-   errors. The ergonomic long-term fix — an explicit `default = true` field in the
-   catalog `[[agents]]` schema — is a cross-repo, PM-owned **follow-up**.
+   disambiguate via `MAESTRO_<H>_MODEL`; never silently pick one. Because the
+   condition is **deterministic** — a retry cannot create or de-duplicate a
+   routable entry, it would only burn retry budget en route to NEEDS_REVIEW
+   (review P2) — this task goes **straight to `NEEDS_REVIEW`, skipping retries**,
+   via a dedicated handler (§3) rather than the retry-looping `_handle_spawn_error`.
+   The ergonomic long-term fix — an explicit `default = true` field in the catalog
+   `[[agents]]` schema — is a cross-repo, PM-owned **follow-up**.
 7. **Deliberate non-blocks (review P1) — recorded so they aren't "fixed" later):**
    - **`retired`/`deprecated` as a resolved model still spawns** (warn only, never
      hard-fail). The CLI/provider is the availability authority; Maestro only warns
@@ -204,7 +214,8 @@ def resolve_model(
             "модельный каталог не настроен: задай $ATP_CATALOG (или 'atp models init')"
         )
     # default_model_for_harness raises HarnessModelUnresolved (PER-TASK) on
-    # no-routable / ambiguous — falls through to _handle_spawn_error, not the halt.
+    # no-routable / ambiguous — routed to _handle_unresolvable_task (NEEDS_REVIEW),
+    # not the global halt.
     return catalog.default_model_for_harness(harness), "catalog"
 
 def warn_on_model_status(model: str, source: str, catalog: Catalog | None) -> None:
@@ -240,24 +251,37 @@ cache (spawns are infrequent; TOML parse is negligible; avoids test cache-bleed)
 `except Exception` → `_handle_spawn_error` → `update_task_status(FAILED)` +
 retry-per-policy (the workdir `SchedulerError`s at `:853/856` are swallowed the
 same way — *not* a halt-loud precedent, contrary to an earlier draft). We add
-exactly **one** dedicated handler ahead of it, catching only the **global** base
-`CatalogError`:
+two dedicated handlers ahead of it — a **global-halt** arm and a
+**per-task-no-retry** arm:
 
 ```python
 try:
     launched = await self._spawn_task(task_id)
-except CatalogError:                        # GLOBAL (NotConfigured / Malformed) → halt
+except CatalogError:                        # GLOBAL (NotConfigured / Malformed) → halt run
     raise
-except Exception as e:                      # incl. HarnessModelUnresolved → FAIL this task
+except HarnessModelUnresolved as e:         # PER-TASK, deterministic → NEEDS_REVIEW, no retry
+    await self._handle_unresolvable_task(task_id, e)
+except Exception as e:                       # everything else → FAILED + bounded retry
     await self._handle_spawn_error(task_id, e)
 ```
 
 - **`CatalogError`** propagates `_spawn_ready_tasks` → `_main_loop` → `run()`'s
   `try/finally` (`_cleanup()` still runs, no orphaned processes) → out. Terminal:
   never FAILED, never retried.
-- **`HarnessModelUnresolved`** (not a `CatalogError`) intentionally falls into the
-  catch-all → FAILED for that task; the run keeps going. One task's harness
-  misconfig never halts unrelated tasks (P0-2 blast radius).
+- **`HarnessModelUnresolved`** (not a `CatalogError`) → new
+  `_handle_unresolvable_task` sets the task to **`NEEDS_REVIEW`** directly
+  (deterministic fault; retrying is futile — review P2). The run keeps going; one
+  task's harness misconfig never halts unrelated tasks (P0-2 blast radius).
+- Everything else keeps the existing `_handle_spawn_error` → FAILED + retry.
+
+`_handle_unresolvable_task` mirrors `_handle_spawn_error` (`scheduler.py:966`) but
+targets `TaskStatus.NEEDS_REVIEW` with the error message, and emits the matching
+status-change/event. Note the task is already `RUNNING` at this point (the
+transition at `:880` precedes the `spawn()` at `:894`, and the raise is before
+`_running_tasks` tracking at `:899`, so there is no process to reap). This adds a
+`RUNNING → NEEDS_REVIEW` edge; like `_handle_spawn_error`'s `RUNNING → FAILED`, it
+force-sets status (no `expected_status` guard). Update the state-machine doc in
+`CLAUDE.md` to record the new edge.
 
 ## Data flow
 
@@ -272,14 +296,14 @@ scheduler._start_task
         routed? → (routed, "routed")
         env?    → (env, "env")
         catalog is None → raise CatalogNotConfigured          # GLOBAL, default path only → halt
-        no / >1 routable for harness → raise HarnessModelUnresolved   # PER-TASK → FAILED
+        no / >1 routable for harness → raise HarnessModelUnresolved   # PER-TASK → NEEDS_REVIEW
         else    → (catalog.default_model_for_harness(h), "catalog")
     log agent.model_resolved
     warn_on_model_status(resolved, source, catalog)   # drift-detector, best-effort
     subprocess.Popen([cli, model_flag, resolved, ...])
 
 # CatalogError (global) → dedicated re-raise in _spawn_ready_tasks → run() → halt loud.
-# HarnessModelUnresolved (per-task) → catch-all → _handle_spawn_error → FAILED, run continues.
+# HarnessModelUnresolved (per-task) → _handle_unresolvable_task → NEEDS_REVIEW (no retry), run continues.
 ```
 
 ## Testing
@@ -313,11 +337,15 @@ scheduler._start_task
     loop terminates, task **not** FAILED-retried / HOLD.
   - **Malformed → halt** (P0-1): `$ATP_CATALOG` → a corrupt file → `run()` raises
     `CatalogMalformed`, loop terminates (proves malformed takes the halt path, not
-    per-task churn).
-  - **Per-task → fail, run continues** (P0-2): two ready tasks, catalog serves
-    harness A but not harness B (no/ambiguous routable for B); B goes **FAILED**
-    (`HarnessModelUnresolved` via `_handle_spawn_error`) while A spawns normally
-    and the run does **not** halt.
+    per-task churn) — halts **even for a routed task** (the P2 asymmetry).
+  - **`_cleanup` on the halt path** (P2): with a live child process already
+    tracked in `_running_tasks`, a `CatalogError` halt must still run `_cleanup()`
+    — assert no orphaned subprocess survives (`run()`'s `try/finally` fired). Guards
+    the "no orphaned processes" promise in §3.
+  - **Per-task → NEEDS_REVIEW, run continues** (P0-2): two ready tasks, catalog
+    serves harness A but not harness B (no/ambiguous routable for B); B goes
+    **`NEEDS_REVIEW`** (`HarnessModelUnresolved` → `_handle_unresolvable_task`,
+    **no retry attempts**) while A spawns normally and the run does **not** halt.
   - **Degenerate routed id** (P1): `task.routed_agent_type` set but
     `model_of_agent_id` → `""` → a warn is emitted and resolution proceeds down the
     normal chain (not a silent fall-through).
