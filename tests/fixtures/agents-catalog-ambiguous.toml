@@ -1,0 +1,19 @@
+[models."claude-sonnet-4-6"]
+vendor = "anthropic"
+status = "active"
+
+[models."claude-sonnet-5"]
+vendor = "anthropic"
+status = "active"
+
+[[agents]]
+harness  = "claude_code"
+model    = "claude-sonnet-4-6"
+tested   = true
+routable = true
+
+[[agents]]
+harness  = "claude_code"
+model    = "claude-sonnet-5"
+tested   = true
+routable = true

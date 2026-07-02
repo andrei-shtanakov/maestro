@@ -10,15 +10,10 @@ import subprocess
 from pathlib import Path
 
 from maestro._vendor import obs
+from maestro.catalog import load_catalog, resolve_model, warn_on_model_status
 from maestro.models import Task
-from maestro.spawners.base import AgentSpawner, resolve_model, spawn_env
+from maestro.spawners.base import AgentSpawner, spawn_env
 
-
-# R-07: interim harness-default model (ADR-ECO-002 D1 will supersede this by
-# reading the model from routed_agent_type). Pinned to the model the R-07
-# sweep benchmarked so the executed model matches the routing decision.
-# Fallback via MAESTRO_CODEX_MODEL when routing supplies no model.
-DEFAULT_CODEX_MODEL = "gpt-5.5"
 
 _obs_log = obs.get_logger("maestro.spawners.codex")
 
@@ -28,9 +23,8 @@ class CodexSpawner(AgentSpawner):
 
     Runs Codex non-interactively via ``codex exec`` with the
     ``workspace-write`` sandbox so it can edit files in the workdir without
-    user interaction. The model is pinned to ``DEFAULT_CODEX_MODEL``;
-    routed model wins; ``MAESTRO_CODEX_MODEL`` is the fallback when
-    routing supplies none.
+    user interaction. The model is resolved from the catalog; routed model
+    wins, then ``MAESTRO_CODEX_MODEL``, then the catalog default.
     """
 
     @property
@@ -68,15 +62,16 @@ class CodexSpawner(AgentSpawner):
             log_file: Path to write process output.
             retry_context: Error context from previous failed attempt.
             model: Routed model from the arbiter. Wins over
-                ``MAESTRO_CODEX_MODEL`` and ``DEFAULT_CODEX_MODEL``
-                (precedence: routed > env > default).
+                ``MAESTRO_CODEX_MODEL`` and the catalog default
+                (precedence: routed > env > catalog).
 
         Returns:
             Subprocess handle for monitoring.
         """
         prompt = self.build_prompt(task, context, retry_context)
+        catalog = load_catalog()
         resolved, source = resolve_model(
-            model, "MAESTRO_CODEX_MODEL", DEFAULT_CODEX_MODEL
+            model, "MAESTRO_CODEX_MODEL", "codex_cli", catalog
         )
         _obs_log.info(
             "agent.model_resolved",
@@ -84,6 +79,7 @@ class CodexSpawner(AgentSpawner):
             model=resolved,
             source=source,
         )
+        warn_on_model_status(resolved, source, catalog)
 
         fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         try:

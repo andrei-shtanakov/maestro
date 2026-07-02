@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import anyio
 import pytest
 
 from maestro.dag import DAG
@@ -139,6 +140,33 @@ class FailingSpawner(BaseSpawner):
     ) -> subprocess.Popen[bytes]:
         msg = "Spawn failed intentionally"
         raise RuntimeError(msg)
+
+
+class RaisingSpawner(BaseSpawner):
+    """Spawner whose spawn() raises a supplied exception."""
+
+    def __init__(self, exc: Exception, agent_type_name: str = "claude_code") -> None:
+        self._exc = exc
+        self._agent_type = agent_type_name
+
+    @property
+    def agent_type(self) -> str:
+        return self._agent_type
+
+    def is_available(self) -> bool:
+        return True
+
+    def spawn(
+        self,
+        task: Task,
+        context: str,
+        workdir: Path,
+        log_file: Path,
+        retry_context: str = "",
+        *,
+        model: str | None = None,
+    ) -> subprocess.Popen[bytes]:
+        raise self._exc
 
 
 @pytest.fixture
@@ -1762,5 +1790,268 @@ class TestSchedulerD2Gate:
         try:
             assert spawner.spawn_count == 0
             assert "refusing to spawn" in caplog.text
+        finally:
+            await db.close()
+
+
+class TestCatalogFaultHandling:
+    """Task 5: three-way spawn-error handling + degenerate-id warn.
+
+    - CatalogError (global: NotConfigured/Malformed) halts the whole run.
+    - HarnessModelUnresolved (per-task, deterministic) sends only that task
+      to NEEDS_REVIEW and the run continues.
+    - A degenerate routed id (e.g. "claude_code@" with an empty model) logs
+      a warning but still spawns with the harness default model.
+    """
+
+    @pytest.mark.anyio
+    async def test_global_catalog_error_halts_run(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        from maestro.catalog import CatalogNotConfigured
+
+        config = TaskConfig(id="task-a", title="A", prompt="do it")
+
+        db = await create_database(temp_db_path)
+        try:
+            await db.create_task(Task.from_config(config, str(temp_dir)))
+
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([config]),
+                spawners={
+                    "claude_code": RaisingSpawner(CatalogNotConfigured("no catalog"))
+                },
+                config=SchedulerConfig(poll_interval=0.05, log_dir=temp_dir / "logs"),
+            )
+
+            with anyio.fail_after(5):
+                with pytest.raises(CatalogNotConfigured):
+                    await scheduler.run()
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_malformed_catalog_halts_run(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        from maestro.catalog import CatalogMalformed
+
+        config = TaskConfig(id="task-a", title="A", prompt="do it")
+
+        db = await create_database(temp_db_path)
+        try:
+            await db.create_task(Task.from_config(config, str(temp_dir)))
+
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([config]),
+                spawners={"claude_code": RaisingSpawner(CatalogMalformed("bad"))},
+                config=SchedulerConfig(poll_interval=0.05, log_dir=temp_dir / "logs"),
+            )
+
+            with anyio.fail_after(5):
+                with pytest.raises(CatalogMalformed):
+                    await scheduler.run()
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_halt_still_runs_cleanup_no_orphans(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        """A halting CatalogError must not leave orphaned running processes.
+
+        task-a (higher priority) is spawned first and tracked as running via
+        a never-completing MockSpawner; task-b then raises CatalogNotConfigured
+        on the same `_spawn_ready_tasks` pass. `run()` must still terminate
+        task-a's process during `_cleanup` before re-raising.
+        """
+        from maestro.catalog import CatalogNotConfigured
+
+        configs = [
+            TaskConfig(
+                id="task-a",
+                title="A",
+                prompt="do it",
+                agent_type=AgentType.CODEX,
+                priority=10,
+            ),
+            TaskConfig(
+                id="task-b",
+                title="B",
+                prompt="do it",
+                agent_type=AgentType.CLAUDE_CODE,
+                priority=0,
+            ),
+        ]
+
+        db = await create_database(temp_db_path)
+        try:
+            for config in configs:
+                await db.create_task(Task.from_config(config, str(temp_dir)))
+
+            delayed_spawner = MockSpawner("codex_cli", delay_seconds=5.0)
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG(configs),
+                spawners={
+                    "codex_cli": delayed_spawner,
+                    "claude_code": RaisingSpawner(CatalogNotConfigured("x")),
+                },
+                config=SchedulerConfig(
+                    max_concurrent=2,
+                    poll_interval=0.05,
+                    log_dir=temp_dir / "logs",
+                    shutdown_grace_seconds=0.05,
+                ),
+            )
+
+            with anyio.fail_after(5):
+                with pytest.raises(CatalogNotConfigured):
+                    await scheduler.run()
+
+            assert scheduler._running_tasks == {}
+            assert delayed_spawner.spawn_count == 1
+            tracked_process = delayed_spawner._mock_processes[0]
+            assert tracked_process.terminate.called
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_unresolvable_harness_marks_needs_review_and_continues(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        from maestro.catalog import HarnessModelUnresolved
+
+        configs = [
+            TaskConfig(id="task-a", title="A", prompt="ok", agent_type=AgentType.CODEX),
+            TaskConfig(
+                id="task-b",
+                title="B",
+                prompt="unresolvable",
+                agent_type=AgentType.CLAUDE_CODE,
+            ),
+        ]
+
+        db = await create_database(temp_db_path)
+        try:
+            for config in configs:
+                await db.create_task(Task.from_config(config, str(temp_dir)))
+
+            healthy_spawner = MockSpawner("codex_cli")
+            raising_spawner = RaisingSpawner(
+                HarnessModelUnresolved("no routable model")
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG(configs),
+                spawners={
+                    "codex_cli": healthy_spawner,
+                    "claude_code": raising_spawner,
+                },
+                config=SchedulerConfig(
+                    max_concurrent=2,
+                    poll_interval=0.05,
+                    log_dir=temp_dir / "logs",
+                ),
+            )
+
+            async def run_with_timeout() -> None:
+                try:
+                    await asyncio.wait_for(scheduler.run(), timeout=2.0)
+                except TimeoutError:
+                    await scheduler.shutdown()
+
+            with anyio.fail_after(5):
+                await run_with_timeout()
+
+            task_b = await db.get_task("task-b")
+            assert task_b.status == TaskStatus.NEEDS_REVIEW
+            assert "no routable model" in (task_b.error_message or "")
+
+            task_a = await db.get_task("task-a")
+            assert task_a.status in (TaskStatus.DONE, TaskStatus.VALIDATING)
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_degenerate_routed_id_warns(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from structlog.testing import capture_logs
+
+        from maestro.models import ArbiterMode, RouteAction, RouteDecision
+
+        db = await create_database(temp_db_path)
+        try:
+            config = TaskConfig(id="task-a", title="A", prompt="do it")
+            await db.create_task(Task.from_config(config, str(temp_dir)))
+
+            spawner = MockSpawner("claude_code")
+            routing = AsyncMock()
+            routing.route.return_value = RouteDecision(
+                action=RouteAction.ASSIGN,
+                chosen_agent="claude_code@",  # trailing '@' -> empty model
+                decision_id="d1",
+                reason="test",
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([config]),
+                spawners={"claude_code": spawner},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                routing=routing,
+                arbiter_mode=ArbiterMode.AUTHORITATIVE,
+            )
+
+            with capture_logs() as logs, anyio.fail_after(5):
+                await scheduler._spawn_ready_tasks(["task-a"])
+
+            assert any(e["event"] == "agent.routed_model_empty" for e in logs)
+            assert spawner.spawn_count == 1
+            assert spawner.spawned_models == [""]
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_bare_routed_id_does_not_warn(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from structlog.testing import capture_logs
+
+        from maestro.models import ArbiterMode, RouteAction, RouteDecision
+
+        db = await create_database(temp_db_path)
+        try:
+            config = TaskConfig(id="task-a", title="A", prompt="do it")
+            await db.create_task(Task.from_config(config, str(temp_dir)))
+
+            spawner = MockSpawner("claude_code")
+            routing = AsyncMock()
+            routing.route.return_value = RouteDecision(
+                action=RouteAction.ASSIGN,
+                chosen_agent="claude_code",  # bare id -> model_of_agent_id is None
+                decision_id="d1",
+                reason="test",
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([config]),
+                spawners={"claude_code": spawner},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                routing=routing,
+                arbiter_mode=ArbiterMode.AUTHORITATIVE,
+            )
+
+            with capture_logs() as logs, anyio.fail_after(5):
+                await scheduler._spawn_ready_tasks(["task-a"])
+
+            assert not any(e["event"] == "agent.routed_model_empty" for e in logs)
+            assert spawner.spawn_count == 1
         finally:
             await db.close()

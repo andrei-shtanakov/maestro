@@ -11,12 +11,26 @@
   unregistered harness fails **terminally** (`SchedulerError`, task FAILED) —
   a HOLD there would leave the task READY forever and hang the run.
 - **Model execution (D1):** the arbiter-routed model (`<harness>@<model>`) is now
-  passed into `spawn()` and executed. Precedence is **routed > env > default**.
-  **Behaviour change:** `MAESTRO_CLAUDE_MODEL` / `MAESTRO_CODEX_MODEL` are now a
-  *fallback* used only when routing supplies no model — they no longer override a
-  routed decision. Each spawn emits an `agent.model_resolved {harness, model,
-  source}` log for observability. Catalog-membership validation of the routed
-  model is deferred to ADR-ECO-003 AI#4.
+  passed into `spawn()` and executed. Each spawn emits an `agent.model_resolved
+  {harness, model, source}` log for observability.
+- **Catalog-driven model defaults (AI#4, ADR-ECO-003b):** the baked
+  `DEFAULT_<H>_MODEL` constants have been removed. The model is now resolved
+  from a user-config catalog loaded from `$ATP_CATALOG` (see `maestro/catalog.py`).
+  New precedence is **`routed` (arbiter) > `MAESTRO_<H>_MODEL` env > catalog
+  default > fail-loud** — env is now a fallback used only when routing
+  supplies no model, and the catalog default is used only when neither routing
+  nor env supply one. A status-graded coherence warning (`retired` /
+  `deprecated` / `unknown`) is logged when the routed or env-supplied model
+  doesn't cleanly match an `active` catalog entry.
+  Fault taxonomy is split by blast radius: a malformed or unconfigured
+  catalog raises a global `CatalogError` (`CatalogNotConfigured` /
+  `CatalogMalformed`) that halts the whole run, while a harness with no (or
+  an ambiguous) routable default raises a per-task `HarnessModelUnresolved`
+  that sends only that task to `NEEDS_REVIEW`.
+  **Breaking change:** a run with no routed model, no `MAESTRO_<H>_MODEL`,
+  and no `$ATP_CATALOG` now fails loud (`CatalogNotConfigured`: "model
+  catalog not configured: set $ATP_CATALOG (or run 'atp models init')")
+  instead of silently falling back to a built-in default model.
 
 ---
 

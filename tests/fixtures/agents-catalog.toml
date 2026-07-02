@@ -1,0 +1,29 @@
+# Test fixture mirroring the SSOT schema (Plane 1 models + Plane 3 agents).
+[models."claude-sonnet-4-6"]
+vendor  = "anthropic"
+status  = "active"
+aliases = ["claude-sonnet-latest"]
+
+[models."gpt-5.5"]
+vendor = "openai"
+status = "active"
+
+[models."legacy-mini"]
+vendor = "openai"
+status = "deprecated"
+
+[models."ancient-1"]
+vendor = "anthropic"
+status = "retired"
+
+[[agents]]
+harness  = "claude_code"
+model    = "claude-sonnet-4-6"
+tested   = true
+routable = true
+
+[[agents]]
+harness  = "codex_cli"
+model    = "gpt-5.5"
+tested   = true
+routable = true
