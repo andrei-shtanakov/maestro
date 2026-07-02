@@ -2015,3 +2015,43 @@ class TestCatalogFaultHandling:
             assert spawner.spawned_models == [""]
         finally:
             await db.close()
+
+    @pytest.mark.anyio
+    async def test_bare_routed_id_does_not_warn(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from structlog.testing import capture_logs
+
+        from maestro.models import ArbiterMode, RouteAction, RouteDecision
+
+        db = await create_database(temp_db_path)
+        try:
+            config = TaskConfig(id="task-a", title="A", prompt="do it")
+            await db.create_task(Task.from_config(config, str(temp_dir)))
+
+            spawner = MockSpawner("claude_code")
+            routing = AsyncMock()
+            routing.route.return_value = RouteDecision(
+                action=RouteAction.ASSIGN,
+                chosen_agent="claude_code",  # bare id -> model_of_agent_id is None
+                decision_id="d1",
+                reason="test",
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([config]),
+                spawners={"claude_code": spawner},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                routing=routing,
+                arbiter_mode=ArbiterMode.AUTHORITATIVE,
+            )
+
+            with capture_logs() as logs, anyio.fail_after(5):
+                await scheduler._spawn_ready_tasks(["task-a"])
+
+            assert not any(e["event"] == "agent.routed_model_empty" for e in logs)
+            assert spawner.spawn_count == 1
+        finally:
+            await db.close()
