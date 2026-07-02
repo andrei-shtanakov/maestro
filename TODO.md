@@ -150,3 +150,17 @@ grep -rn "arbiter\|route_task\|ArbiterClient" maestro/
 # R-09
 ls .github/workflows/
 ```
+
+---
+
+## Catalog distribution follow-ups (ADR-ECO-003b)
+
+- [ ] XDG default catalog path ($XDG_CONFIG_HOME/<eco>/agents-catalog.toml) once the
+      <eco> namespace is ratified; extend `resolve_catalog_path`.
+- [ ] `maestro models init | list | discover | update` CLI (ADR-003b D3).
+- [ ] Shared `CLAUDE_MODEL` / `CODEX_MODEL` cross-tool override layer.
+- [ ] `default = true` field in the catalog `[[agents]]` schema to disambiguate the
+      A/B window (cross-repo, PM-owned) — removes the `HarnessModelUnresolved`
+      ambiguity raise.
+- [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral
+      conformance test (precedence + alias resolution across Maestro / ATP / arbiter).
