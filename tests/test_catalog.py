@@ -92,7 +92,7 @@ def test_fixture_matches_sibling_ssot() -> None:
     """When the sibling dev/ops SSOT exists, the fixture's routable defaults must
     still match it. Skipped in isolation (CI without the sibling repo). Seed of
     the ADR-003b cross-reader conformance test (shape only, not behavior)."""
-    ssot = Path(__file__).parents[3] / "atp-platform" / "method" / "agents-catalog.toml"
+    ssot = Path(__file__).parents[2] / "atp-platform" / "method" / "agents-catalog.toml"
     if not ssot.is_file():
         pytest.skip("sibling atp-platform SSOT not present")
     import tomllib

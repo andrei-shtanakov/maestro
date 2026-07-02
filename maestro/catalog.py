@@ -29,7 +29,7 @@ from maestro._vendor import obs
 _obs_log = obs.get_logger("maestro.catalog")
 
 _NOT_CONFIGURED_MSG = (
-    "модельный каталог не настроен: задай $ATP_CATALOG (или 'atp models init')"
+    "model catalog not configured: set $ATP_CATALOG (or run 'atp models init')"
 )
 
 
@@ -83,12 +83,12 @@ class Catalog(BaseModel):
             return routable[0]
         if not routable:
             raise HarnessModelUnresolved(
-                f"каталог не содержит routable-модели для harness '{harness}'; "
-                f"задай MAESTRO_{harness.upper()}_MODEL"
+                f"catalog has no routable model for harness '{harness}'; "
+                f"set MAESTRO_{harness.upper()}_MODEL"
             )
         raise HarnessModelUnresolved(
-            f"неоднозначный default для harness '{harness}': routable-моделей "
-            f"{len(routable)} ({', '.join(routable)}); задай "
+            f"ambiguous default for harness '{harness}': {len(routable)} "
+            f"routable models ({', '.join(routable)}); set "
             f"MAESTRO_{harness.upper()}_MODEL"
         )
 
@@ -134,4 +134,4 @@ def load_catalog() -> Catalog | None:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
         return Catalog.model_validate(data)
     except (tomllib.TOMLDecodeError, ValidationError, OSError) as exc:
-        raise CatalogMalformed(f"каталог повреждён ({path}): {exc}") from exc
+        raise CatalogMalformed(f"catalog is corrupt ({path}): {exc}") from exc
