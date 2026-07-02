@@ -81,6 +81,10 @@ class TestTaskStatus:
         assert not TaskStatus.RUNNING.can_transition_to(TaskStatus.DONE)
         assert not TaskStatus.RUNNING.can_transition_to(TaskStatus.READY)
 
+    def test_running_can_transition_to_needs_review(self) -> None:
+        """Test RUNNING → NEEDS_REVIEW transition (unresolvable harness default)."""
+        assert TaskStatus.RUNNING.can_transition_to(TaskStatus.NEEDS_REVIEW)
+
     def test_valid_transitions_from_validating(self) -> None:
         """Test valid transitions from VALIDATING."""
         assert TaskStatus.VALIDATING.can_transition_to(TaskStatus.DONE)

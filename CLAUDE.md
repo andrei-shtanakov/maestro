@@ -86,12 +86,14 @@ uv add --dev <package>
 
 ```
 PENDING -> READY -> RUNNING -> VALIDATING -> DONE
-             |        |            |
-             |        |            └-> FAILED -> READY (retry)
-             |        |                  |
-             |        └-> FAILED --------┴-> NEEDS_REVIEW -> READY
-             |                                    |
-             |                                    └-> ABANDONED
+             |        |  |         |
+             |        |  |         └-> FAILED -> READY (retry)
+             |        |  |              |
+             |        |  └──FAILED──────┴-> NEEDS_REVIEW -> READY
+             |        |                      |
+             |        └──NEEDS_REVIEW────────┘   (catalog default unresolved for harness)
+             |                            |
+             |                            └-> ABANDONED
              |
              └-> AWAITING_APPROVAL -> READY   (requires_approval; `maestro approve
                        |             <task-id>` sets READY, then scheduler runs it)

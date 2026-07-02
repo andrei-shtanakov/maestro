@@ -48,7 +48,7 @@ class TaskStatus(StrEnum):
             cls.PENDING: {cls.READY},
             cls.READY: {cls.RUNNING, cls.AWAITING_APPROVAL},
             cls.AWAITING_APPROVAL: {cls.READY, cls.ABANDONED},
-            cls.RUNNING: {cls.VALIDATING, cls.FAILED},
+            cls.RUNNING: {cls.VALIDATING, cls.FAILED, cls.NEEDS_REVIEW},
             cls.VALIDATING: {cls.DONE, cls.FAILED},
             cls.FAILED: {cls.READY, cls.NEEDS_REVIEW},
             cls.NEEDS_REVIEW: {cls.READY, cls.ABANDONED},
