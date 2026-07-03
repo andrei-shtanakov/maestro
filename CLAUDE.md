@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## `../_cowork_output/` is dev-only — never a code/runtime resource
+
+`../_cowork_output/` (the polyrepo **sibling** workspace — not to be confused with this repo's own local `./_cowork_output/` scratch directory) is the development-time coordination area (cross-team ADRs, status notes, contract drafts, PM/dev tooling). Users and teams installing or cloning this project do NOT have it. Rules:
+
+- Shipped/runtime code must never read, import, or resolve paths under `../_cowork_output/`.
+- Canonical shippable facts live inside the owning repo: the ecosystem agents-catalog SSOT is `atp-platform/method/agents-catalog.toml` (ADR-ECO-003, canon confirmed 2026-07-03); Maestro's spawner model defaults are (to be) generated from that catalog (ADR-ECO-003 action #4), never resolved from `../_cowork_output/` at runtime.
+- Vendoring a pinned copy INTO a repo is the correct pattern; referencing OUT to `../_cowork_output/` from shipped code is the antipattern.
+- Only workspace-local dev tooling (e.g. the conformance check in `../_cowork_output/devtools/`) and documentation may reference it.
+
 ## Project Overview
 
 Maestro is an AI Agent Orchestrator with two operation modes:
