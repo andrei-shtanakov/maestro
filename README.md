@@ -81,6 +81,19 @@ uv run maestro workstreams                   # Check workstreams status
 uv run maestro workspaces                # List active worktrees
 ```
 
+### Config authoring: `init` and `validate`
+
+- `uv run maestro init` — scaffold a commented `project.yaml` from the current
+  directory (git-derived autofill for `project`/`repo`).
+- `uv run maestro validate project.yaml` — preflight checks before you run:
+  dependency cycles, scope overlap between workstreams, and repo sanity.
+- `uv run maestro validate project.yaml --strict --no-fs` — CI mode: `--strict`
+  treats warnings as errors (exit 1), `--no-fs` skips filesystem access for a
+  deterministic check with no real repo required.
+
+`maestro orchestrate` also runs this preflight automatically as a fail-fast
+gate before spawning any workstream.
+
 ## Examples
 
 | File | Description |

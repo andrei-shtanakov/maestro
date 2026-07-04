@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Added
+- **`maestro validate <project.yaml>` (preflight, Mode 2):** static and
+  filesystem checks over an orchestrator config before a run — dependency
+  cycles (`dag-cycle`, error) via the shared `dag.find_cycle`, scope overlap
+  between workstreams (`scope-overlap`, warning; two-tier: a static heuristic
+  plus an exact file-set intersection when `--no-fs` is not set), empty scope
+  (`scope-empty`, warning), missing/non-git repo (`repo-missing` /
+  `repo-not-git`, errors), and scope globs matching nothing on disk
+  (`scope-no-match`, warning). `--strict` treats warnings as errors (exit 1);
+  `--no-fs` skips filesystem checks for deterministic, repo-less runs. The
+  same checks now run as a fail-fast gate inside `maestro orchestrate`
+  (`maestro/preflight.py`).
+- **`maestro init [PATH] [--force] [--project NAME]`:** scaffolds a commented
+  `project.yaml` template with git-derived autofill (project name, repo path)
+  and self-checks the generated config against `OrchestratorConfig` before
+  writing (`maestro/scaffold.py`).
+
 ### Changed
 - **Routing (D2):** the arbiter can now route to any harness that has a
   registered spawner; the closed `AgentType` enum no longer gates spawns
