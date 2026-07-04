@@ -1439,3 +1439,33 @@ workstreams:
         assert "dag-cycle" in result.output
         # Aborted before any orchestrator work: no database was created
         assert not db_path.exists()
+
+
+class TestInitCommand:
+    """Tests for maestro init."""
+
+    def test_init_writes_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["init"])
+        assert result.exit_code == 0
+        assert (tmp_path / "project.yaml").exists()
+
+    def test_init_refuses_overwrite(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "project.yaml").write_text("existing")
+        result = runner.invoke(app, ["init"])
+        assert result.exit_code == 1
+        assert (tmp_path / "project.yaml").read_text() == "existing"
+
+    def test_init_force_overwrites(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "project.yaml").write_text("existing")
+        result = runner.invoke(app, ["init", "--force"])
+        assert result.exit_code == 0
+        assert (tmp_path / "project.yaml").read_text() != "existing"

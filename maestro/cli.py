@@ -51,6 +51,7 @@ from maestro.preflight import (
     ValidationReport,
     validate_project,
 )
+from maestro.scaffold import ScaffoldError, generate_project_yaml
 from maestro.spawners import AiderSpawner, AnnounceSpawner, CodexSpawner
 from maestro.spawners.base import AgentSpawner  # noqa: TC001 — runtime use
 from maestro.workspace import WorkspaceManager
@@ -883,6 +884,47 @@ def validate_command(
     _print_validation_report(report)
     if not report.ok or (strict and report.warnings):
         raise typer.Exit(1)
+
+
+@app.command("init")
+def init_command(
+    path: Annotated[
+        Path,
+        typer.Argument(help="Output path for the generated config"),
+    ] = Path("project.yaml"),
+    force: Annotated[
+        bool,
+        typer.Option("--force", "-f", help="Overwrite an existing file"),
+    ] = False,
+    project: Annotated[
+        str | None,
+        typer.Option(
+            "--project", help="Project name (default: current directory name)"
+        ),
+    ] = None,
+) -> None:
+    """Generate a Mode-2 project.yaml scaffold for the current directory.
+
+    Values are autofilled from the git environment (remote URL, base
+    branch); everything else gets commented, schema-valid defaults.
+    """
+    if path.exists() and not force:
+        err_console.print(
+            f"[red]{path} already exists.[/red] Use --force to overwrite."
+        )
+        raise typer.Exit(1)
+
+    try:
+        content = generate_project_yaml(Path.cwd(), project=project)
+    except ScaffoldError as e:
+        err_console.print(f"[red]Scaffold error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+    path.write_text(content, encoding="utf-8")
+    console.print(
+        f"[green]Wrote {path}.[/green] Next: edit the workstreams, "
+        f"then run 'maestro validate {path}'."
+    )
 
 
 # =================================================================
