@@ -62,7 +62,12 @@ def find_cycle(deps: dict[str, set[str]]) -> list[str] | None:
 
 
 def _cycle_path(deps: dict[str, set[str]], known: set[str]) -> list[str]:
-    """Recover one cycle path via DFS (called only when a cycle exists)."""
+    """Recover one cycle path via DFS (called only when a cycle exists).
+
+    Raises:
+        RuntimeError: If no cycle path is found — the caller guarantees a
+            cycle exists, so reaching this means a broken invariant.
+    """
     visited: set[str] = set()
     rec_stack: set[str] = set()
 
@@ -87,7 +92,8 @@ def _cycle_path(deps: dict[str, set[str]], known: set[str]) -> list[str]:
             result = dfs(node, [])
             if result:
                 return result
-    return []
+    msg = "cycle detected by Kahn's algorithm but DFS found no cycle path"
+    raise RuntimeError(msg)
 
 
 @dataclass

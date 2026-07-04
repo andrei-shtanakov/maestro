@@ -10,7 +10,14 @@ Tests cover:
 
 import pytest
 
-from maestro.dag import DAG, CycleError, DAGNode, ScopeWarning, find_cycle
+from maestro.dag import (
+    DAG,
+    CycleError,
+    DAGNode,
+    ScopeWarning,
+    _cycle_path,
+    find_cycle,
+)
 from maestro.models import TaskConfig
 
 
@@ -824,3 +831,9 @@ class TestFindCycle:
     def test_unknown_deps_ignored(self) -> None:
         # "ghost" is not a key -> edge ignored, same as DAG._build_graph
         assert find_cycle({"a": {"ghost"}, "b": {"a"}}) is None
+
+    def test_cycle_path_raises_on_broken_invariant(self) -> None:
+        # _cycle_path is only called after Kahn proved a cycle exists;
+        # if DFS still finds none, it must fail loudly, not return [].
+        with pytest.raises(RuntimeError, match="no cycle path"):
+            _cycle_path({"a": set()}, {"a"})

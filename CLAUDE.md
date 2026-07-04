@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Maestro is an AI Agent Orchestrator with two operation modes:
 
-1. **Task Scheduler** (`maestro run`) — coordinates multiple AI coding agents (Claude Code, Codex, opencode, Aider) on tasks defined in a single YAML config. All tasks share one directory.
+1. **Task Scheduler** (`maestro run`) — coordinates multiple AI coding agents (Claude Code, Codex, Aider) on tasks defined in a single YAML config. All tasks share one directory.
 
 2. **Multi-Process Orchestrator** (`maestro orchestrate`) — decomposes a project into independent work units ("workstreams"), runs each in an isolated git worktree via spec-runner, and creates PRs on completion.
 
@@ -91,7 +91,7 @@ uv add --dev <package>
 - **pr_manager.py**: GitHub PR creation via `gh` CLI
 
 **Subpackages:**
-- **spawners/**: AgentSpawner ABC + implementations (claude_code, codex_cli, opencode, aider, announce) + registry; opencode is the first open-model agentic harness (`opencode run -m opencode/<model>`, ADR-ECO-003c)
+- **spawners/**: AgentSpawner ABC + implementations (claude_code, codex_cli, aider, announce) + registry. An opencode spawner module (`opencode run -m opencode/<model>`, first open-model agentic harness, ADR-ECO-003c) exists but is not yet registered as a selectable agent type (no entry point / default-set wiring)
 - **coordination/**: MCP server (FastMCP) + REST API (FastAPI) with /workstreams endpoints; Arbiter routing (`routing.py` strategies, vendored `arbiter_client.py` MCP client, `arbiter_errors.py`)
 - **benchmark/**: R-06b/R-07 benchmark-aware routing — async runner, ATP client, spawner→responder adapter, and Arbiter feedback wiring (`arbiter_report.py`)
 - **notifications/**: Desktop notifications (macOS/Linux)
