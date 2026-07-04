@@ -42,6 +42,8 @@ def _write_orchestrator_config(base_dir: Path) -> Path:
     """Create a minimal orchestrator config file for testing."""
     repo_dir = base_dir / "repo"
     repo_dir.mkdir(parents=True, exist_ok=True)
+    # Create a proper git repository (required by preflight validation)
+    (repo_dir / ".git").mkdir(parents=True, exist_ok=True)
     workspace_dir = base_dir / "workspaces"
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1277,3 +1279,210 @@ class TestApproveCommand:
 
         status = asyncio.run(verify())
         assert status == TaskStatus.READY
+
+
+# =============================================================================
+# Test: Validate Command
+# =============================================================================
+
+
+class TestValidateCommand:
+    """Tests for maestro validate."""
+
+    @staticmethod
+    def _write_project_yaml(
+        tmp_path: Path, repo_path: Path, workstreams_yaml: str
+    ) -> Path:
+        config_file = tmp_path / "project.yaml"
+        config_file.write_text(
+            f"""
+project: test
+repo_url: https://github.com/user/test
+repo_path: {repo_path}
+workspace_base: /tmp/maestro-ws/test
+workstreams:
+{workstreams_yaml}
+"""
+        )
+        return config_file
+
+    @staticmethod
+    def _make_repo(tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src" / "a").mkdir(parents=True)
+        (repo / "src" / "a" / "main.py").write_text("x")
+        return repo
+
+    def test_valid_config_exit_zero(self, tmp_path: Path) -> None:
+        repo = self._make_repo(tmp_path)
+        config_file = self._write_project_yaml(
+            tmp_path,
+            repo,
+            """  - id: a
+    title: A
+    description: d
+    scope: ["src/a/**"]
+""",
+        )
+        result = runner.invoke(app, ["validate", str(config_file)])
+        assert result.exit_code == 0
+        assert "0 errors, 0 warnings" in result.output
+
+    def test_cycle_exit_one(self, tmp_path: Path) -> None:
+        repo = self._make_repo(tmp_path)
+        config_file = self._write_project_yaml(
+            tmp_path,
+            repo,
+            """  - id: a
+    title: A
+    description: d
+    scope: ["src/a/**"]
+    depends_on: [b]
+  - id: b
+    title: B
+    description: d
+    scope: ["src/b/**"]
+    depends_on: [a]
+""",
+        )
+        result = runner.invoke(app, ["validate", str(config_file)])
+        assert result.exit_code == 1
+        assert "dag-cycle" in result.output
+
+    def test_warnings_exit_zero_without_strict(self, tmp_path: Path) -> None:
+        repo = self._make_repo(tmp_path)
+        config_file = self._write_project_yaml(
+            tmp_path,
+            repo,
+            """  - id: a
+    title: A
+    description: d
+    scope: []
+""",
+        )
+        result = runner.invoke(app, ["validate", str(config_file)])
+        assert result.exit_code == 0
+        assert "scope-empty" in result.output
+
+    def test_warnings_exit_one_with_strict(self, tmp_path: Path) -> None:
+        repo = self._make_repo(tmp_path)
+        config_file = self._write_project_yaml(
+            tmp_path,
+            repo,
+            """  - id: a
+    title: A
+    description: d
+    scope: []
+""",
+        )
+        result = runner.invoke(app, ["validate", str(config_file), "--strict"])
+        assert result.exit_code == 1
+
+    def test_no_fs_skips_repo_checks(self, tmp_path: Path) -> None:
+        config_file = self._write_project_yaml(
+            tmp_path,
+            tmp_path / "missing-repo",
+            """  - id: a
+    title: A
+    description: d
+    scope: ["src/a/**"]
+""",
+        )
+        result = runner.invoke(app, ["validate", str(config_file), "--no-fs"])
+        assert result.exit_code == 0
+
+    def test_schema_error_exit_one(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "project.yaml"
+        config_file.write_text("project: test\n")  # missing required fields
+        result = runner.invoke(app, ["validate", str(config_file)])
+        assert result.exit_code == 1
+
+    def test_char_class_pattern_not_swallowed_by_markup(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        (repo / "src" / "main.py").write_text("x")
+        config_file = self._write_project_yaml(
+            tmp_path,
+            repo,
+            """  - id: a
+    title: A
+    description: d
+    scope: ["src/[abc]/**"]
+""",
+        )
+        result = runner.invoke(app, ["validate", str(config_file)])
+        assert "src/[abc]/**" in result.output
+
+
+# =============================================================================
+# Test: Orchestrate Preflight
+# =============================================================================
+
+
+class TestOrchestratePreflight:
+    """Preflight validation gates maestro orchestrate."""
+
+    def test_orchestrate_aborts_on_cycle(self, tmp_path: Path) -> None:
+        """Test that orchestrate aborts on DAG cycle before creating DB."""
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        config_file = tmp_path / "project.yaml"
+        config_file.write_text(
+            f"""
+project: test
+repo_url: https://github.com/user/test
+repo_path: {repo}
+workspace_base: {tmp_path / "ws"}
+workstreams:
+  - id: a
+    title: A
+    description: d
+    scope: ["src/a/**"]
+    depends_on: [b]
+  - id: b
+    title: B
+    description: d
+    scope: ["src/b/**"]
+    depends_on: [a]
+"""
+        )
+        db_path = tmp_path / "maestro.db"
+        result = runner.invoke(
+            app, ["orchestrate", str(config_file), "--db", str(db_path)]
+        )
+        assert result.exit_code == 1
+        assert "dag-cycle" in result.output
+        # Aborted before any orchestrator work: no database was created
+        assert not db_path.exists()
+
+
+class TestInitCommand:
+    """Tests for maestro init."""
+
+    def test_init_writes_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["init"])
+        assert result.exit_code == 0
+        assert (tmp_path / "project.yaml").exists()
+
+    def test_init_refuses_overwrite(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "project.yaml").write_text("existing")
+        result = runner.invoke(app, ["init"])
+        assert result.exit_code == 1
+        assert (tmp_path / "project.yaml").read_text() == "existing"
+
+    def test_init_force_overwrites(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "project.yaml").write_text("existing")
+        result = runner.invoke(app, ["init", "--force"])
+        assert result.exit_code == 0
+        assert (tmp_path / "project.yaml").read_text() != "existing"

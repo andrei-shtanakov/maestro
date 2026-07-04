@@ -20,6 +20,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -46,6 +47,12 @@ from maestro.git import GitManager
 from maestro.models import ArbiterMode, OrchestratorConfig, TaskStatus, WorkstreamStatus
 from maestro.orchestrator import Orchestrator
 from maestro.pr_manager import PRManager
+from maestro.preflight import (
+    ValidationIssue,
+    ValidationReport,
+    validate_project,
+)
+from maestro.scaffold import ScaffoldError, generate_project_yaml
 from maestro.spawners import AiderSpawner, AnnounceSpawner, CodexSpawner
 from maestro.spawners.base import AgentSpawner  # noqa: TC001 — runtime use
 from maestro.workspace import WorkspaceManager
@@ -289,6 +296,23 @@ def _display_summary(tasks: list) -> None:
             parts.append(f"[{style}]{status.value}: {count}[/{style}]")
 
     console.print("\n" + " | ".join(parts))
+
+
+def _print_validation_report(report: ValidationReport) -> None:
+    """Render preflight issues and a summary line."""
+    for issue in report.issues:
+        color = "red" if issue.severity == "error" else "yellow"
+        location = (
+            f" {', '.join(issue.workstream_ids)}:" if issue.workstream_ids else ""
+        )
+        console.print(
+            f"[{color}]{issue.severity}[/{color}] "
+            f"{escape(f'[{issue.code}]')}{escape(location)} "
+            f"{escape(issue.message)}"
+        )
+    n_err, n_warn = len(report.errors), len(report.warnings)
+    style = "red" if n_err else ("yellow" if n_warn else "green")
+    console.print(f"[{style}]{n_err} errors, {n_warn} warnings[/{style}]")
 
 
 async def _run_scheduler(
@@ -811,6 +835,100 @@ def approve_command(
     asyncio.run(_approve_task(db_path, task_id))
 
 
+@app.command("validate")
+def validate_command(
+    config: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to project YAML configuration",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ],
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Treat warnings as errors (exit 1)"),
+    ] = False,
+    no_fs: Annotated[
+        bool,
+        typer.Option(
+            "--no-fs",
+            help=(
+                "Skip filesystem checks (repo existence, glob matching). "
+                "Only the static overlap heuristic runs; it can miss "
+                "overlaps the filesystem tier would catch."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Validate a Mode-2 project.yaml without running it.
+
+    Checks dependency cycles, scope overlaps, and repository sanity.
+    Exit code 0 when there are no errors (warnings allowed unless
+    --strict), 1 otherwise.
+    """
+    try:
+        project = load_orchestrator_config(config)
+    except ConfigError as e:
+        _print_validation_report(
+            ValidationReport(
+                issues=[
+                    ValidationIssue(severity="error", code="schema", message=str(e))
+                ]
+            )
+        )
+        raise typer.Exit(1) from e
+
+    report = validate_project(project, check_fs=not no_fs)
+    _print_validation_report(report)
+    if not report.ok or (strict and report.warnings):
+        raise typer.Exit(1)
+
+
+@app.command("init")
+def init_command(
+    path: Annotated[
+        Path,
+        typer.Argument(help="Output path for the generated config"),
+    ] = Path("project.yaml"),
+    force: Annotated[
+        bool,
+        typer.Option("--force", "-f", help="Overwrite an existing file"),
+    ] = False,
+    project: Annotated[
+        str | None,
+        typer.Option(
+            "--project", help="Project name (default: current directory name)"
+        ),
+    ] = None,
+) -> None:
+    """Generate a Mode-2 project.yaml scaffold for the current directory.
+
+    Values are autofilled from the git environment (remote URL, base
+    branch); everything else gets commented, schema-valid defaults.
+    """
+    if path.exists() and not force:
+        err_console.print(
+            f"[red]{path} already exists.[/red] Use --force to overwrite."
+        )
+        raise typer.Exit(1)
+
+    try:
+        content = generate_project_yaml(Path.cwd(), project=project)
+    except ScaffoldError as e:
+        err_console.print(f"[red]Scaffold error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+    path.write_text(content, encoding="utf-8")
+    console.print(
+        f"[green]Wrote {path}.[/green] Next: edit the workstreams, "
+        f"then run 'maestro validate {path}'."
+    )
+
+
 # =================================================================
 # Multi-Process Orchestration Commands
 # =================================================================
@@ -899,6 +1017,16 @@ async def _run_orchestrator(
     except ConfigError as e:
         err_console.print(f"[red]Configuration error:[/red] {e}")
         raise typer.Exit(1) from e
+
+    report = validate_project(config)
+    if report.issues:
+        _print_validation_report(report)
+    if not report.ok:
+        err_console.print(
+            "[red]Preflight validation failed.[/red] "
+            f"Run 'maestro validate {config_path}' for details."
+        )
+        raise typer.Exit(1)
 
     # Ensure DB directory exists
     db_path.parent.mkdir(parents=True, exist_ok=True)

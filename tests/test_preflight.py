@@ -1,0 +1,267 @@
+"""Unit tests for preflight validation (maestro validate)."""
+
+from pathlib import Path
+
+from maestro.models import OrchestratorConfig, WorkstreamConfig
+from maestro.preflight import ValidationIssue, ValidationReport, validate_project
+
+
+def make_config(
+    workstreams: list[WorkstreamConfig], repo_path: str = "/nonexistent"
+) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project="test",
+        repo_url="https://github.com/user/test",
+        repo_path=repo_path,
+        workspace_base="/tmp/maestro-ws/test",
+        workstreams=workstreams,
+    )
+
+
+def ws(id_: str, scope: list[str], depends_on: list[str]) -> WorkstreamConfig:
+    return WorkstreamConfig(
+        id=id_,
+        title=id_,
+        description=f"workstream {id_}",
+        scope=scope,
+        depends_on=depends_on,
+    )
+
+
+def make_git_repo(tmp_path: Path, files: list[str]) -> Path:
+    """Create a fake git repo with the given relative files."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    for rel in files:
+        f = repo / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("x")
+    return repo
+
+
+class TestValidationReport:
+    def test_ok_when_only_warnings(self) -> None:
+        report = ValidationReport(
+            issues=[
+                ValidationIssue(severity="warning", code="scope-empty", message="w")
+            ]
+        )
+        assert report.ok
+        assert len(report.warnings) == 1
+        assert report.errors == []
+
+    def test_not_ok_with_errors(self) -> None:
+        report = ValidationReport(
+            issues=[ValidationIssue(severity="error", code="dag-cycle", message="e")]
+        )
+        assert not report.ok
+        assert len(report.errors) == 1
+
+
+class TestStaticChecks:
+    def test_clean_config_no_issues(self) -> None:
+        config = make_config(
+            [
+                ws("a", ["src/a/**"], []),
+                ws("b", ["src/b/**"], ["a"]),
+            ]
+        )
+        report = validate_project(config, check_fs=False)
+        assert report.ok
+        assert report.issues == []
+
+    def test_two_node_cycle_is_error(self) -> None:
+        config = make_config(
+            [
+                ws("a", ["src/a/**"], ["b"]),
+                ws("b", ["src/b/**"], ["a"]),
+            ]
+        )
+        report = validate_project(config, check_fs=False)
+        assert not report.ok
+        codes = [i.code for i in report.errors]
+        assert codes == ["dag-cycle"]
+        assert set(report.errors[0].workstream_ids) == {"a", "b"}
+
+    def test_three_node_cycle_is_error(self) -> None:
+        config = make_config(
+            [
+                ws("a", ["src/a/**"], ["c"]),
+                ws("b", ["src/b/**"], ["a"]),
+                ws("c", ["src/c/**"], ["b"]),
+            ]
+        )
+        report = validate_project(config, check_fs=False)
+        assert [i.code for i in report.errors] == ["dag-cycle"]
+
+    def test_scope_overlap_is_warning(self) -> None:
+        config = make_config(
+            [
+                ws("a", ["src/**"], []),
+                ws("b", ["src/auth/**"], []),
+            ]
+        )
+        report = validate_project(config, check_fs=False)
+        assert report.ok  # warnings only
+        overlap = [i for i in report.issues if i.code == "scope-overlap"]
+        assert len(overlap) == 1
+        assert set(overlap[0].workstream_ids) == {"a", "b"}
+
+    def test_empty_scope_is_warning(self) -> None:
+        config = make_config([ws("a", [], [])])
+        report = validate_project(config, check_fs=False)
+        assert report.ok
+        assert [i.code for i in report.issues] == ["scope-empty"]
+        assert report.issues[0].workstream_ids == ["a"]
+
+    def test_empty_workstreams_skips_dag_and_scope_checks(self) -> None:
+        config = make_config([])
+        report = validate_project(config, check_fs=False)
+        assert report.ok
+        assert report.issues == []
+
+
+class TestFilesystemChecks:
+    def test_repo_missing_is_error(self, tmp_path: Path) -> None:
+        config = make_config(
+            [ws("a", ["src/**"], [])], repo_path=str(tmp_path / "nope")
+        )
+        report = validate_project(config)
+        assert [i.code for i in report.errors] == ["repo-missing"]
+
+    def test_repo_not_git_is_error(self, tmp_path: Path) -> None:
+        plain_dir = tmp_path / "plain"
+        plain_dir.mkdir()
+        config = make_config([ws("a", ["src/**"], [])], repo_path=str(plain_dir))
+        report = validate_project(config)
+        assert [i.code for i in report.errors] == ["repo-not-git"]
+
+    def test_repo_errors_skip_scope_fs_checks(self, tmp_path: Path) -> None:
+        config = make_config(
+            [ws("a", ["src/**"], [])], repo_path=str(tmp_path / "nope")
+        )
+        report = validate_project(config)
+        assert [i.code for i in report.issues] == ["repo-missing"]
+
+    def test_glob_with_matches_is_silent(self, tmp_path: Path) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/main.py"])
+        config = make_config([ws("a", ["src/a/**"], [])], repo_path=str(repo))
+        report = validate_project(config)
+        assert report.issues == []
+
+    def test_glob_without_matches_is_warning(self, tmp_path: Path) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/main.py"])
+        config = make_config(
+            [ws("a", ["src/a/**", "src/typo/**"], [])], repo_path=str(repo)
+        )
+        report = validate_project(config)
+        assert [i.code for i in report.issues] == ["scope-no-match"]
+        assert "src/typo/**" in report.issues[0].message
+
+    def test_directory_scope_without_glob_counts_files(self, tmp_path: Path) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/main.py"])
+        config = make_config([ws("a", ["src/a"], [])], repo_path=str(repo))
+        report = validate_project(config)
+        assert report.issues == []
+
+    def test_check_fs_false_skips_everything(self, tmp_path: Path) -> None:
+        config = make_config(
+            [ws("a", ["src/**"], [])], repo_path=str(tmp_path / "nope")
+        )
+        report = validate_project(config, check_fs=False)
+        assert report.issues == []
+
+
+class TestExactOverlapTier:
+    def test_heuristic_false_negative_caught_by_fs_tier(self, tmp_path: Path) -> None:
+        # './src/**' vs 'src/**' — the static heuristic misses this
+        # (different first segment), the exact tier must catch it.
+        repo = make_git_repo(tmp_path, ["src/main.py"])
+        config = make_config(
+            [
+                ws("a", ["./src/**"], []),
+                ws("b", ["src/**"], []),
+            ],
+            repo_path=str(repo),
+        )
+        report = validate_project(config)
+        overlap = [i for i in report.issues if i.code == "scope-overlap"]
+        assert len(overlap) == 1
+        assert set(overlap[0].workstream_ids) == {"a", "b"}
+        assert "src/main.py" in overlap[0].message
+
+    def test_no_duplicate_when_both_tiers_fire(self, tmp_path: Path) -> None:
+        repo = make_git_repo(tmp_path, ["src/auth/login.py"])
+        config = make_config(
+            [
+                ws("a", ["src/**"], []),
+                ws("b", ["src/auth/**"], []),
+            ],
+            repo_path=str(repo),
+        )
+        report = validate_project(config)
+        overlap = [i for i in report.issues if i.code == "scope-overlap"]
+        assert len(overlap) == 1  # static tier fired; exact tier de-duplicated
+
+    def test_disjoint_scopes_no_overlap(self, tmp_path: Path) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/x.py", "src/b/y.py"])
+        config = make_config(
+            [
+                ws("a", ["src/a/**"], []),
+                ws("b", ["src/b/**"], []),
+            ],
+            repo_path=str(repo),
+        )
+        report = validate_project(config)
+        assert report.issues == []
+
+
+class TestInvalidScopePatterns:
+    def test_absolute_pattern_is_warning_not_crash(self, tmp_path: Path) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/main.py"])
+        config = make_config([ws("a", ["/src/**"], [])], repo_path=str(repo))
+        report = validate_project(config)
+        assert report.ok
+        assert [i.code for i in report.issues] == ["scope-invalid-pattern"]
+        assert "a" in report.issues[0].workstream_ids
+        assert "/src/**" in report.issues[0].message
+
+    def test_empty_pattern_is_warning_not_crash(self, tmp_path: Path) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/main.py"])
+        config = make_config([ws("a", [""], [])], repo_path=str(repo))
+        report = validate_project(config)
+        assert report.ok
+        assert [i.code for i in report.issues] == ["scope-invalid-pattern"]
+
+    def test_parent_escape_is_warning_and_contributes_no_files(
+        self, tmp_path: Path
+    ) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/main.py"])
+        # Sibling file outside the repo that '../**' would otherwise match.
+        (tmp_path / "sibling.py").write_text("x")
+        config = make_config(
+            [
+                ws("a", ["../**"], []),
+                ws("b", ["src/a/**"], []),
+            ],
+            repo_path=str(repo),
+        )
+        report = validate_project(config)
+        assert [i.code for i in report.issues] == ["scope-invalid-pattern"]
+        assert not any(i.code == "scope-overlap" for i in report.issues)
+
+    def test_invalid_pattern_does_not_also_emit_scope_no_match(
+        self, tmp_path: Path
+    ) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/main.py"])
+        config = make_config([ws("a", ["/src/**"], [])], repo_path=str(repo))
+        report = validate_project(config)
+        assert not any(i.code == "scope-no-match" for i in report.issues)
+
+    def test_dotdot_in_filename_component_is_not_flagged_invalid(
+        self, tmp_path: Path
+    ) -> None:
+        repo = make_git_repo(tmp_path, ["src/foo..bar/main.py"])
+        config = make_config([ws("a", ["src/foo..bar/**"], [])], repo_path=str(repo))
+        report = validate_project(config)
+        assert not any(i.code == "scope-invalid-pattern" for i in report.issues)

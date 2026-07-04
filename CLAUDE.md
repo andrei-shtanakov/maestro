@@ -35,6 +35,11 @@ uv run maestro orchestrate <project.yaml>   # Run orchestrator
 uv run maestro workstreams --db maestro.db       # Show workstreams status
 uv run maestro workspaces <project.yaml>     # List active worktrees
 
+# === Mode-2 config authoring ===
+uv run maestro init                          # Scaffold project.yaml from cwd
+uv run maestro validate project.yaml         # Preflight: cycles, scope overlap, repo sanity
+uv run maestro validate project.yaml --strict --no-fs  # CI mode, no filesystem access
+
 # === Log utilities ===
 uv run maestro merge-logs <pipeline-dir>     # Time-sort per-pid JSONL into merged.jsonl
 
@@ -75,6 +80,8 @@ uv add --dev <package>
 - **cost_tracker.py**: Token usage parsing and cost calculation
 - **event_log.py**: Structured event logging for task lifecycle
 - **merge_logs.py**: Standalone merge-logs CLI — time-sorts per-pid JSONL into merged.jsonl
+- **preflight.py**: Mode-2 config validation — ValidationReport (errors/warnings), cycle detection via shared dag.find_cycle, two-tier scope-overlap (static heuristic + exact file-set intersection), repo/glob filesystem checks; runs standalone (`maestro validate`) and as a fail-fast gate inside `maestro orchestrate`
+- **scaffold.py**: `maestro init` generator — commented project.yaml template with git-derived autofill, self-checked against OrchestratorConfig before writing
 - **spec_runner.py**: Integration boundary between Maestro and the external spec-runner
 
 **Multi-process orchestration (new):**
@@ -84,7 +91,7 @@ uv add --dev <package>
 - **pr_manager.py**: GitHub PR creation via `gh` CLI
 
 **Subpackages:**
-- **spawners/**: AgentSpawner ABC + implementations (claude_code, codex_cli, aider, announce) + registry
+- **spawners/**: AgentSpawner ABC + implementations (claude_code, codex_cli, aider, announce) + registry. An opencode spawner module (`opencode run -m opencode/<model>`, first open-model agentic harness, ADR-ECO-003c) exists but is not yet registered as a selectable agent type (no entry point / default-set wiring)
 - **coordination/**: MCP server (FastMCP) + REST API (FastAPI) with /workstreams endpoints; Arbiter routing (`routing.py` strategies, vendored `arbiter_client.py` MCP client, `arbiter_errors.py`)
 - **benchmark/**: R-06b/R-07 benchmark-aware routing — async runner, ATP client, spawner→responder adapter, and Arbiter feedback wiring (`arbiter_report.py`)
 - **notifications/**: Desktop notifications (macOS/Linux)
@@ -161,3 +168,7 @@ PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
 - git worktree for workspace isolation
 - gh CLI for PR creation
 - spec-runner (external) for subtask execution
+
+## Ideas and Docs
+
+- Направление/идеи (авторинг workstream'ов, scaffold/SDK): см. `docs/idea-workstream-framework.md`

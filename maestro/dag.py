@@ -26,6 +26,76 @@ class CycleError(Exception):
         super().__init__(f"Cyclic dependency detected: {cycle_str}")
 
 
+def find_cycle(deps: dict[str, set[str]]) -> list[str] | None:
+    """Find a dependency cycle in an id -> dependencies mapping.
+
+    Detects a cycle with Kahn's algorithm, then recovers the cycle path
+    with DFS. Dependencies whose ids are not keys of ``deps`` are ignored.
+
+    Args:
+        deps: Mapping of node id to the set of ids it depends on.
+
+    Returns:
+        Cycle path with the first node repeated at the end
+        (e.g. ``["a", "b", "a"]``), or None if the graph is acyclic.
+    """
+    known = set(deps)
+    in_degree = {node: len(deps[node] & known) for node in deps}
+    dependents: dict[str, set[str]] = {node: set() for node in deps}
+    for node, node_deps in deps.items():
+        for dep in node_deps & known:
+            dependents[dep].add(node)
+
+    queue: deque[str] = deque(node for node, degree in in_degree.items() if degree == 0)
+    processed = 0
+    while queue:
+        node = queue.popleft()
+        processed += 1
+        for dependent in dependents[node]:
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                queue.append(dependent)
+
+    if processed == len(deps):
+        return None
+    return _cycle_path(deps, known)
+
+
+def _cycle_path(deps: dict[str, set[str]], known: set[str]) -> list[str]:
+    """Recover one cycle path via DFS (called only when a cycle exists).
+
+    Raises:
+        RuntimeError: If no cycle path is found — the caller guarantees a
+            cycle exists, so reaching this means a broken invariant.
+    """
+    visited: set[str] = set()
+    rec_stack: set[str] = set()
+
+    def dfs(node: str, path: list[str]) -> list[str] | None:
+        visited.add(node)
+        rec_stack.add(node)
+        path.append(node)
+        for dep in deps[node] & known:
+            if dep not in visited:
+                result = dfs(dep, path)
+                if result:
+                    return result
+            elif dep in rec_stack:
+                cycle_start = path.index(dep)
+                return [*path[cycle_start:], dep]
+        path.pop()
+        rec_stack.remove(node)
+        return None
+
+    for node in deps:
+        if node not in visited:
+            result = dfs(node, [])
+            if result:
+                return result
+    msg = "cycle detected by Kahn's algorithm but DFS found no cycle path"
+    raise RuntimeError(msg)
+
+
 @dataclass
 class ScopeWarning:
     """Warning for overlapping scopes between parallel tasks.
@@ -107,78 +177,16 @@ class DAG:
                     self._nodes[dep_id].dependents.add(task.id)
 
     def _detect_cycles(self) -> None:
-        """Detect cycles using Kahn's algorithm.
-
-        Kahn's algorithm works by repeatedly removing nodes with no incoming
-        edges (in-degree 0). If the graph is acyclic, all nodes will be
-        removed. If nodes remain, they form a cycle.
+        """Detect cycles via the shared find_cycle function.
 
         Raises:
             CycleError: If a cycle is detected.
         """
-        # Calculate in-degrees
-        in_degree: dict[str, int] = {
-            node_id: len(node.dependencies) for node_id, node in self._nodes.items()
-        }
-
-        # Queue of nodes with no incoming edges
-        queue: deque[str] = deque()
-        for node_id, degree in in_degree.items():
-            if degree == 0:
-                queue.append(node_id)
-
-        processed_count = 0
-
-        while queue:
-            node_id = queue.popleft()
-            processed_count += 1
-
-            # Reduce in-degree for all dependents
-            for dependent_id in self._nodes[node_id].dependents:
-                in_degree[dependent_id] -= 1
-                if in_degree[dependent_id] == 0:
-                    queue.append(dependent_id)
-
-        # If not all nodes processed, there's a cycle
-        if processed_count != len(self._nodes):
-            cycle_path = self._find_cycle_path()
-            raise CycleError(cycle_path)
-
-    def _find_cycle_path(self) -> list[str]:
-        """Find and return the path of a cycle using DFS.
-
-        Returns:
-            List of task IDs forming the cycle.
-        """
-        visited: set[str] = set()
-        rec_stack: set[str] = set()
-
-        def dfs(node_id: str, path: list[str]) -> list[str] | None:
-            visited.add(node_id)
-            rec_stack.add(node_id)
-            path.append(node_id)
-
-            for dep_id in self._nodes[node_id].dependencies:
-                if dep_id not in visited:
-                    result = dfs(dep_id, path)
-                    if result:
-                        return result
-                elif dep_id in rec_stack:
-                    # Found cycle
-                    cycle_start = path.index(dep_id)
-                    return [*path[cycle_start:], dep_id]
-
-            path.pop()
-            rec_stack.remove(node_id)
-            return None
-
-        for node_id in self._nodes:
-            if node_id not in visited:
-                result = dfs(node_id, [])
-                if result:
-                    return result
-
-        return []
+        cycle = find_cycle(
+            {node_id: node.dependencies for node_id, node in self._nodes.items()}
+        )
+        if cycle is not None:
+            raise CycleError(cycle)
 
     def topological_sort(self) -> list[str]:
         """Return tasks in topological order (execution order).
