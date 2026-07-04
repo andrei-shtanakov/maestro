@@ -143,8 +143,71 @@ def _check_overlap_static(
 
 
 def _check_repo(repo: Path) -> list[ValidationIssue]:
-    """Placeholder — implemented in the filesystem-checks task."""
+    """Check that repo exists and is a git repository.
+
+    Args:
+        repo: Path to the repository.
+
+    Returns:
+        List of errors if repo is missing or not a git repository.
+    """
+    if not repo.exists():
+        return [
+            ValidationIssue(
+                severity="error",
+                code="repo-missing",
+                message=(
+                    f"repo_path does not exist: {repo}. Fix repo_path in the config."
+                ),
+            )
+        ]
+    if not (repo / ".git").exists():
+        return [
+            ValidationIssue(
+                severity="error",
+                code="repo-not-git",
+                message=(
+                    f"repo_path is not a git repository (no .git): {repo}. "
+                    "Point repo_path at a cloned repository."
+                ),
+            )
+        ]
     return []
+
+
+def _expand_scope(repo: Path, patterns: list[str]) -> dict[str, set[str]]:
+    """Expand each glob to the set of matching repo-relative file paths.
+
+    A pattern matching a directory counts every file under it. Files
+    inside .git are excluded. Patterns are normalized by stripping a
+    leading './' so './src/**' and 'src/**' expand identically.
+
+    Args:
+        repo: Path to the repository root.
+        patterns: List of glob patterns (may include ./).
+
+    Returns:
+        Dict mapping each pattern to the set of matching file paths
+        (relative to repo).
+    """
+    matches: dict[str, set[str]] = {}
+    for pattern in patterns:
+        normalized = pattern.removeprefix("./")
+        matched: set[str] = set()
+        for p in repo.glob(normalized):
+            rel = p.relative_to(repo)
+            if ".git" in rel.parts:
+                continue
+            if p.is_file():
+                matched.add(str(rel))
+            elif p.is_dir():
+                matched.update(
+                    str(f.relative_to(repo))
+                    for f in p.rglob("*")
+                    if f.is_file() and ".git" not in f.relative_to(repo).parts
+                )
+        matches[pattern] = matched
+    return matches
 
 
 def _check_scope_fs(
@@ -152,5 +215,61 @@ def _check_scope_fs(
     repo: Path,
     seen_pairs: set[frozenset[str]],
 ) -> list[ValidationIssue]:
-    """Placeholder — implemented in the filesystem-checks task."""
-    return []
+    """Check for non-matching glob patterns and exact scope overlaps.
+
+    The static heuristic (at parse time) catches obvious overlaps like
+    'src/**' vs 'src/auth/**'. This tier catches misses like './src/**'
+    vs 'src/**' by expanding every pattern against actual files.
+
+    Args:
+        workstreams: List of workstream configs to check.
+        repo: Path to the repository root.
+        seen_pairs: Pairs already reported by the static tier
+            (to avoid duplicates).
+
+    Returns:
+        List of warnings for unmatched patterns and overlapping scopes.
+    """
+    issues: list[ValidationIssue] = []
+    files_by_ws: dict[str, set[str]] = {}
+
+    for w in workstreams:
+        expanded = _expand_scope(repo, w.scope)
+        files_by_ws[w.id] = set().union(*expanded.values()) if expanded else set()
+        for pattern, matched in expanded.items():
+            if not matched:
+                issues.append(
+                    ValidationIssue(
+                        severity="warning",
+                        code="scope-no-match",
+                        workstream_ids=[w.id],
+                        message=(
+                            f"Scope pattern '{pattern}' of workstream "
+                            f"'{w.id}' matches no existing files — either a "
+                            "typo or a glob for files not yet created."
+                        ),
+                    )
+                )
+
+    for i, a in enumerate(workstreams):
+        for b in workstreams[i + 1 :]:
+            pair = frozenset({a.id, b.id})
+            if pair in seen_pairs:
+                continue
+            common = files_by_ws[a.id] & files_by_ws[b.id]
+            if common:
+                sample = ", ".join(sorted(common)[:5])
+                issues.append(
+                    ValidationIssue(
+                        severity="warning",
+                        code="scope-overlap",
+                        workstream_ids=sorted(pair),
+                        message=(
+                            f"Scopes of '{a.id}' and '{b.id}' match the same "
+                            f"existing files (e.g. {sample}). Overlapping "
+                            "scopes risk merge conflicts; split the scopes "
+                            "or add a depends_on edge."
+                        ),
+                    )
+                )
+    return issues
