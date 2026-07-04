@@ -42,6 +42,8 @@ def _write_orchestrator_config(base_dir: Path) -> Path:
     """Create a minimal orchestrator config file for testing."""
     repo_dir = base_dir / "repo"
     repo_dir.mkdir(parents=True, exist_ok=True)
+    # Create a proper git repository (required by preflight validation)
+    (repo_dir / ".git").mkdir(parents=True, exist_ok=True)
     workspace_dir = base_dir / "workspaces"
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1395,3 +1397,45 @@ workstreams:
         config_file.write_text("project: test\n")  # missing required fields
         result = runner.invoke(app, ["validate", str(config_file)])
         assert result.exit_code == 1
+
+
+# =============================================================================
+# Test: Orchestrate Preflight
+# =============================================================================
+
+
+class TestOrchestratePreflight:
+    """Preflight validation gates maestro orchestrate."""
+
+    def test_orchestrate_aborts_on_cycle(self, tmp_path: Path) -> None:
+        """Test that orchestrate aborts on DAG cycle before creating DB."""
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        config_file = tmp_path / "project.yaml"
+        config_file.write_text(
+            f"""
+project: test
+repo_url: https://github.com/user/test
+repo_path: {repo}
+workspace_base: {tmp_path / "ws"}
+workstreams:
+  - id: a
+    title: A
+    description: d
+    scope: ["src/a/**"]
+    depends_on: [b]
+  - id: b
+    title: B
+    description: d
+    scope: ["src/b/**"]
+    depends_on: [a]
+"""
+        )
+        db_path = tmp_path / "maestro.db"
+        result = runner.invoke(
+            app, ["orchestrate", str(config_file), "--db", str(db_path)]
+        )
+        assert result.exit_code == 1
+        assert "dag-cycle" in result.output
+        # Aborted before any orchestrator work: no database was created
+        assert not db_path.exists()

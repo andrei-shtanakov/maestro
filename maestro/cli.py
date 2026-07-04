@@ -974,6 +974,16 @@ async def _run_orchestrator(
         err_console.print(f"[red]Configuration error:[/red] {e}")
         raise typer.Exit(1) from e
 
+    report = validate_project(config)
+    if report.issues:
+        _print_validation_report(report)
+    if not report.ok:
+        err_console.print(
+            "[red]Preflight validation failed.[/red] "
+            f"Run 'maestro validate {config_path}' for details."
+        )
+        raise typer.Exit(1)
+
     # Ensure DB directory exists
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
