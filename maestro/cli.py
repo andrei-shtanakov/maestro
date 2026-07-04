@@ -46,6 +46,11 @@ from maestro.git import GitManager
 from maestro.models import ArbiterMode, OrchestratorConfig, TaskStatus, WorkstreamStatus
 from maestro.orchestrator import Orchestrator
 from maestro.pr_manager import PRManager
+from maestro.preflight import (
+    ValidationIssue,
+    ValidationReport,
+    validate_project,
+)
 from maestro.spawners import AiderSpawner, AnnounceSpawner, CodexSpawner
 from maestro.spawners.base import AgentSpawner  # noqa: TC001 — runtime use
 from maestro.workspace import WorkspaceManager
@@ -289,6 +294,22 @@ def _display_summary(tasks: list) -> None:
             parts.append(f"[{style}]{status.value}: {count}[/{style}]")
 
     console.print("\n" + " | ".join(parts))
+
+
+def _print_validation_report(report: ValidationReport) -> None:
+    """Render preflight issues and a summary line."""
+    for issue in report.issues:
+        color = "red" if issue.severity == "error" else "yellow"
+        location = (
+            f" {', '.join(issue.workstream_ids)}:" if issue.workstream_ids else ""
+        )
+        console.print(
+            f"[{color}]{issue.severity}[/{color}] "
+            f"\\[{issue.code}]{location} {issue.message}"
+        )
+    n_err, n_warn = len(report.errors), len(report.warnings)
+    style = "red" if n_err else ("yellow" if n_warn else "green")
+    console.print(f"[{style}]{n_err} errors, {n_warn} warnings[/{style}]")
 
 
 async def _run_scheduler(
@@ -809,6 +830,59 @@ def approve_command(
     """
     db_path = db or DEFAULT_DB_PATH
     asyncio.run(_approve_task(db_path, task_id))
+
+
+@app.command("validate")
+def validate_command(
+    config: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to project YAML configuration",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ],
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Treat warnings as errors (exit 1)"),
+    ] = False,
+    no_fs: Annotated[
+        bool,
+        typer.Option(
+            "--no-fs",
+            help=(
+                "Skip filesystem checks (repo existence, glob matching). "
+                "Only the static overlap heuristic runs; it can miss "
+                "overlaps the filesystem tier would catch."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Validate a Mode-2 project.yaml without running it.
+
+    Checks dependency cycles, scope overlaps, and repository sanity.
+    Exit code 0 when there are no errors (warnings allowed unless
+    --strict), 1 otherwise.
+    """
+    try:
+        project = load_orchestrator_config(config)
+    except ConfigError as e:
+        _print_validation_report(
+            ValidationReport(
+                issues=[
+                    ValidationIssue(severity="error", code="schema", message=str(e))
+                ]
+            )
+        )
+        raise typer.Exit(1) from e
+
+    report = validate_project(project, check_fs=not no_fs)
+    _print_validation_report(report)
+    if not report.ok or (strict and report.warnings):
+        raise typer.Exit(1)
 
 
 # =================================================================
