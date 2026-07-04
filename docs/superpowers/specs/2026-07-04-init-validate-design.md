@@ -68,6 +68,7 @@ def validate_project(
 | `repo-missing` | error | `repo_path` does not exist (after `~` expansion) | FS, only when `check_fs=True` |
 | `repo-not-git` | error | `repo_path` exists but has no `.git` | FS |
 | `scope-no-match` | warning | a scope glob matches zero files under `repo_path` | FS, `pathlib.Path.glob`. Honest framing: this cannot distinguish a typo from a legitimate glob for not-yet-created files — it flags "probably-empty scope", nothing stronger. Low-signal by construction; kept because it is free once the FS pass globs anyway |
+| `scope-invalid-pattern` | warning | a scope glob is unsafe to expand: empty/whitespace, absolute (leading `/`), contains a `..` path segment, or otherwise rejected by `pathlib.Path.glob` (e.g. `NotImplementedError`/`ValueError`) | FS. Detected before globbing so it never raises and never lets a pattern escape `repo_path` via `..`; the pattern contributes no files to that workstream's scope and does not also emit `scope-no-match` |
 
 Empty `workstreams` (auto-decompose mode): DAG/scope checks are skipped, FS
 repo checks still run.

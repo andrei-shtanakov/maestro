@@ -20,6 +20,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -306,7 +307,8 @@ def _print_validation_report(report: ValidationReport) -> None:
         )
         console.print(
             f"[{color}]{issue.severity}[/{color}] "
-            f"\\[{issue.code}]{location} {issue.message}"
+            f"{escape(f'[{issue.code}]')}{escape(location)} "
+            f"{escape(issue.message)}"
         )
     n_err, n_warn = len(report.errors), len(report.warnings)
     style = "red" if n_err else ("yellow" if n_warn else "green")

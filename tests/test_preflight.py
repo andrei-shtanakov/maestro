@@ -214,3 +214,54 @@ class TestExactOverlapTier:
         )
         report = validate_project(config)
         assert report.issues == []
+
+
+class TestInvalidScopePatterns:
+    def test_absolute_pattern_is_warning_not_crash(self, tmp_path: Path) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/main.py"])
+        config = make_config([ws("a", ["/src/**"], [])], repo_path=str(repo))
+        report = validate_project(config)
+        assert report.ok
+        assert [i.code for i in report.issues] == ["scope-invalid-pattern"]
+        assert "a" in report.issues[0].workstream_ids
+        assert "/src/**" in report.issues[0].message
+
+    def test_empty_pattern_is_warning_not_crash(self, tmp_path: Path) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/main.py"])
+        config = make_config([ws("a", [""], [])], repo_path=str(repo))
+        report = validate_project(config)
+        assert report.ok
+        assert [i.code for i in report.issues] == ["scope-invalid-pattern"]
+
+    def test_parent_escape_is_warning_and_contributes_no_files(
+        self, tmp_path: Path
+    ) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/main.py"])
+        # Sibling file outside the repo that '../**' would otherwise match.
+        (tmp_path / "sibling.py").write_text("x")
+        config = make_config(
+            [
+                ws("a", ["../**"], []),
+                ws("b", ["src/a/**"], []),
+            ],
+            repo_path=str(repo),
+        )
+        report = validate_project(config)
+        assert [i.code for i in report.issues] == ["scope-invalid-pattern"]
+        assert not any(i.code == "scope-overlap" for i in report.issues)
+
+    def test_invalid_pattern_does_not_also_emit_scope_no_match(
+        self, tmp_path: Path
+    ) -> None:
+        repo = make_git_repo(tmp_path, ["src/a/main.py"])
+        config = make_config([ws("a", ["/src/**"], [])], repo_path=str(repo))
+        report = validate_project(config)
+        assert not any(i.code == "scope-no-match" for i in report.issues)
+
+    def test_dotdot_in_filename_component_is_not_flagged_invalid(
+        self, tmp_path: Path
+    ) -> None:
+        repo = make_git_repo(tmp_path, ["src/foo..bar/main.py"])
+        config = make_config([ws("a", ["src/foo..bar/**"], [])], repo_path=str(repo))
+        report = validate_project(config)
+        assert not any(i.code == "scope-invalid-pattern" for i in report.issues)

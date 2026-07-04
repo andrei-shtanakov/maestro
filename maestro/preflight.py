@@ -175,26 +175,65 @@ def _check_repo(repo: Path) -> list[ValidationIssue]:
     return []
 
 
-def _expand_scope(repo: Path, patterns: list[str]) -> dict[str, set[str]]:
+def _invalid_pattern_reason(pattern: str) -> str | None:
+    """Classify why a scope glob is unsafe to pass to ``Path.glob``.
+
+    Args:
+        pattern: Raw scope glob pattern (before './' stripping).
+
+    Returns:
+        A human-readable reason if the pattern is invalid, else None.
+    """
+    if not pattern.strip():
+        return "it is empty"
+    normalized = pattern.removeprefix("./")
+    if normalized.startswith("/"):
+        return "it is an absolute path (scope globs must be repo-relative)"
+    if ".." in Path(normalized).parts:
+        return "it contains a '..' segment, which can escape the repo root"
+    return None
+
+
+def _expand_scope(
+    repo: Path, patterns: list[str]
+) -> tuple[dict[str, set[str]], dict[str, str]]:
     """Expand each glob to the set of matching repo-relative file paths.
 
     A pattern matching a directory counts every file under it. Files
     inside .git are excluded. Patterns are normalized by stripping a
     leading './' so './src/**' and 'src/**' expand identically.
 
+    Patterns that are empty, absolute, contain a '..' segment, or are
+    otherwise rejected by the glob engine are skipped (they contribute
+    no files) and reported back via the second return value instead of
+    raising.
+
     Args:
         repo: Path to the repository root.
         patterns: List of glob patterns (may include ./).
 
     Returns:
-        Dict mapping each pattern to the set of matching file paths
-        (relative to repo).
+        Tuple of:
+        - Dict mapping each *valid* pattern to the set of matching file
+          paths (relative to repo).
+        - Dict mapping each *invalid* pattern to the reason it was
+          rejected.
     """
     matches: dict[str, set[str]] = {}
+    invalid: dict[str, str] = {}
     for pattern in patterns:
+        reason = _invalid_pattern_reason(pattern)
+        if reason is not None:
+            invalid[pattern] = reason
+            continue
         normalized = pattern.removeprefix("./")
         matched: set[str] = set()
-        for p in repo.glob(normalized):
+        try:
+            globbed = list(repo.glob(normalized))
+        except (ValueError, NotImplementedError) as e:
+            invalid[pattern] = f"it was rejected by the glob engine: {e}"
+            continue
+        for p in globbed:
             rel = p.relative_to(repo)
             if ".git" in rel.parts:
                 continue
@@ -207,7 +246,7 @@ def _expand_scope(repo: Path, patterns: list[str]) -> dict[str, set[str]]:
                     if f.is_file() and ".git" not in f.relative_to(repo).parts
                 )
         matches[pattern] = matched
-    return matches
+    return matches, invalid
 
 
 def _check_scope_fs(
@@ -234,8 +273,21 @@ def _check_scope_fs(
     files_by_ws: dict[str, set[str]] = {}
 
     for w in workstreams:
-        expanded = _expand_scope(repo, w.scope)
+        expanded, invalid = _expand_scope(repo, w.scope)
         files_by_ws[w.id] = set().union(*expanded.values()) if expanded else set()
+        for pattern, reason in invalid.items():
+            issues.append(
+                ValidationIssue(
+                    severity="warning",
+                    code="scope-invalid-pattern",
+                    workstream_ids=[w.id],
+                    message=(
+                        f"Scope pattern '{pattern}' of workstream '{w.id}' "
+                        f"is invalid: {reason}. Scope globs must be "
+                        "repo-relative; fix or remove this pattern."
+                    ),
+                )
+            )
         for pattern, matched in expanded.items():
             if not matched:
                 issues.append(

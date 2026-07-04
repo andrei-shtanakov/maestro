@@ -9,8 +9,11 @@
   between workstreams (`scope-overlap`, warning; two-tier: a static heuristic
   plus an exact file-set intersection when `--no-fs` is not set), empty scope
   (`scope-empty`, warning), missing/non-git repo (`repo-missing` /
-  `repo-not-git`, errors), and scope globs matching nothing on disk
-  (`scope-no-match`, warning). `--strict` treats warnings as errors (exit 1);
+  `repo-not-git`, errors), scope globs matching nothing on disk
+  (`scope-no-match`, warning), and scope globs that are unsafe to expand —
+  absolute, empty, containing a `..` segment, or otherwise rejected by the
+  glob engine (`scope-invalid-pattern`, warning; contributes no files and
+  never raises). `--strict` treats warnings as errors (exit 1);
   `--no-fs` skips filesystem checks for deterministic, repo-less runs. The
   same checks now run as a fail-fast gate inside `maestro orchestrate`
   (`maestro/preflight.py`).

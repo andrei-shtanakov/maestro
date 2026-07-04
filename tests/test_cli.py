@@ -1398,6 +1398,23 @@ workstreams:
         result = runner.invoke(app, ["validate", str(config_file)])
         assert result.exit_code == 1
 
+    def test_char_class_pattern_not_swallowed_by_markup(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        (repo / "src" / "main.py").write_text("x")
+        config_file = self._write_project_yaml(
+            tmp_path,
+            repo,
+            """  - id: a
+    title: A
+    description: d
+    scope: ["src/[abc]/**"]
+""",
+        )
+        result = runner.invoke(app, ["validate", str(config_file)])
+        assert "src/[abc]/**" in result.output
+
 
 # =============================================================================
 # Test: Orchestrate Preflight
