@@ -62,18 +62,48 @@ def validate_project(
 | Code | Severity | What | Source |
 |---|---|---|---|
 | (pydantic) | error | schema shape, duplicate IDs, unknown deps, self-dep, ID format | already enforced at load time by `OrchestratorConfig`; the CLI renders `ValidationError` as error issues — not re-implemented in preflight |
-| `dag-cycle` | error | cycle in workstream `depends_on` | new — Kahn's algorithm modeled on `maestro/dag.py::TaskDAG._detect_cycles`, operating on `list[WorkstreamConfig]`; report includes the cycle path |
-| `scope-overlap` | warning | glob overlap between two workstreams | reuse `Decomposer.validate_non_overlap` / `_patterns_overlap` (`maestro/decomposer.py`) |
+| `dag-cycle` | error | cycle in workstream `depends_on` | shared pure cycle detector (see "Shared cycle detection" below); report includes the cycle path |
+| `scope-overlap` | warning | scope overlap between two workstreams | two-tier (see "Scope overlap accuracy" below): static glob heuristic always; exact file-set intersection when `check_fs=True` |
 | `scope-empty` | warning | workstream has empty `scope` | new — no conflict protection for that workstream |
 | `repo-missing` | error | `repo_path` does not exist (after `~` expansion) | FS, only when `check_fs=True` |
 | `repo-not-git` | error | `repo_path` exists but has no `.git` | FS |
-| `scope-no-match` | warning | a scope glob matches zero files under `repo_path` | FS, `pathlib.Path.glob`; warning (not error) because globs for not-yet-created files are legitimate |
+| `scope-no-match` | warning | a scope glob matches zero files under `repo_path` | FS, `pathlib.Path.glob`. Honest framing: this cannot distinguish a typo from a legitimate glob for not-yet-created files — it flags "probably-empty scope", nothing stronger. Low-signal by construction; kept because it is free once the FS pass globs anyway |
 
 Empty `workstreams` (auto-decompose mode): DAG/scope checks are skipped, FS
 repo checks still run.
 
-`_patterns_overlap` stays where it is; preflight imports it. If a later slice
-needs a stricter matcher, that is a preflight-internal change.
+### Shared cycle detection (refactor, MVP-blocking)
+
+`DAG._detect_cycles` + `_find_cycle_path` (`maestro/dag.py:109-181`) are
+extracted into a module-level pure function in `dag.py`:
+
+```python
+def find_cycle(deps: dict[str, set[str]]) -> list[str] | None:
+    """Kahn's algorithm + DFS path recovery over an id->dependencies map."""
+```
+
+`DAG` calls it with `{id: node.dependencies}` (raising `CycleError` as today);
+preflight calls it with `{ws.id: set(ws.depends_on)}`. One algorithm, one test
+suite, no second Kahn implementation to drift. Existing `DAG` behavior and
+tests are unchanged (pure extraction).
+
+### Scope overlap accuracy (two-tier)
+
+`_patterns_overlap` (`maestro/decomposer.py:427`) is a heuristic (mutual
+`fnmatch` + shared top-level directory) with known false-negative classes:
+unnormalized paths (`./src/**` vs `src/**`), patterns whose first segments
+differ but expand to the same files. Because `scope-overlap` is the headline
+check, a silent false negative is the worst failure mode. Therefore:
+
+- **Static tier** (always, and the only tier under `--no-fs`): the existing
+  heuristic via `Decomposer.validate_non_overlap`. Its limits are documented
+  in the `validate --no-fs` help text.
+- **Exact tier** (`check_fs=True`): expand every workstream's globs against
+  the real repo tree (the FS pass globs anyway for `scope-no-match`), then
+  intersect the resulting file sets pairwise. Exact for files that exist;
+  overlapping globs over not-yet-created files remain covered only by the
+  heuristic. Issues from both tiers share the `scope-overlap` code and are
+  de-duplicated per workstream pair.
 
 ## Component 2: `maestro validate` (CLI)
 
@@ -104,8 +134,11 @@ Non-interactive. `maestro/scaffold.py` holds the logic:
   `examples/project.yaml`, including one example workstream and commented-out
   optional sections (`notifications`). Values are substituted into the template
   so comments survive (direct pydantic serialization would lose them).
-- **Autofill** (small sync `subprocess.run` git queries local to `scaffold.py`;
-  `GitManager` is async and worktree-oriented — wrong tool here):
+- **Autofill** via a single private helper (`_git_query`) inside `scaffold.py`
+  using sync `subprocess.run`. `GitManager` is async and worktree-oriented —
+  wrong tool here — but this makes scaffold the second git access path in the
+  repo, so the helper is private and must not be imported elsewhere; if a third
+  caller ever needs sync git queries, promote it deliberately:
   - `project` — current directory basename, overridable via `--project`;
   - `repo_path` — absolute cwd;
   - `repo_url` — `git remote get-url origin`; if absent, a placeholder plus a
@@ -142,13 +175,21 @@ config is loaded (`_run_orchestrator`, cli.py:898), immediately after
 
 ## Testing
 
+- `tests/test_dag.py` additions: `find_cycle` pure-function cases (no cycle,
+  2-node, 3-node, disconnected components); existing `DAG` cycle tests keep
+  passing unchanged — they prove the extraction is behavior-preserving.
 - `tests/test_preflight.py`: 2-node and 3-node cycles (self-dep already covered
-  by pydantic), overlap warning, empty scope, FS cases via `tmp_path` (missing
-  repo, non-git dir, glob with zero matches, glob with matches), empty
-  workstreams list, `check_fs=False` skips FS issues.
+  by pydantic), overlap warning from the static tier, overlap caught **only**
+  by the exact FS tier (heuristic false negative, e.g. `./src/**` vs
+  `src/**`), de-duplication when both tiers fire, empty scope, FS cases via
+  `tmp_path` (missing repo, non-git dir, glob with zero matches, glob with
+  matches), empty workstreams list, `check_fs=False` skips FS issues.
 - `tests/test_scaffold.py`: generation inside a tmp git repo with remote
   (round-trip through `load_orchestrator_config`), repo without remote
-  (placeholder path), non-git cwd, existing file / `--force`.
+  (placeholder path), non-git cwd — **explicitly asserting the placeholder
+  output still passes `load_orchestrator_config`** (placeholders must satisfy
+  the pydantic schema, e.g. `validate_repo_path`; only `validate`'s FS checks
+  may fail on it), existing file / `--force`.
 - CLI tests via `typer.testing.CliRunner` following existing test style:
   `validate` exit codes (ok / errors / `--strict` with warnings), `init`
   happy path and refusal to overwrite.
@@ -157,7 +198,9 @@ config is loaded (`_run_orchestrator`, cli.py:898), immediately after
 
 ## Implementation order (TDD throughout)
 
-1. `preflight.py` (report + checks)
-2. `maestro validate` CLI command
-3. `orchestrate` integration
-4. `scaffold.py` + `maestro init` CLI command
+1. `dag.py`: extract `find_cycle` pure function (behavior-preserving refactor,
+   existing tests green before and after)
+2. `preflight.py` (report + checks, both overlap tiers)
+3. `maestro validate` CLI command
+4. `orchestrate` integration
+5. `scaffold.py` + `maestro init` CLI command
