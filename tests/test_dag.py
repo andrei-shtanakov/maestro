@@ -10,7 +10,7 @@ Tests cover:
 
 import pytest
 
-from maestro.dag import DAG, CycleError, DAGNode, ScopeWarning
+from maestro.dag import DAG, CycleError, DAGNode, ScopeWarning, find_cycle
 from maestro.models import TaskConfig
 
 
@@ -786,3 +786,41 @@ class TestCycleError:
         path = ["x", "y", "z", "x"]
         error = CycleError(path)
         assert error.cycle_path == path
+
+
+# =============================================================================
+# Test: find_cycle Pure Function
+# =============================================================================
+
+
+class TestFindCycle:
+    """Tests for the shared pure cycle detector."""
+
+    def test_no_cycle(self) -> None:
+        deps = {"a": set(), "b": {"a"}, "c": {"b"}}
+        assert find_cycle(deps) is None
+
+    def test_empty_graph(self) -> None:
+        assert find_cycle({}) is None
+
+    def test_two_node_cycle(self) -> None:
+        cycle = find_cycle({"a": {"b"}, "b": {"a"}})
+        assert cycle is not None
+        assert cycle[0] == cycle[-1]
+        assert set(cycle) == {"a", "b"}
+
+    def test_three_node_cycle(self) -> None:
+        cycle = find_cycle({"a": {"c"}, "b": {"a"}, "c": {"b"}})
+        assert cycle is not None
+        assert cycle[0] == cycle[-1]
+        assert set(cycle) == {"a", "b", "c"}
+
+    def test_cycle_in_disconnected_component(self) -> None:
+        deps = {"a": set(), "x": {"y"}, "y": {"x"}}
+        cycle = find_cycle(deps)
+        assert cycle is not None
+        assert set(cycle) == {"x", "y"}
+
+    def test_unknown_deps_ignored(self) -> None:
+        # "ghost" is not a key -> edge ignored, same as DAG._build_graph
+        assert find_cycle({"a": {"ghost"}, "b": {"a"}}) is None
