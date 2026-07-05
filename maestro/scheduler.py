@@ -30,7 +30,7 @@ from maestro.coordination.routing import (
     StaticRouting,
     task_status_to_outcome_status,
 )
-from maestro.cost_tracker import has_pricing, parse_and_create_cost
+from maestro.cost_tracker import effective_cost, parse_and_create_cost
 from maestro.dag import DAG
 from maestro.database import Database
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
@@ -315,10 +315,24 @@ class Scheduler:
         """
         task = running_task.task
         attempt = task.retry_count + 1
+        # Dispatch the parser by the EFFECTIVE harness: a routed task's log
+        # was written by the routed agent, not the declared one (agent_type:
+        # auto routed to opencode writes opencode JSONL). A routed harness
+        # outside AgentType (D2 custom spawner) falls back to the declared
+        # type — no parser exists for it anyway, so behavior is unchanged.
+        harness = (
+            harness_of_agent_id(task.routed_agent_type)
+            if task.routed_agent_type
+            else task.agent_type.value
+        )
+        try:
+            effective_agent = AgentType(harness)
+        except ValueError:
+            effective_agent = task.agent_type
         try:
             cost = parse_and_create_cost(
                 task_id=task.id,
-                agent_type=task.agent_type,
+                agent_type=effective_agent,
                 log_file=running_task.log_file,
                 attempt=attempt,
             )
@@ -369,12 +383,14 @@ class Scheduler:
         matching = [r for r in rows if r.attempt == attempt]
         if matching:
             tokens_used = sum(r.input_tokens + r.output_tokens for r in matching)
-            if all(has_pricing(r.agent_type) for r in matching):
-                cost_usd = sum(r.estimated_cost_usd for r in matching)
-            # else: an unpriced harness (opencode) is in the mix — its cost
-            # is UNKNOWN, not 0.0. cost_usd stays None; the arbiter client
-            # omits None from the payload, so cost-aware routing reads
-            # "unknown" instead of "free".
+            per_row = [effective_cost(r) for r in matching]
+            if all(c is not None for c in per_row):
+                cost_usd = sum(c for c in per_row if c is not None)
+            # else: at least one row's cost is UNKNOWN (unpriced harness
+            # with no agent-reported cost) — cost_usd stays None; the
+            # arbiter client omits None, so cost-aware routing reads
+            # "unknown" instead of "free". Matching spans ONE attempt, so
+            # this never zeroes out a different attempt's known cost.
 
         error_code: str | None = None
         if task.error_message:

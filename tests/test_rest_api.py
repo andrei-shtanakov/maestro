@@ -16,7 +16,7 @@ from maestro.coordination.rest_api import (
     create_rest_server,
 )
 from maestro.database import Database, create_database
-from maestro.models import AgentType, Task, TaskStatus
+from maestro.models import AgentType, Task, TaskCost, TaskStatus
 
 
 # =============================================================================
@@ -623,6 +623,43 @@ class TestGetTaskResult:
         data = response.json()
         assert data["status"] == "running"
         assert data["completed_at"] is None
+
+
+# =============================================================================
+# Unit Tests: Cost Endpoints
+# =============================================================================
+
+
+class TestGetTaskCosts:
+    """Tests for GET /tasks/{task_id}/costs endpoint."""
+
+    @pytest.mark.anyio
+    async def test_reported_cost_usd_round_trips(
+        self, client: AsyncClient, db: Database, ready_task: Task
+    ) -> None:
+        """A reported cost (e.g. opencode part.cost) survives serialization.
+
+        Regression test: /costs/summary (COALESCE, real dollars) and the
+        per-row costs endpoint must agree on the same row instead of the
+        per-row response silently reporting $0.00.
+        """
+        await db.save_task_cost(
+            TaskCost(
+                task_id=ready_task.id,
+                agent_type=AgentType.CLAUDE_CODE,
+                input_tokens=10,
+                output_tokens=5,
+                estimated_cost_usd=0.0,
+                reported_cost_usd=0.02,
+            )
+        )
+
+        response = await client.get(f"/tasks/{ready_task.id}/costs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        assert data["costs"][0]["reported_cost_usd"] == pytest.approx(0.02)
 
 
 # =============================================================================

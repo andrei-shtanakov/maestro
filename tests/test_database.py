@@ -25,6 +25,7 @@ from maestro.models import (
     Complexity,
     Language,
     Task,
+    TaskCost,
     TaskStatus,
     TaskType,
 )
@@ -1388,6 +1389,7 @@ class TestSchemaMigrationsJournal:
                 (1, "r02_arbiter_columns"),
                 (2, "r03_arbiter_routing"),
                 (3, "r06b_rename_zadachi_to_workstreams"),
+                (4, "cost_from_log_reported_cost"),
             ]
         finally:
             await db.close()
@@ -1411,7 +1413,7 @@ class TestSchemaMigrationsJournal:
             )
             row = await cursor.fetchone()
             assert row is not None
-            assert row["n"] == 3
+            assert row["n"] == 4
         finally:
             await db2.close()
 
@@ -1426,7 +1428,7 @@ class TestSchemaMigrationsJournal:
         path = tmp_path / "prejournal.db"
         # Simulate a v0.2.0 DB: full current tasks schema, but no
         # schema_migrations table.
-        setup_sql = """
+        tasks_sql = """
         CREATE TABLE tasks (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -1457,8 +1459,22 @@ class TestSchemaMigrationsJournal:
             arbiter_outcome_reported_at TIMESTAMP
         )
         """
+        costs_sql = """
+        CREATE TABLE task_costs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            agent_type TEXT NOT NULL,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            estimated_cost_usd REAL DEFAULT 0.0,
+            attempt INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        )
+        """
         async with aiosqlite.connect(str(path)) as conn:
-            await conn.execute(setup_sql)
+            await conn.execute(tasks_sql)
+            await conn.execute(costs_sql)
             await conn.commit()
 
         db = Database(path)
@@ -1473,6 +1489,7 @@ class TestSchemaMigrationsJournal:
                 (1, "r02_arbiter_columns"),
                 (2, "r03_arbiter_routing"),
                 (3, "r06b_rename_zadachi_to_workstreams"),
+                (4, "cost_from_log_reported_cost"),
             ]
             # Sanity: the idempotent ALTERs must not have fired twice.
             cursor = await db._connection.execute("PRAGMA table_info(tasks)")
@@ -1804,5 +1821,131 @@ class TestMigrationRenameZadachiToWorkstreams:
             tables = {row["name"] for row in await cursor.fetchall()}
             assert "workstreams" in tables
             assert "zadachi" not in tables
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_migration_4_adds_reported_cost_column(self, tmp_path) -> None:
+        """A pre-#4 database gains reported_cost_usd on connect + journal row."""
+        import aiosqlite
+
+        db_path = tmp_path / "old.db"
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                """
+                CREATE TABLE task_costs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    agent_type TEXT NOT NULL,
+                    input_tokens INTEGER DEFAULT 0,
+                    output_tokens INTEGER DEFAULT 0,
+                    estimated_cost_usd REAL DEFAULT 0.0,
+                    attempt INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            await conn.commit()
+
+        db = Database(db_path)
+        await db.connect()
+        try:
+            assert db._connection is not None
+            cursor = await db._connection.execute("PRAGMA table_info(task_costs)")
+            columns = {row["name"] for row in await cursor.fetchall()}
+            assert "reported_cost_usd" in columns
+            cursor = await db._connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 4"
+            )
+            row = await cursor.fetchone()
+            assert row is not None and row["name"] == "cost_from_log_reported_cost"
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_task_cost_reported_cost_round_trip(self, tmp_path) -> None:
+        """reported_cost_usd survives save/get for both a value and None."""
+        from maestro.models import Task, TaskStatus
+
+        db = Database(tmp_path / "c.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir=str(tmp_path),
+                agent_type=AgentType.OPENCODE,
+                status=TaskStatus.DONE,
+            )
+            await db.create_task(task)
+            await db.save_task_cost(
+                TaskCost(
+                    task_id="t1",
+                    agent_type=AgentType.OPENCODE,
+                    input_tokens=100,
+                    output_tokens=20,
+                    estimated_cost_usd=0.0,
+                    reported_cost_usd=0.0123,
+                    attempt=1,
+                )
+            )
+            await db.save_task_cost(
+                TaskCost(
+                    task_id="t1",
+                    agent_type=AgentType.OPENCODE,
+                    input_tokens=50,
+                    output_tokens=10,
+                    estimated_cost_usd=0.0,
+                    attempt=2,
+                )
+            )
+            rows = await db.get_task_costs("t1")
+            assert rows[0].reported_cost_usd == pytest.approx(0.0123)
+            assert rows[1].reported_cost_usd is None
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_get_cost_summary_coalesces_reported_cost(self, tmp_path) -> None:
+        """get_cost_summary prefers reported_cost_usd per row, falling
+        back to estimated_cost_usd when unreported."""
+        from maestro.models import Task, TaskStatus
+
+        db = Database(tmp_path / "c.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir=str(tmp_path),
+                agent_type=AgentType.OPENCODE,
+                status=TaskStatus.DONE,
+            )
+            await db.create_task(task)
+            await db.save_task_cost(
+                TaskCost(
+                    task_id="t1",
+                    agent_type=AgentType.OPENCODE,
+                    input_tokens=100,
+                    output_tokens=20,
+                    estimated_cost_usd=0.0,
+                    reported_cost_usd=0.02,
+                    attempt=1,
+                )
+            )
+            await db.save_task_cost(
+                TaskCost(
+                    task_id="t1",
+                    agent_type=AgentType.CLAUDE_CODE,
+                    input_tokens=10,
+                    output_tokens=5,
+                    estimated_cost_usd=0.001,
+                    attempt=2,
+                )
+            )
+            summary = await db.get_cost_summary()
+            assert summary["total_cost_usd"] == pytest.approx(0.021)
         finally:
             await db.close()

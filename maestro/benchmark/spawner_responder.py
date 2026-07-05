@@ -105,7 +105,13 @@ class SpawnerResponder:
         log_content = log_file.read_text() if log_file.exists() else ""
         usage = parse_log(log_content, agent_enum)
         total_tokens = usage.input_tokens + usage.output_tokens
-        cost = calculate_cost(usage, agent_enum)
+        # Agent-reported cost wins over the PRICING estimate; the trailing
+        # `cost or None` guards below keep 0.0 out of the wire format.
+        cost = (
+            usage.cost_usd
+            if usage.cost_usd is not None
+            else calculate_cost(usage, agent_enum)
+        )
 
         if process.returncode != 0:
             return AgentResponse(

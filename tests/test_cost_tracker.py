@@ -17,6 +17,7 @@ from maestro.cost_tracker import (
     build_summary,
     calculate_cost,
     create_task_cost,
+    effective_cost,
     format_summary,
     has_pricing,
     parse_and_create_cost,
@@ -263,6 +264,81 @@ class TestOpencodeLogParsing:
         assert usage.input_tokens == 1
         assert usage.output_tokens == 2
 
+    def test_parse_real_fixture_sums_cost(self) -> None:
+        """Real captured run: per-step part.cost summed across step_finish.
+
+        Literal computed with jq independently of the parser:
+        0.0170512 + 0.00359536 = 0.02064656. Per-step semantics proven by
+        the same fixture argument as tokens: step 2's cost (0.00359536) is
+        LESS than step 1's (0.0170512) — impossible for a cumulative counter.
+        """
+        usage = parse_opencode_log(self.FIXTURE.read_text(encoding="utf-8"))
+        assert usage.cost_usd == pytest.approx(0.02064656, rel=1e-9)
+
+    def test_no_cost_reported_is_none_not_zero(self) -> None:
+        """A run whose steps carry no cost → cost_usd is None (unknown)."""
+        log = (
+            '{"type": "step_finish", "part": {"tokens": {"input": 10, "output": 5}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.cost_usd is None
+        assert usage.input_tokens == 10  # tokens still parsed
+
+    def test_null_cost_skipped(self) -> None:
+        log = (
+            '{"type": "step_finish", "part": {"cost": null, "tokens": '
+            '{"input": 1, "output": 1}}}\n'
+        )
+        assert parse_opencode_log(log).cost_usd is None
+
+    def test_bool_cost_ignored(self) -> None:
+        """bool is an int subclass in Python; JSON true must not become $1."""
+        log = (
+            '{"type": "step_finish", "part": {"cost": true, "tokens": '
+            '{"input": 1, "output": 1}}}\n'
+        )
+        assert parse_opencode_log(log).cost_usd is None
+
+    def test_partial_cost_sums_available_steps(self) -> None:
+        """One step with cost, one without → total is the one reported value."""
+        log = (
+            '{"type": "step_finish", "part": {"cost": 0.01, "tokens": '
+            '{"input": 10, "output": 2}}}\n'
+            '{"type": "step_finish", "part": {"tokens": '
+            '{"input": 5, "output": 1}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.cost_usd == pytest.approx(0.01)
+        assert usage.input_tokens == 15
+
+    def test_cost_only_step_without_tokens_counted(self) -> None:
+        """A step_finish with cost but no tokens dict still contributes cost."""
+        log = '{"type": "step_finish", "part": {"cost": 0.02}}\n'
+        usage = parse_opencode_log(log)
+        assert usage.cost_usd == pytest.approx(0.02)
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
+
+    def test_infinity_cost_ignored(self) -> None:
+        """Infinity must not leak in and poison downstream summaries."""
+        log = (
+            '{"type": "step_finish", "part": {"cost": Infinity, "tokens": '
+            '{"input": 1, "output": 1}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.cost_usd is None
+        assert usage.input_tokens == 1
+
+    def test_nan_cost_ignored(self) -> None:
+        """NaN must not fail the downstream ge=0.0 check and drop the row."""
+        log = (
+            '{"type": "step_finish", "part": {"cost": NaN, "tokens": '
+            '{"input": 1, "output": 1}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.cost_usd is None
+        assert usage.input_tokens == 1
+
 
 class TestHasPricing:
     """PRICING membership = "this harness has a priced rate card"."""
@@ -277,6 +353,39 @@ class TestHasPricing:
         assert has_pricing(AgentType.CLAUDE_CODE) is True
         assert has_pricing(AgentType.CODEX) is True
         assert has_pricing(AgentType.AIDER) is True
+
+
+class TestEffectiveCost:
+    """effective_cost: reported wins; estimate only for priced harnesses."""
+
+    def test_reported_wins_over_estimate(self) -> None:
+        cost = TaskCost(
+            task_id="t",
+            agent_type=AgentType.CLAUDE_CODE,
+            estimated_cost_usd=0.5,
+            reported_cost_usd=0.02,
+        )
+        assert effective_cost(cost) == pytest.approx(0.02)
+
+    def test_priced_harness_falls_back_to_estimate(self) -> None:
+        cost = TaskCost(
+            task_id="t",
+            agent_type=AgentType.ANNOUNCE,
+            estimated_cost_usd=0.0,
+        )
+        assert effective_cost(cost) == 0.0  # honest zero, not None
+
+    def test_unpriced_unreported_is_unknown(self) -> None:
+        cost = TaskCost(task_id="t", agent_type=AgentType.OPENCODE)
+        assert effective_cost(cost) is None
+
+    def test_unpriced_reported_is_known(self) -> None:
+        cost = TaskCost(
+            task_id="t",
+            agent_type=AgentType.OPENCODE,
+            reported_cost_usd=0.02,
+        )
+        assert effective_cost(cost) == pytest.approx(0.02)
 
 
 class TestParseLog:
@@ -389,6 +498,17 @@ class TestCreateTaskCost:
         cost = create_task_cost("task-002", AgentType.CODEX, usage, attempt=3)
         assert cost.attempt == 3
 
+    def test_create_task_cost_carries_reported_cost(self) -> None:
+        usage = TokenUsage(input_tokens=10, output_tokens=5, cost_usd=0.02)
+        cost = create_task_cost("t1", AgentType.OPENCODE, usage)
+        assert cost.reported_cost_usd == pytest.approx(0.02)
+        assert cost.estimated_cost_usd == 0.0  # unpriced harness estimate
+
+    def test_create_task_cost_no_reported_cost(self) -> None:
+        usage = TokenUsage(input_tokens=10, output_tokens=5)
+        cost = create_task_cost("t1", AgentType.CLAUDE_CODE, usage)
+        assert cost.reported_cost_usd is None
+
 
 class TestParseAndCreateCost:
     """Tests for the parse_and_create_cost convenience function."""
@@ -429,6 +549,20 @@ class TestParseAndCreateCost:
         log_file.write_text('{"result": "done"}')
         result = parse_and_create_cost("task-001", AgentType.CLAUDE_CODE, log_file)
         assert result is None
+
+    def test_parse_and_create_cost_only_log_still_creates_row(
+        self, temp_dir: Path
+    ) -> None:
+        """Zero tokens + reported cost is still a row (relaxed gate)."""
+        log_file = temp_dir / "t.log"
+        log_file.write_text(
+            '{"type": "step_finish", "part": {"cost": 0.02}}\n',
+            encoding="utf-8",
+        )
+        cost = parse_and_create_cost("t1", AgentType.OPENCODE, log_file)
+        assert cost is not None
+        assert cost.reported_cost_usd == pytest.approx(0.02)
+        assert cost.input_tokens == 0
 
 
 # =============================================================================
@@ -515,6 +649,30 @@ class TestBuildSummary:
         assert summary.total_output_tokens == 1100
         assert summary.task_count == 1
         assert abs(summary.costs_by_task["task-001"] - 0.022) < 0.001
+
+    def test_reported_cost_preferred_in_summary(self) -> None:
+        """COALESCE semantics: reported wins per row, estimate is fallback."""
+        costs = [
+            TaskCost(
+                task_id="t1",
+                agent_type=AgentType.OPENCODE,
+                input_tokens=100,
+                output_tokens=20,
+                estimated_cost_usd=0.0,
+                reported_cost_usd=0.02,
+            ),
+            TaskCost(
+                task_id="t2",
+                agent_type=AgentType.CLAUDE_CODE,
+                input_tokens=10,
+                output_tokens=5,
+                estimated_cost_usd=0.001,
+            ),
+        ]
+        summary = build_summary(costs)
+        assert summary.total_cost_usd == pytest.approx(0.021)
+        assert summary.costs_by_task["t1"] == pytest.approx(0.02)
+        assert summary.costs_by_task["t2"] == pytest.approx(0.001)
 
 
 class TestFormatSummary:

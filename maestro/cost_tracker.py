@@ -8,6 +8,7 @@ for other agent types.
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,6 +48,21 @@ def has_pricing(agent_type: AgentType) -> bool:
     return agent_type.value in PRICING
 
 
+def effective_cost(cost: TaskCost) -> float | None:
+    """The best-known cost of one TaskCost row, or None if unknown.
+
+    Agent-reported cost wins; the PRICING estimate is trusted only for
+    priced harnesses (announce's 0.0 is an honest zero); an unpriced
+    harness with no report is UNKNOWN — callers reporting to the arbiter
+    must propagate None, never 0.0.
+    """
+    if cost.reported_cost_usd is not None:
+        return cost.reported_cost_usd
+    if has_pricing(cost.agent_type):
+        return cost.estimated_cost_usd
+    return None
+
+
 # =========================================================================
 # Token Usage Data
 # =========================================================================
@@ -58,6 +74,13 @@ class TokenUsage:
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cost_usd: float | None = None
+    """Agent-reported cost in USD (e.g. opencode's per-step ``part.cost``).
+
+    None means the agent did not report a cost — never collapse to 0.0.
+    Only the opencode parser fills this today; claude/codex/aider logs are
+    priced from PRICING downstream.
+    """
 
 
 # =========================================================================
@@ -151,20 +174,24 @@ def parse_opencode_log(log_content: str) -> TokenUsage:
     per-step usage in ``part.tokens`` (verified against a captured real run:
     values are per-step increments, so they are summed across events).
 
-    ``part.tokens.cache.read`` / ``part.tokens.cache.write`` and ``part.cost``
-    are intentionally dropped (tokens-only, spec variant A). The cost-from-log
-    follow-up must NOT bill cache reads at full input price — in real runs
-    ``cache.read`` is on the order of input itself.
+    ``part.tokens.cache.read`` / ``part.tokens.cache.write`` are intentionally
+    dropped: Maestro never computes opencode cost from tokens, so cache reads
+    are never billed at input price. ``part.cost`` IS extracted (summed
+    per-step, same fixture-proven semantics) into ``TokenUsage.cost_usd`` —
+    opencode's own number already prices cache correctly.
 
     Args:
         log_content: Raw log file content (stderr shares the fd, so
             non-JSON noise lines are expected and skipped).
 
     Returns:
-        TokenUsage with input and output (+ reasoning) token sums.
+        TokenUsage with input and output (+ reasoning) token sums, and
+        reported cost if any.
     """
     usage = TokenUsage()
     saw_step_finish = False
+    saw_cost = False
+    cost_total = 0.0
     for raw_line in log_content.splitlines():
         line = raw_line.strip()
         if not line:
@@ -178,14 +205,28 @@ def parse_opencode_log(log_content: str) -> TokenUsage:
         part = event.get("part")
         if not isinstance(part, dict):
             continue
+        saw_step_finish = True
+        cost = part.get("cost")
+        # bool is an int subclass: JSON true must not leak in as $1.00.
+        # Infinity/NaN must not leak in either: Infinity poisons summaries,
+        # NaN fails the TaskCost.reported_cost_usd ge=0.0 check downstream
+        # and silently drops the whole row (including tokens).
+        if (
+            isinstance(cost, (int, float))
+            and not isinstance(cost, bool)
+            and math.isfinite(cost)
+        ):
+            saw_cost = True
+            cost_total += float(cost)
         tokens = part.get("tokens")
         if not isinstance(tokens, dict):
             continue
-        saw_step_finish = True
         usage.input_tokens += int(tokens.get("input") or 0)
         usage.output_tokens += int(tokens.get("output") or 0) + int(
             tokens.get("reasoning") or 0
         )
+    if saw_cost:
+        usage.cost_usd = cost_total
     if log_content.strip() and not saw_step_finish:
         # Format-drift canary: opencode renaming/removing step_finish would
         # otherwise zero out token tracking with no signal at all.
@@ -269,6 +310,7 @@ def create_task_cost(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
         estimated_cost_usd=cost,
+        reported_cost_usd=usage.cost_usd,
         attempt=attempt,
     )
 
@@ -301,7 +343,7 @@ def parse_and_create_cost(
         return None
 
     usage = parse_log(log_content, agent_type)
-    if usage.input_tokens == 0 and usage.output_tokens == 0:
+    if usage.input_tokens == 0 and usage.output_tokens == 0 and usage.cost_usd is None:
         return None
 
     return create_task_cost(task_id, agent_type, usage, attempt)
@@ -338,12 +380,21 @@ def build_summary(costs: list[TaskCost]) -> CostSummary:
     for cost in costs:
         summary.total_input_tokens += cost.input_tokens
         summary.total_output_tokens += cost.output_tokens
-        summary.total_cost_usd += cost.estimated_cost_usd
+        # COALESCE semantics (same as get_cost_summary's SQL): reported
+        # wins; the estimate is the fallback. Summaries stay non-nullable
+        # floats — the None-vs-0 distinction lives only at the
+        # arbiter-outcome boundary (effective_cost).
+        row_cost = (
+            cost.reported_cost_usd
+            if cost.reported_cost_usd is not None
+            else cost.estimated_cost_usd
+        )
+        summary.total_cost_usd += row_cost
         task_ids.add(cost.task_id)
 
         if cost.task_id not in summary.costs_by_task:
             summary.costs_by_task[cost.task_id] = 0.0
-        summary.costs_by_task[cost.task_id] += cost.estimated_cost_usd
+        summary.costs_by_task[cost.task_id] += row_cost
 
     summary.task_count = len(task_ids)
     return summary
@@ -364,7 +415,7 @@ def format_summary(summary: CostSummary) -> str:
         f"Tasks tracked: {summary.task_count}",
         f"Total input tokens: {summary.total_input_tokens:,}",
         f"Total output tokens: {summary.total_output_tokens:,}",
-        f"Total estimated cost: ${summary.total_cost_usd:.4f}",
+        f"Total cost: ${summary.total_cost_usd:.4f}",
     ]
 
     if summary.costs_by_task:
