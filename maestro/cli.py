@@ -39,6 +39,7 @@ from maestro import (
 )
 from maestro import merge_logs as _merge_logs
 from maestro._vendor.obs import init_logging
+from maestro.catalog_cli import models_app
 from maestro.config import load_orchestrator_config
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
@@ -79,6 +80,7 @@ app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
 )
+app.add_typer(models_app, name="models")
 
 
 def _get_status_style(status: TaskStatus) -> str:

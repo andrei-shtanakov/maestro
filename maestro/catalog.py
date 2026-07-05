@@ -29,7 +29,7 @@ from maestro._vendor import obs
 _obs_log = obs.get_logger("maestro.catalog")
 
 _NOT_CONFIGURED_MSG = (
-    "model catalog not configured: set $ATP_CATALOG (or run 'atp models init')"
+    "model catalog not configured: set $ATP_CATALOG (or run 'maestro models init')"
 )
 
 
