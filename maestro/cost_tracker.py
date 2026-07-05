@@ -47,6 +47,21 @@ def has_pricing(agent_type: AgentType) -> bool:
     return agent_type.value in PRICING
 
 
+def effective_cost(cost: TaskCost) -> float | None:
+    """The best-known cost of one TaskCost row, or None if unknown.
+
+    Agent-reported cost wins; the PRICING estimate is trusted only for
+    priced harnesses (announce's 0.0 is an honest zero); an unpriced
+    harness with no report is UNKNOWN — callers reporting to the arbiter
+    must propagate None, never 0.0.
+    """
+    if cost.reported_cost_usd is not None:
+        return cost.reported_cost_usd
+    if has_pricing(cost.agent_type):
+        return cost.estimated_cost_usd
+    return None
+
+
 # =========================================================================
 # Token Usage Data
 # =========================================================================

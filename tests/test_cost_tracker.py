@@ -17,6 +17,7 @@ from maestro.cost_tracker import (
     build_summary,
     calculate_cost,
     create_task_cost,
+    effective_cost,
     format_summary,
     has_pricing,
     parse_and_create_cost,
@@ -332,6 +333,39 @@ class TestHasPricing:
         assert has_pricing(AgentType.CLAUDE_CODE) is True
         assert has_pricing(AgentType.CODEX) is True
         assert has_pricing(AgentType.AIDER) is True
+
+
+class TestEffectiveCost:
+    """effective_cost: reported wins; estimate only for priced harnesses."""
+
+    def test_reported_wins_over_estimate(self) -> None:
+        cost = TaskCost(
+            task_id="t",
+            agent_type=AgentType.CLAUDE_CODE,
+            estimated_cost_usd=0.5,
+            reported_cost_usd=0.02,
+        )
+        assert effective_cost(cost) == pytest.approx(0.02)
+
+    def test_priced_harness_falls_back_to_estimate(self) -> None:
+        cost = TaskCost(
+            task_id="t",
+            agent_type=AgentType.ANNOUNCE,
+            estimated_cost_usd=0.0,
+        )
+        assert effective_cost(cost) == 0.0  # honest zero, not None
+
+    def test_unpriced_unreported_is_unknown(self) -> None:
+        cost = TaskCost(task_id="t", agent_type=AgentType.OPENCODE)
+        assert effective_cost(cost) is None
+
+    def test_unpriced_reported_is_known(self) -> None:
+        cost = TaskCost(
+            task_id="t",
+            agent_type=AgentType.OPENCODE,
+            reported_cost_usd=0.02,
+        )
+        assert effective_cost(cost) == pytest.approx(0.02)
 
 
 class TestParseLog:

@@ -402,3 +402,86 @@ async def test_record_cost_non_enum_routed_harness_falls_back(tmp_path) -> None:
         assert await db.get_task_costs("t1") == []
     finally:
         await db.close()
+
+
+@pytest.mark.anyio
+async def test_build_outcome_reports_reported_cost(tmp_path) -> None:
+    """opencode row WITH agent-reported cost → real dollars to the arbiter."""
+    db = Database(tmp_path / "c.db")
+    await db.connect()
+    try:
+        task = Task(
+            id="t1",
+            title="T",
+            prompt="P",
+            workdir=str(tmp_path),
+            agent_type=AgentType.OPENCODE,
+            status=TaskStatus.DONE,
+        )
+        await db.create_task(task)
+        from maestro.models import TaskCost
+
+        await db.save_task_cost(
+            TaskCost(
+                task_id="t1",
+                agent_type=AgentType.OPENCODE,
+                input_tokens=100,
+                output_tokens=20,
+                estimated_cost_usd=0.0,
+                reported_cost_usd=0.0206,
+                attempt=1,
+            )
+        )
+        scheduler = _make_scheduler(db, tmp_path)
+        outcome = await scheduler._build_outcome(task, exit_code=0)
+        assert outcome.cost_usd == pytest.approx(0.0206)
+        assert outcome.tokens_used == 120
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
+async def test_build_outcome_mixed_known_unknown_rows_is_none(tmp_path) -> None:
+    """Two rows on ONE attempt, one unknown → whole outcome cost is None.
+    (Defensive guard — _build_outcome's matching set spans a single attempt;
+    closes the deferred minor from PR #42's final review.)"""
+    db = Database(tmp_path / "c.db")
+    await db.connect()
+    try:
+        task = Task(
+            id="t1",
+            title="T",
+            prompt="P",
+            workdir=str(tmp_path),
+            agent_type=AgentType.OPENCODE,
+            status=TaskStatus.DONE,
+        )
+        await db.create_task(task)
+        from maestro.models import TaskCost
+
+        await db.save_task_cost(
+            TaskCost(
+                task_id="t1",
+                agent_type=AgentType.CLAUDE_CODE,
+                input_tokens=10,
+                output_tokens=5,
+                estimated_cost_usd=0.001,
+                attempt=1,
+            )
+        )
+        await db.save_task_cost(
+            TaskCost(
+                task_id="t1",
+                agent_type=AgentType.OPENCODE,
+                input_tokens=100,
+                output_tokens=20,
+                estimated_cost_usd=0.0,
+                attempt=1,
+            )
+        )
+        scheduler = _make_scheduler(db, tmp_path)
+        outcome = await scheduler._build_outcome(task, exit_code=0)
+        assert outcome.cost_usd is None
+        assert outcome.tokens_used == 135
+    finally:
+        await db.close()
