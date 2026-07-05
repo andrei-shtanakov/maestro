@@ -164,6 +164,12 @@ ls .github/workflows/
       ambiguity raise.
 - [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral
       conformance test (precedence + alias resolution across Maestro / ATP / arbiter).
+- [ ] `maestro models`: detect the same observed model id under TWO vendors in
+      one manifest — today it renders an unparseable Plane-1 block (two
+      `[models."id"]` tables); update refuses safely via the validation gate
+      (cryptic tomllib message), discover --out writes the broken block while
+      exiting 2. Should become its own report category or fold into
+      vendor_conflicts.
 
 ## opencode follow-ups (ADR-ECO-003c)
 

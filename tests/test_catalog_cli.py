@@ -105,6 +105,25 @@ class TestModelsInit:
         assert "--path" in result.output
         assert "ATP_CATALOG" in result.output
 
+    def test_init_unwritable_parent_fails_with_message_not_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A read-only parent dir must produce a clean exit 1, never a
+        propagated OSError traceback."""
+        monkeypatch.delenv("ATP_CATALOG", raising=False)
+        ro = tmp_path / "ro"
+        ro.mkdir()
+        ro.chmod(0o555)
+        target = ro / "sub" / "cat.toml"
+        try:
+            result = runner.invoke(app, ["models", "init", "--path", str(target)])
+        finally:
+            ro.chmod(0o755)
+        assert result.exit_code == 1
+        assert "cannot write" in result.output
+        assert str(target) in result.output
+        assert "Traceback" not in result.output
+
 
 class TestModelsList:
     def test_list_renders_models_and_agents(
@@ -210,6 +229,23 @@ class TestModelsDiscover:
         assert result2.exit_code == 1
         assert "refusing to overwrite" in result2.output
 
+    def test_out_nonexistent_parent_fails_with_message_not_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--out into a directory that doesn't exist must exit 1 with a
+        message naming the target, never a raw FileNotFoundError traceback."""
+        self._setup(tmp_path, monkeypatch)
+        manifest = _write_manifest(tmp_path / "obs.json", OBSERVED_WITH_NEW)
+        out = tmp_path / "nonexistent-dir" / "block.toml"
+        result = runner.invoke(
+            app,
+            ["models", "discover", "--observed", str(manifest), "--out", str(out)],
+        )
+        assert result.exit_code == 1
+        assert "cannot write" in result.output
+        assert str(out) in result.output
+        assert "Traceback" not in result.output
+
     def test_malformed_manifest_exit_1(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -304,6 +340,27 @@ class TestModelsUpdate:
             app, ["models", "update", "--observed", str(manifest), "--yes"]
         )
         assert result.exit_code == 1
+        assert target.read_bytes() == before
+
+    def test_readonly_parent_fails_with_message_not_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A catalog whose parent dir becomes read-only after setup must
+        exit 1 with a message naming the path, never a raw OSError
+        traceback, and must leave the catalog byte-identical."""
+        target, manifest = self._setup(tmp_path, monkeypatch)
+        before = target.read_bytes()
+        target.parent.chmod(0o555)
+        try:
+            result = runner.invoke(
+                app, ["models", "update", "--observed", str(manifest), "--yes"]
+            )
+        finally:
+            target.parent.chmod(0o755)
+        assert result.exit_code == 1
+        assert "cannot write" in result.output
+        assert str(target) in result.output
+        assert "Traceback" not in result.output
         assert target.read_bytes() == before
 
     def test_fingerprint_mismatch_aborts(

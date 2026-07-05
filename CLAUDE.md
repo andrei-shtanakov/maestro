@@ -80,7 +80,7 @@ uv add --dev <package>
 - **database.py**: SQLite layer with async CRUD, WAL mode (tasks + workstreams tables)
 - **dag.py**: DAG building, cycle detection, topological sort, scope overlap warnings
 - **git.py**: Git operations (branch, rebase, push, worktree, merge)
-- **cli.py**: Typer CLI (run, status, retry, stop, approve, orchestrate, workstreams, workspaces, merge-logs)
+- **cli.py**: Typer CLI (run, status, retry, stop, approve, orchestrate, workstreams, workspaces, merge-logs, models)
 - **scheduler.py**: Main scheduler loop — polls DAG, spawns agents, monitors completion
 - **validator.py**: Post-task validation (run validation_cmd)
 - **retry.py**: Exponential backoff retry logic with jitter

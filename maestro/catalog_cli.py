@@ -72,7 +72,12 @@ def _resolved_catalog_or_exit() -> tuple[Path, Catalog]:
     except CatalogMalformed as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
-    assert catalog is not None  # path existence checked above
+    if catalog is None:  # file vanished between is_file() and load
+        err_console.print(
+            f"[red]catalog configured at {path} but the file is missing[/red]"
+            f" — run 'maestro models init --path {path}' or fix $ATP_CATALOG"
+        )
+        raise typer.Exit(1)
     return path, catalog
 
 
@@ -117,13 +122,21 @@ def _atomic_write_new_file(target: Path, content: str) -> None:
     if target.exists():
         err_console.print(f"[red]{target} already exists[/red] — refusing to overwrite")
         raise typer.Exit(1)
-    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.")
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.")
+    except OSError as exc:
+        err_console.print(f"[red]cannot write {target}: {exc}[/red]")
+        raise typer.Exit(1) from exc
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
         Path(tmp).replace(target)
+    except OSError as exc:
+        Path(tmp).unlink(missing_ok=True)
+        err_console.print(f"[red]cannot write {target}: {exc}[/red]")
+        raise typer.Exit(1) from exc
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
@@ -142,8 +155,8 @@ def models_init(
     if target is None:
         err_console.print("[red]no target[/red]: pass --path or set $ATP_CATALOG")
         raise typer.Exit(1)
-    target.parent.mkdir(parents=True, exist_ok=True)
     try:
+        target.parent.mkdir(parents=True, exist_ok=True)
         # Exclusive create: existence check and write are one atomic
         # operation — no TOCTOU window.
         with target.open("x", encoding="utf-8") as fh:
@@ -151,6 +164,9 @@ def models_init(
     except FileExistsError:
         err_console.print(f"[red]{target} already exists[/red] — refusing to overwrite")
         raise typer.Exit(1) from None
+    except OSError as exc:
+        err_console.print(f"[red]cannot write {target}: {exc}[/red]")
+        raise typer.Exit(1) from exc
     console.print(f"[green]Catalog scaffolded:[/green] {target}")
     console.print("Next steps: edit the file (uncomment / add your models).")
     if os.environ.get("ATP_CATALOG") != str(target):
@@ -288,7 +304,11 @@ def models_update(
 
     # Temp file in the same directory, fsync, fingerprint re-check, atomic
     # replace. Best-effort lost-update guard, not a lock protocol.
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    except OSError as exc:
+        err_console.print(f"[red]cannot write {path}: {exc}[/red]")
+        raise typer.Exit(1) from exc
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(new_content)
@@ -299,6 +319,10 @@ def models_update(
             err_console.print("[red]catalog changed underneath us[/red] — re-run")
             raise typer.Exit(1)
         Path(tmp).replace(path)
+    except OSError as exc:
+        Path(tmp).unlink(missing_ok=True)
+        err_console.print(f"[red]cannot write {path}: {exc}[/red]")
+        raise typer.Exit(1) from exc
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
