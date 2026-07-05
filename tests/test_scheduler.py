@@ -1691,14 +1691,19 @@ class TestSchedulerD2Gate:
     async def test_non_enum_harness_with_spawner_spawns(
         self, temp_db_path: Path, temp_dir: Path
     ) -> None:
-        """PROOF OF D2: 'opencode' is not an AgentType member, but has a spawner."""
-        spawner = MockSpawner("opencode")
+        """PROOF OF D2: 'fakeharness' is not an AgentType member, but has a spawner.
+
+        (Originally used 'opencode' as the example; opencode became a real
+        AgentType member when it was wired in, so the proof harness must stay
+        a name that never joins the enum.)
+        """
+        spawner = MockSpawner("fakeharness")
         db, _ = await self._run(
-            temp_db_path, temp_dir, {"opencode": spawner}, "opencode@glm-5.1"
+            temp_db_path, temp_dir, {"fakeharness": spawner}, "fakeharness@some-model"
         )
         try:
             assert spawner.spawn_count == 1  # previously HOLD via ValueError
-            assert spawner.spawned_models == ["glm-5.1"]
+            assert spawner.spawned_models == ["some-model"]
         finally:
             await db.close()
 

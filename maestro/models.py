@@ -76,6 +76,9 @@ class AgentType(StrEnum):
     CODEX = "codex_cli"
     AIDER = "aider"
     ANNOUNCE = "announce"
+    OPENCODE = "opencode"
+    """Bare name on purpose (vs codex_cli / claude_code): it is the tool's
+    real CLI name and the catalog harness id (ADR-ECO-003c). Do not suffix."""
     AUTO = "auto"
     """Routing sentinel: arbiter decides the real agent. NOT a spawnable agent.
 

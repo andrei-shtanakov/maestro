@@ -250,7 +250,7 @@ class TestAgentType:
 
     def test_all_agent_types_exist(self) -> None:
         """Verify all expected agent types are defined."""
-        expected = {"claude_code", "codex_cli", "aider", "announce", "auto"}
+        expected = {"claude_code", "codex_cli", "aider", "announce", "opencode", "auto"}
         actual = {a.value for a in AgentType}
         assert actual == expected
 

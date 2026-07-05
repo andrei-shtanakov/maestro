@@ -5,6 +5,7 @@ from maestro.spawners.announce import AnnounceSpawner
 from maestro.spawners.base import AgentSpawner
 from maestro.spawners.claude_code import ClaudeCodeSpawner
 from maestro.spawners.codex import CodexSpawner
+from maestro.spawners.opencode import OpencodeSpawner
 from maestro.spawners.registry import (
     SpawnerNotFoundError,
     SpawnerRegistry,
@@ -18,6 +19,7 @@ __all__ = [
     "AnnounceSpawner",
     "ClaudeCodeSpawner",
     "CodexSpawner",
+    "OpencodeSpawner",
     "SpawnerNotFoundError",
     "SpawnerRegistry",
     "create_default_registry",

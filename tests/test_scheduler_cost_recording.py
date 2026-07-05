@@ -177,3 +177,94 @@ async def test_failure_path_records_cost_at_attempt_one(tmp_path) -> None:
         assert refetched.retry_count == 1
     finally:
         await db.close()
+
+
+@pytest.mark.anyio
+async def test_build_outcome_unpriced_harness_reports_cost_none(
+    tmp_path,
+) -> None:
+    """opencode (no PRICING entry): cost 0.0 would read as 'free' to
+    cost-aware routing (R-07 'route cheapest sufficient'), so _build_outcome
+    must report cost_usd=None (unknown) while still reporting real tokens."""
+    db = Database(tmp_path / "c.db")
+    await db.connect()
+    try:
+        task = Task(
+            id="t1",
+            title="T",
+            prompt="P",
+            workdir=str(tmp_path),
+            agent_type=AgentType.OPENCODE,
+            status=TaskStatus.DONE,
+        )
+        await db.create_task(task)
+
+        scheduler = Scheduler(
+            db=db,
+            dag=DAG([]),
+            spawners={},
+            config=SchedulerConfig(workdir=tmp_path, log_dir=tmp_path / "logs"),
+        )
+
+        from maestro.models import TaskCost
+
+        await db.save_task_cost(
+            TaskCost(
+                task_id="t1",
+                agent_type=AgentType.OPENCODE,
+                input_tokens=250,
+                output_tokens=55,
+                estimated_cost_usd=0.0,  # unpriced harness records 0.0
+                attempt=1,
+            )
+        )
+
+        outcome = await scheduler._build_outcome(task, exit_code=0)
+        assert outcome.tokens_used == 305  # tokens are real and reported
+        assert outcome.cost_usd is None  # cost is UNKNOWN, not free
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
+async def test_build_outcome_announce_zero_cost_stays_zero(
+    tmp_path,
+) -> None:
+    """announce IS in PRICING at (0.0, 0.0) — an honest zero, not unknown."""
+    db = Database(tmp_path / "c.db")
+    await db.connect()
+    try:
+        task = Task(
+            id="t1",
+            title="T",
+            prompt="P",
+            workdir=str(tmp_path),
+            agent_type=AgentType.ANNOUNCE,
+            status=TaskStatus.DONE,
+        )
+        await db.create_task(task)
+
+        scheduler = Scheduler(
+            db=db,
+            dag=DAG([]),
+            spawners={},
+            config=SchedulerConfig(workdir=tmp_path, log_dir=tmp_path / "logs"),
+        )
+
+        from maestro.models import TaskCost
+
+        await db.save_task_cost(
+            TaskCost(
+                task_id="t1",
+                agent_type=AgentType.ANNOUNCE,
+                input_tokens=0,
+                output_tokens=0,
+                estimated_cost_usd=0.0,
+                attempt=1,
+            )
+        )
+
+        outcome = await scheduler._build_outcome(task, exit_code=0)
+        assert outcome.cost_usd == 0.0
+    finally:
+        await db.close()

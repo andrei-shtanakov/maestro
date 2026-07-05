@@ -30,7 +30,7 @@ from maestro.coordination.routing import (
     StaticRouting,
     task_status_to_outcome_status,
 )
-from maestro.cost_tracker import parse_and_create_cost
+from maestro.cost_tracker import has_pricing, parse_and_create_cost
 from maestro.dag import DAG
 from maestro.database import Database
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
@@ -369,7 +369,12 @@ class Scheduler:
         matching = [r for r in rows if r.attempt == attempt]
         if matching:
             tokens_used = sum(r.input_tokens + r.output_tokens for r in matching)
-            cost_usd = sum(r.estimated_cost_usd for r in matching)
+            if all(has_pricing(r.agent_type) for r in matching):
+                cost_usd = sum(r.estimated_cost_usd for r in matching)
+            # else: an unpriced harness (opencode) is in the mix — its cost
+            # is UNKNOWN, not 0.0. cost_usd stays None; the arbiter client
+            # omits None from the payload, so cost-aware routing reads
+            # "unknown" instead of "free".
 
         error_code: str | None = None
         if task.error_message:

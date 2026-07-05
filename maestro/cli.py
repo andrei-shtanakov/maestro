@@ -53,7 +53,12 @@ from maestro.preflight import (
     validate_project,
 )
 from maestro.scaffold import ScaffoldError, generate_project_yaml
-from maestro.spawners import AiderSpawner, AnnounceSpawner, CodexSpawner
+from maestro.spawners import (
+    AiderSpawner,
+    AnnounceSpawner,
+    CodexSpawner,
+    OpencodeSpawner,
+)
 from maestro.spawners.base import AgentSpawner  # noqa: TC001 — runtime use
 from maestro.workspace import WorkspaceManager
 
@@ -392,15 +397,16 @@ async def _run_scheduler(
                     "[yellow]No existing tasks found, starting fresh[/yellow]"
                 )
 
-        # Setup spawners — all four built-ins so YAML configs with
-        # agent_type: codex_cli / aider / announce work out of the box,
-        # matching what examples/hello.yaml, examples/tasks.yaml, and
-        # the arbiter policy tree's agent set expect.
+        # Setup spawners — all five built-ins so YAML configs with
+        # agent_type: codex_cli / aider / announce / opencode work out of
+        # the box, matching what examples/hello.yaml, examples/tasks.yaml,
+        # and the arbiter policy tree's agent set expect.
         spawners: dict[str, AgentSpawner] = {
             "claude_code": ClaudeCodeSpawner(),
             "codex_cli": CodexSpawner(),
             "aider": AiderSpawner(),
             "announce": AnnounceSpawner(),
+            "opencode": OpencodeSpawner(),
         }
 
         # Determine log directory

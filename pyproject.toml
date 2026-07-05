@@ -46,6 +46,7 @@ claude_code = "maestro.spawners.claude_code:ClaudeCodeSpawner"
 codex_cli = "maestro.spawners.codex:CodexSpawner"
 aider = "maestro.spawners.aider:AiderSpawner"
 announce = "maestro.spawners.announce:AnnounceSpawner"
+opencode = "maestro.spawners.opencode:OpencodeSpawner"
 
 [tool.uv]
 package = true

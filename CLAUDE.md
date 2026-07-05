@@ -91,7 +91,7 @@ uv add --dev <package>
 - **pr_manager.py**: GitHub PR creation via `gh` CLI
 
 **Subpackages:**
-- **spawners/**: AgentSpawner ABC + implementations (claude_code, codex_cli, aider, announce) + registry. An opencode spawner module (`opencode run -m opencode/<model>`, first open-model agentic harness, ADR-ECO-003c) exists but is not yet registered as a selectable agent type (no entry point / default-set wiring)
+- **spawners/**: AgentSpawner ABC + implementations (claude_code, codex_cli, aider, announce, opencode) + registry. opencode (`opencode run --format json -m opencode/<model>`, ADR-ECO-003c) is the first open-model agentic harness: open models (glm-5.1, qwen3.6, …) reach routing as `opencode@<model>`. Its cost is reported to the arbiter as unknown (`cost_usd=None`, not 0.0) until cost-from-log lands
 - **coordination/**: MCP server (FastMCP) + REST API (FastAPI) with /workstreams endpoints; Arbiter routing (`routing.py` strategies, vendored `arbiter_client.py` MCP client, `arbiter_errors.py`)
 - **benchmark/**: R-06b/R-07 benchmark-aware routing — async runner, ATP client, spawner→responder adapter, and Arbiter feedback wiring (`arbiter_report.py`)
 - **notifications/**: Desktop notifications (macOS/Linux)

@@ -164,3 +164,24 @@ ls .github/workflows/
       ambiguity raise.
 - [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral
       conformance test (precedence + alias resolution across Maestro / ATP / arbiter).
+
+## opencode follow-ups (ADR-ECO-003c)
+
+- [ ] Cost-from-log: surface `part.cost` (and optionally cache_read/cache_write)
+      from opencode JSONL into TaskCost/TaskOutcome instead of PRICING-based 0.
+      Constraint (recorded in parse_opencode_log docstring): cache_read must
+      NOT be billed at full input price — in real runs cache_read ~= input.
+      Until then opencode reports cost_usd=None (unknown) to the arbiter.
+- [ ] opencode entry in the ecosystem SSOT catalog (atp-platform/method/
+      agents-catalog.toml) — cross-repo; the test fixture already carries
+      harness=opencode / glm-5.1.
+- [ ] Routed-path token telemetry: `parse_and_create_cost` keys the parser off
+      the DECLARED `task.agent_type` (scheduler.py), so a task routed to
+      opencode (`agent_type: auto`, or an authoritative arbiter override)
+      never reaches `parse_opencode_log` — token usage is silently zero and
+      the drift canary is bypassed. `cost_usd` stays None on that path, so
+      router honesty holds; only the token signal is lost. Pre-existing
+      structural gap (a claude→codex override mis-parses the same way).
+      Fix alongside cost-from-log: dispatch the parser by EFFECTIVE harness
+      (`harness_of_agent_id(task.routed_agent_type)` fallback) at the same
+      call site.
