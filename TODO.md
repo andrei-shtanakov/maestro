@@ -157,13 +157,19 @@ ls .github/workflows/
 
 - [ ] XDG default catalog path ($XDG_CONFIG_HOME/<eco>/agents-catalog.toml) once the
       <eco> namespace is ratified; extend `resolve_catalog_path`.
-- [ ] `maestro models init | list | discover | update` CLI (ADR-003b D3).
+- [x] `maestro models init | list | discover | update` CLI (ADR-003b D3) (closed by feat/models-cli).
 - [ ] Shared `CLAUDE_MODEL` / `CODEX_MODEL` cross-tool override layer.
 - [ ] `default = true` field in the catalog `[[agents]]` schema to disambiguate the
       A/B window (cross-repo, PM-owned) — removes the `HarnessModelUnresolved`
       ambiguity raise.
 - [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral
       conformance test (precedence + alias resolution across Maestro / ATP / arbiter).
+- [ ] `maestro models`: detect the same observed model id under TWO vendors in
+      one manifest — today it renders an unparseable Plane-1 block (two
+      `[models."id"]` tables); update refuses safely via the validation gate
+      (cryptic tomllib message), discover --out writes the broken block while
+      exiting 2. Should become its own report category or fold into
+      vendor_conflicts.
 
 ## opencode follow-ups (ADR-ECO-003c)
 
@@ -173,9 +179,14 @@ ls .github/workflows/
       NOT be billed at full input price — in real runs cache_read ~= input.
       Until then opencode reports cost_usd=None (unknown) to the arbiter.
       (closed by feat/cost-from-log)
-- [ ] opencode entry in the ecosystem SSOT catalog (atp-platform/method/
+- [x] opencode entry in the ecosystem SSOT catalog (atp-platform/method/
       agents-catalog.toml) — cross-repo; the test fixture already carries
       harness=opencode / glm-5.1.
+      Verified 2026-07-05: atp-platform/method/agents-catalog.toml has
+      [harnesses.opencode] + one routable [[agents]] opencode/glm-5.1
+      (promoted 2026-07-03, gate 003a D4) + two Path B non-routable entries;
+      Maestro's loader resolves default_model_for_harness('opencode') ==
+      'glm-5.1' against it. Done upstream by the atp-platform actor.
 - [x] Routed-path token telemetry: `parse_and_create_cost` keys the parser off
       the DECLARED `task.agent_type` (scheduler.py), so a task routed to
       opencode (`agent_type: auto`, or an authoritative arbiter override)

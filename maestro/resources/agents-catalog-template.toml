@@ -1,0 +1,38 @@
+# Maestro model catalog (user-runtime; ADR-ECO-003b).
+#
+# One file, three readers: Maestro, ATP, and arbiter all resolve this file
+# via $ATP_CATALOG. Edit it to declare the models YOUR instance may use —
+# nothing here is vendored into any tool; you own this file.
+#
+# Plane 1 — models this instance knows about:
+#   [models."<model-id>"]
+#   vendor  = "<vendor>"        # anthropic / openai / zai / ...
+#   status  = "active"          # active | deprecated | retired
+#   aliases = ["<other-id>"]    # optional
+#
+# Plane 3 — which (harness, model) pairs are enrolled:
+#   [[agents]]
+#   harness  = "claude_code"    # claude_code | codex_cli | aider | opencode
+#   model    = "<model-id>"
+#   tested   = true
+#   routable = true             # exactly ONE routable entry per harness
+#
+# `maestro models discover --observed <manifest.json>` proposes additions;
+# `maestro models update` applies them (Plane 1 only — enrolling a model
+# for routing is your editorial decision).
+
+# Required schema scaffolding — keep this table header even when empty.
+# (TOML note: this bare header must stay ABOVE any [models."..."] entry.)
+[models]
+
+# Examples — uncomment and adapt:
+#
+# [models."claude-sonnet-4-6"]
+# vendor = "anthropic"
+# status = "active"
+#
+# [[agents]]
+# harness  = "claude_code"
+# model    = "claude-sonnet-4-6"
+# tested   = true
+# routable = true
