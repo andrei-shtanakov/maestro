@@ -40,6 +40,12 @@ uv run maestro init                          # Scaffold project.yaml from cwd
 uv run maestro validate project.yaml         # Preflight: cycles, scope overlap, repo sanity
 uv run maestro validate project.yaml --strict --no-fs  # CI mode, no filesystem access
 
+# === Model catalog management (ADR-ECO-003b D3) ===
+uv run maestro models init --path ~/.config/atp/agents-catalog.toml   # Scaffold user catalog
+uv run maestro models list                                            # Show resolved catalog
+uv run maestro models discover --observed observed.json               # Propose additions (exit 2 = new found)
+uv run maestro models update --observed observed.json --dry-run       # Apply proposals (Plane 1 only)
+
 # === Log utilities ===
 uv run maestro merge-logs <pipeline-dir>     # Time-sort per-pid JSONL into merged.jsonl
 
@@ -69,6 +75,8 @@ uv add --dev <package>
 - **models.py**: Pydantic models (Task, TaskStatus, Workstream, WorkstreamStatus, OrchestratorConfig)
 - **config.py**: YAML parsing with defaults merging, env var substitution, `load_orchestrator_config()`
 - **catalog.py**: Model catalog loader (ADR-ECO-003b). `resolve_model()` applies the precedence `routed > MAESTRO_<H>_MODEL > catalog-default > fail-loud`; the catalog (loaded from `$ATP_CATALOG`, no baked default) supplies only the last-resort *default* layer, used when neither a routed model nor the env var provides one. Also emits a status-graded coherence warning. Fault taxonomy by blast radius: `CatalogError` (global — halts the run) vs `HarnessModelUnresolved` (per-task — sends that task to `NEEDS_REVIEW`)
+- **catalog_discovery.py**: Pure diff logic for `maestro models` — observed-manifest contract (missing vendor key = not observed; empty list = observed-and-empty), alias-aware new-model detection, vendor-conflict reporting, TOML-escaped Plane-1 rendering
+- **catalog_cli.py**: `maestro models init|list|discover|update` Typer sub-app (ADR-ECO-003b D3) — init from the shipped inert template (`maestro/resources/`), read-only discover (public exit contract 0/2/1), update via validate-then-atomic-replace
 - **database.py**: SQLite layer with async CRUD, WAL mode (tasks + workstreams tables)
 - **dag.py**: DAG building, cycle detection, topological sort, scope overlap warnings
 - **git.py**: Git operations (branch, rebase, push, worktree, merge)

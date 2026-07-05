@@ -87,7 +87,10 @@ Two new modules + a Typer sub-app; `cli.py` gains only the registration line.
   loaded via `importlib.resources` (package `maestro.resources` gets an
   `__init__.py`). Content: header comment explaining the schema and the
   three-reader contract ($ATP_CATALOG shared by Maestro/ATP/arbiter), plus
-  FULLY COMMENTED-OUT example `[models."..."]` and `[[agents]]` entries.
+  FULLY COMMENTED-OUT example `[models."..."]` and `[[agents]]` entries,
+  plus one UNCOMMENTED bare `[models]` table header — `Catalog.models` is a
+  required field, so the empty table is schema scaffolding the loader needs
+  (it is not an active-model endorsement).
   Invariant (tested): the template parses as valid TOML and validates into
   an EMPTY `Catalog` (no models, no agents) — a fresh init resolves nothing,
   preserving fail-loud and shipping no active-model endorsement in the wheel
