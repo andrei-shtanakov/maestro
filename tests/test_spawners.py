@@ -15,6 +15,7 @@ from maestro.spawners import (
     ClaudeCodeSpawner,
     CodexSpawner,
 )
+from maestro.spawners.opencode import OpencodeSpawner, _qualify
 
 
 # =============================================================================
@@ -781,6 +782,12 @@ def announce_spawner() -> AnnounceSpawner:
     return AnnounceSpawner()
 
 
+@pytest.fixture
+def opencode_spawner() -> OpencodeSpawner:
+    """Provide an opencode spawner instance."""
+    return OpencodeSpawner()
+
+
 # =============================================================================
 # Unit Tests: CodexSpawner
 # =============================================================================
@@ -990,6 +997,170 @@ class TestCodexSpawner:
         assert sample_task.title in prompt
         assert sample_task.prompt in prompt
         assert context in prompt
+
+
+# =============================================================================
+# Unit Tests: _qualify (opencode model prefix)
+# =============================================================================
+
+
+class TestQualify:
+    """_qualify: bare model ids get opencode's provider prefix."""
+
+    def test_bare_id_gets_prefix(self) -> None:
+        assert _qualify("glm-5.1") == "opencode/glm-5.1"
+
+    def test_provider_qualified_id_passes_through(self) -> None:
+        assert _qualify("zai/glm-5.1") == "zai/glm-5.1"
+
+
+# =============================================================================
+# Unit Tests: OpencodeSpawner
+# =============================================================================
+
+
+class TestOpencodeSpawner:
+    """Tests for OpencodeSpawner."""
+
+    def test_agent_type(self, opencode_spawner: OpencodeSpawner) -> None:
+        """Test that agent_type returns correct value."""
+        assert opencode_spawner.agent_type == "opencode"
+
+    def test_opencode_available_when_in_path(
+        self,
+        opencode_spawner: OpencodeSpawner,
+    ) -> None:
+        """Test is_available returns True when opencode is in PATH."""
+        with patch(
+            "maestro.spawners.opencode.shutil.which",
+            return_value="/opt/homebrew/bin/opencode",
+        ):
+            assert opencode_spawner.is_available() is True
+
+    def test_opencode_unavailable_when_not_in_path(
+        self,
+        opencode_spawner: OpencodeSpawner,
+    ) -> None:
+        """Test is_available returns False when opencode is not in PATH."""
+        with patch(
+            "maestro.spawners.opencode.shutil.which",
+            return_value=None,
+        ):
+            assert opencode_spawner.is_available() is False
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_creates_process_with_correct_args(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        opencode_spawner: OpencodeSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+        catalog_env: Path,
+    ) -> None:
+        """Catalog default resolves and is provider-qualified on the argv."""
+        mock_process = MagicMock()
+        mock_popen.return_value = mock_process
+        mock_os_open.return_value = 42
+
+        log_file = temp_dir / "task.log"
+        workdir = Path(sample_task.workdir)
+
+        result = opencode_spawner.spawn(sample_task, "ctx", workdir, log_file)
+
+        mock_popen.assert_called_once()
+        call_args = mock_popen.call_args
+        cmd = call_args[0][0]
+
+        assert cmd[0] == "opencode"
+        assert cmd[1] == "run"
+        assert "--format" in cmd
+        assert cmd[cmd.index("--format") + 1] == "json"
+        # Fixture catalog default glm-5.1, prefixed for the CLI:
+        assert cmd[cmd.index("-m") + 1] == "opencode/glm-5.1"
+        assert call_args[1]["cwd"] == workdir
+        assert call_args[1]["stdout"] == 42
+        assert call_args[1]["stderr"] == subprocess.STDOUT
+        mock_os_close.assert_called_once_with(42)
+        assert result == mock_process
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_model_override_from_env(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        opencode_spawner: OpencodeSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+        catalog_env: Path,
+    ) -> None:
+        """MAESTRO_OPENCODE_MODEL overrides the catalog default."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+        workdir = Path(sample_task.workdir)
+
+        with patch.dict(os.environ, {"MAESTRO_OPENCODE_MODEL": "qwen3.6"}):
+            opencode_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("-m") + 1] == "opencode/qwen3.6"
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_routed_model_beats_env(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        opencode_spawner: OpencodeSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+        catalog_env: Path,
+    ) -> None:
+        """Precedence routed > env: routed model overrides MAESTRO_OPENCODE_MODEL."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+        workdir = Path(sample_task.workdir)
+
+        with patch.dict(os.environ, {"MAESTRO_OPENCODE_MODEL": "env-model"}):
+            opencode_spawner.spawn(
+                sample_task, "", workdir, temp_dir / "t.log", model="glm-5.1"
+            )
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("-m") + 1] == "opencode/glm-5.1"
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_provider_qualified_routed_model_not_double_prefixed(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        opencode_spawner: OpencodeSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+        catalog_env: Path,
+    ) -> None:
+        """A routed 'provider/model' id passes through _qualify unchanged."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+        workdir = Path(sample_task.workdir)
+
+        opencode_spawner.spawn(
+            sample_task, "", workdir, temp_dir / "t.log", model="zai/glm-5.1"
+        )
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("-m") + 1] == "zai/glm-5.1"
 
 
 # =============================================================================

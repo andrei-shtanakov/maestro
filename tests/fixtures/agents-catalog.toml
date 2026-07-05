@@ -27,3 +27,13 @@ harness  = "codex_cli"
 model    = "gpt-5.5"
 tested   = true
 routable = true
+
+[models."glm-5.1"]
+vendor = "zai"
+status = "active"
+
+[[agents]]
+harness  = "opencode"
+model    = "glm-5.1"
+tested   = true
+routable = true
