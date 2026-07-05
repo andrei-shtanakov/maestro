@@ -1,5 +1,6 @@
 """Tests for the SpawnerRegistry module."""
 
+import importlib.metadata
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from maestro.spawners import (
     AnnounceSpawner,
     ClaudeCodeSpawner,
     CodexSpawner,
+    OpencodeSpawner,
     SpawnerNotFoundError,
     SpawnerRegistry,
     create_default_registry,
@@ -429,6 +431,15 @@ class TestEntryPointDiscovery:
         assert count == 0
         assert len(registry) == 0
 
+    def test_installed_entry_points_include_all_builtins(self) -> None:
+        """The installed distribution registers all five built-in spawners
+        under the maestro.spawners entry-point group (real metadata, no mock).
+        Guards the pyproject wiring — the cli.py default dict and this group
+        are dual registration sources that must not diverge."""
+        eps = importlib.metadata.entry_points(group="maestro.spawners")
+        names = {ep.name for ep in eps}
+        assert {"claude_code", "codex_cli", "aider", "announce", "opencode"} <= names
+
 
 # =============================================================================
 # Unit Tests: Directory Discovery
@@ -456,14 +467,16 @@ class TestDirectoryDiscovery:
         """Test that directory discovery finds all built-in spawners."""
         count = registry.discover_from_directory()
 
-        assert count >= 4
+        assert count >= 5
         assert "claude_code" in registry
         assert "codex_cli" in registry
         assert "aider" in registry
         assert "announce" in registry
+        assert "opencode" in registry
         assert isinstance(registry.get_spawner("codex_cli"), CodexSpawner)
         assert isinstance(registry.get_spawner("aider"), AiderSpawner)
         assert isinstance(registry.get_spawner("announce"), AnnounceSpawner)
+        assert isinstance(registry.get_spawner("opencode"), OpencodeSpawner)
 
     def test_discover_from_directory_custom_path(
         self,
