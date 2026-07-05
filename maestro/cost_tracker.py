@@ -58,6 +58,13 @@ class TokenUsage:
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cost_usd: float | None = None
+    """Agent-reported cost in USD (e.g. opencode's per-step ``part.cost``).
+
+    None means the agent did not report a cost — never collapse to 0.0.
+    Only the opencode parser fills this today; claude/codex/aider logs are
+    priced from PRICING downstream.
+    """
 
 
 # =========================================================================
@@ -151,20 +158,24 @@ def parse_opencode_log(log_content: str) -> TokenUsage:
     per-step usage in ``part.tokens`` (verified against a captured real run:
     values are per-step increments, so they are summed across events).
 
-    ``part.tokens.cache.read`` / ``part.tokens.cache.write`` and ``part.cost``
-    are intentionally dropped (tokens-only, spec variant A). The cost-from-log
-    follow-up must NOT bill cache reads at full input price — in real runs
-    ``cache.read`` is on the order of input itself.
+    ``part.tokens.cache.read`` / ``part.tokens.cache.write`` are intentionally
+    dropped: Maestro never computes opencode cost from tokens, so cache reads
+    are never billed at input price. ``part.cost`` IS extracted (summed
+    per-step, same fixture-proven semantics) into ``TokenUsage.cost_usd`` —
+    opencode's own number already prices cache correctly.
 
     Args:
         log_content: Raw log file content (stderr shares the fd, so
             non-JSON noise lines are expected and skipped).
 
     Returns:
-        TokenUsage with input and output (+ reasoning) token sums.
+        TokenUsage with input and output (+ reasoning) token sums, and
+        reported cost if any.
     """
     usage = TokenUsage()
     saw_step_finish = False
+    saw_cost = False
+    cost_total = 0.0
     for raw_line in log_content.splitlines():
         line = raw_line.strip()
         if not line:
@@ -178,14 +189,21 @@ def parse_opencode_log(log_content: str) -> TokenUsage:
         part = event.get("part")
         if not isinstance(part, dict):
             continue
+        saw_step_finish = True
+        cost = part.get("cost")
+        # bool is an int subclass: JSON true must not leak in as $1.00.
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            saw_cost = True
+            cost_total += float(cost)
         tokens = part.get("tokens")
         if not isinstance(tokens, dict):
             continue
-        saw_step_finish = True
         usage.input_tokens += int(tokens.get("input") or 0)
         usage.output_tokens += int(tokens.get("output") or 0) + int(
             tokens.get("reasoning") or 0
         )
+    if saw_cost:
+        usage.cost_usd = cost_total
     if log_content.strip() and not saw_step_finish:
         # Format-drift canary: opencode renaming/removing step_finish would
         # otherwise zero out token tracking with no signal at all.

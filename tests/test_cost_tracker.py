@@ -263,6 +263,61 @@ class TestOpencodeLogParsing:
         assert usage.input_tokens == 1
         assert usage.output_tokens == 2
 
+    def test_parse_real_fixture_sums_cost(self) -> None:
+        """Real captured run: per-step part.cost summed across step_finish.
+
+        Literal computed with jq independently of the parser:
+        0.0170512 + 0.00359536 = 0.02064656. Per-step semantics proven by
+        the same fixture argument as tokens: step 2's cost (0.00359536) is
+        LESS than step 1's (0.0170512) — impossible for a cumulative counter.
+        """
+        usage = parse_opencode_log(self.FIXTURE.read_text(encoding="utf-8"))
+        assert usage.cost_usd == pytest.approx(0.02064656, rel=1e-9)
+
+    def test_no_cost_reported_is_none_not_zero(self) -> None:
+        """A run whose steps carry no cost → cost_usd is None (unknown)."""
+        log = (
+            '{"type": "step_finish", "part": {"tokens": {"input": 10, "output": 5}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.cost_usd is None
+        assert usage.input_tokens == 10  # tokens still parsed
+
+    def test_null_cost_skipped(self) -> None:
+        log = (
+            '{"type": "step_finish", "part": {"cost": null, "tokens": '
+            '{"input": 1, "output": 1}}}\n'
+        )
+        assert parse_opencode_log(log).cost_usd is None
+
+    def test_bool_cost_ignored(self) -> None:
+        """bool is an int subclass in Python; JSON true must not become $1."""
+        log = (
+            '{"type": "step_finish", "part": {"cost": true, "tokens": '
+            '{"input": 1, "output": 1}}}\n'
+        )
+        assert parse_opencode_log(log).cost_usd is None
+
+    def test_partial_cost_sums_available_steps(self) -> None:
+        """One step with cost, one without → total is the one reported value."""
+        log = (
+            '{"type": "step_finish", "part": {"cost": 0.01, "tokens": '
+            '{"input": 10, "output": 2}}}\n'
+            '{"type": "step_finish", "part": {"tokens": '
+            '{"input": 5, "output": 1}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.cost_usd == pytest.approx(0.01)
+        assert usage.input_tokens == 15
+
+    def test_cost_only_step_without_tokens_counted(self) -> None:
+        """A step_finish with cost but no tokens dict still contributes cost."""
+        log = '{"type": "step_finish", "part": {"cost": 0.02}}\n'
+        usage = parse_opencode_log(log)
+        assert usage.cost_usd == pytest.approx(0.02)
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
+
 
 class TestHasPricing:
     """PRICING membership = "this harness has a priced rate card"."""
