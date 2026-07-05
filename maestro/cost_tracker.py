@@ -287,6 +287,7 @@ def create_task_cost(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
         estimated_cost_usd=cost,
+        reported_cost_usd=usage.cost_usd,
         attempt=attempt,
     )
 
@@ -319,7 +320,7 @@ def parse_and_create_cost(
         return None
 
     usage = parse_log(log_content, agent_type)
-    if usage.input_tokens == 0 and usage.output_tokens == 0:
+    if usage.input_tokens == 0 and usage.output_tokens == 0 and usage.cost_usd is None:
         return None
 
     return create_task_cost(task_id, agent_type, usage, attempt)

@@ -866,6 +866,14 @@ class TaskCost(BaseModel):
     estimated_cost_usd: float = Field(
         default=0.0, ge=0.0, description="Estimated cost in USD"
     )
+    reported_cost_usd: float | None = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Agent-reported cost in USD (e.g. opencode part.cost); "
+            "None when the agent did not report one"
+        ),
+    )
     attempt: int = Field(default=1, ge=1, description="Retry attempt number")
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),

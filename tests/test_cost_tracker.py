@@ -444,6 +444,17 @@ class TestCreateTaskCost:
         cost = create_task_cost("task-002", AgentType.CODEX, usage, attempt=3)
         assert cost.attempt == 3
 
+    def test_create_task_cost_carries_reported_cost(self) -> None:
+        usage = TokenUsage(input_tokens=10, output_tokens=5, cost_usd=0.02)
+        cost = create_task_cost("t1", AgentType.OPENCODE, usage)
+        assert cost.reported_cost_usd == pytest.approx(0.02)
+        assert cost.estimated_cost_usd == 0.0  # unpriced harness estimate
+
+    def test_create_task_cost_no_reported_cost(self) -> None:
+        usage = TokenUsage(input_tokens=10, output_tokens=5)
+        cost = create_task_cost("t1", AgentType.CLAUDE_CODE, usage)
+        assert cost.reported_cost_usd is None
+
 
 class TestParseAndCreateCost:
     """Tests for the parse_and_create_cost convenience function."""
@@ -484,6 +495,20 @@ class TestParseAndCreateCost:
         log_file.write_text('{"result": "done"}')
         result = parse_and_create_cost("task-001", AgentType.CLAUDE_CODE, log_file)
         assert result is None
+
+    def test_parse_and_create_cost_only_log_still_creates_row(
+        self, temp_dir: Path
+    ) -> None:
+        """Zero tokens + reported cost is still a row (relaxed gate)."""
+        log_file = temp_dir / "t.log"
+        log_file.write_text(
+            '{"type": "step_finish", "part": {"cost": 0.02}}\n',
+            encoding="utf-8",
+        )
+        cost = parse_and_create_cost("t1", AgentType.OPENCODE, log_file)
+        assert cost is not None
+        assert cost.reported_cost_usd == pytest.approx(0.02)
+        assert cost.input_tokens == 0
 
 
 # =============================================================================

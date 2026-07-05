@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS task_costs (
     input_tokens INTEGER DEFAULT 0,
     output_tokens INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0.0,
+    reported_cost_usd REAL,
     attempt INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
@@ -266,6 +267,7 @@ def _row_to_task_cost(row: aiosqlite.Row) -> TaskCost:
         input_tokens=row["input_tokens"],
         output_tokens=row["output_tokens"],
         estimated_cost_usd=row["estimated_cost_usd"],
+        reported_cost_usd=row["reported_cost_usd"],
         attempt=row["attempt"],
         created_at=_parse_datetime(row["created_at"]) or datetime.now(UTC),
     )
@@ -382,6 +384,11 @@ class Database:
                 3,
                 "r06b_rename_zadachi_to_workstreams",
                 self._migrate_rename_zadachi_to_workstreams,
+            ),
+            (
+                4,
+                "cost_from_log_reported_cost",
+                self._migrate_task_costs_reported_cost,
             ),
         ]
 
@@ -519,6 +526,20 @@ class Database:
         await self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_workstreams_status ON workstreams(status)"
         )
+
+    async def _migrate_task_costs_reported_cost(self) -> None:
+        """cost-from-log: add `reported_cost_usd` to an older `task_costs`.
+
+        NULL for all pre-existing rows — consumers COALESCE to the estimate.
+        Idempotent via PRAGMA table_info (same shape as the R-02 migration).
+        """
+        assert self._connection is not None  # narrowed by caller
+        cursor = await self._connection.execute("PRAGMA table_info(task_costs)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "reported_cost_usd" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE task_costs ADD COLUMN reported_cost_usd REAL"
+            )
 
     @asynccontextmanager
     async def transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:
@@ -1536,8 +1557,8 @@ class Database:
             """
             INSERT INTO task_costs (
                 task_id, agent_type, input_tokens, output_tokens,
-                estimated_cost_usd, attempt, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                estimated_cost_usd, reported_cost_usd, attempt, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 cost.task_id,
@@ -1545,6 +1566,7 @@ class Database:
                 cost.input_tokens,
                 cost.output_tokens,
                 cost.estimated_cost_usd,
+                cost.reported_cost_usd,
                 cost.attempt,
                 _format_datetime(cost.created_at),
             ),
