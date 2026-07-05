@@ -6,9 +6,113 @@
         "claude_code",
         "codex_cli",
         "aider",
-        "announce"
+        "announce",
+        "opencode",
+        "auto"
       ],
       "title": "AgentType",
+      "type": "string"
+    },
+    "ArbiterConfig": {
+      "additionalProperties": false,
+      "description": "Configuration for the Arbiter MCP integration.\n\nValidated on YAML load. `enabled=false` (default) keeps Maestro on the\nzero-config StaticRouting path; no arbiter subprocess ever started.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/$defs/ArbiterMode",
+          "default": "advisory"
+        },
+        "optional": {
+          "default": false,
+          "title": "Optional",
+          "type": "boolean"
+        },
+        "binary_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Binary Path"
+        },
+        "config_dir": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Config Dir"
+        },
+        "tree_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tree Path"
+        },
+        "db_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Db Path"
+        },
+        "timeout_ms": {
+          "default": 500,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "reconnect_interval_s": {
+          "default": 60,
+          "minimum": 1,
+          "title": "Reconnect Interval S",
+          "type": "integer"
+        },
+        "abandon_outcome_after_s": {
+          "default": 300,
+          "minimum": 1,
+          "title": "Abandon Outcome After S",
+          "type": "integer"
+        },
+        "log_level": {
+          "default": "warn",
+          "title": "Log Level",
+          "type": "string"
+        }
+      },
+      "title": "ArbiterConfig",
+      "type": "object"
+    },
+    "ArbiterMode": {
+      "description": "Arbiter routing authority.\n\nADVISORY \u2014 explicit `agent_type` in task config is honored; arbiter is\nconsulted for learning signal and can HOLD/REJECT on invariants.\nAUTHORITATIVE \u2014 arbiter's `chosen_agent` overrides user declaration.",
+      "enum": [
+        "advisory",
+        "authoritative"
+      ],
+      "title": "ArbiterMode",
       "type": "string"
     },
     "Complexity": {
@@ -357,6 +461,18 @@
       ],
       "default": null,
       "description": "Notification configuration"
+    },
+    "arbiter": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ArbiterConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional arbiter integration. When omitted/None the scheduler stays on zero-config StaticRouting and no subprocess is spawned."
     }
   },
   "required": [
