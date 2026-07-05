@@ -8,6 +8,7 @@ for other agent types.
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -207,7 +208,14 @@ def parse_opencode_log(log_content: str) -> TokenUsage:
         saw_step_finish = True
         cost = part.get("cost")
         # bool is an int subclass: JSON true must not leak in as $1.00.
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        # Infinity/NaN must not leak in either: Infinity poisons summaries,
+        # NaN fails the TaskCost.reported_cost_usd ge=0.0 check downstream
+        # and silently drops the whole row (including tokens).
+        if (
+            isinstance(cost, (int, float))
+            and not isinstance(cost, bool)
+            and math.isfinite(cost)
+        ):
             saw_cost = True
             cost_total += float(cost)
         tokens = part.get("tokens")
@@ -407,7 +415,7 @@ def format_summary(summary: CostSummary) -> str:
         f"Tasks tracked: {summary.task_count}",
         f"Total input tokens: {summary.total_input_tokens:,}",
         f"Total output tokens: {summary.total_output_tokens:,}",
-        f"Total estimated cost: ${summary.total_cost_usd:.4f}",
+        f"Total cost: ${summary.total_cost_usd:.4f}",
     ]
 
     if summary.costs_by_task:

@@ -187,3 +187,10 @@ ls .github/workflows/
       (`harness_of_agent_id(task.routed_agent_type)` fallback) at the same
       call site.
       (closed by feat/cost-from-log)
+- [ ] Recovery-path reported cost: `_reconstruct_outcome` (recovery.py) always
+      reports cost_usd=None even when a persisted TaskCost row with
+      reported_cost_usd exists for the crashed attempt — honest-unknown, but
+      real dollars the DB already holds are lost on crash-recovery reports.
+- [ ] Responder `cost or None` (spawner_responder.py) collapses a genuine
+      reported $0.00 into None ("confirmed free" reads as "unknown") — becomes
+      real when free/local open models run under opencode.

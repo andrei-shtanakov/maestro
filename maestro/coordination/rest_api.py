@@ -124,6 +124,7 @@ class TaskCostResponse(BaseModel):
     input_tokens: int
     output_tokens: int
     estimated_cost_usd: float
+    reported_cost_usd: float | None = None
     attempt: int
     created_at: str
 
@@ -137,6 +138,7 @@ class TaskCostResponse(BaseModel):
             input_tokens=cost.input_tokens,
             output_tokens=cost.output_tokens,
             estimated_cost_usd=cost.estimated_cost_usd,
+            reported_cost_usd=cost.reported_cost_usd,
             attempt=cost.attempt,
             created_at=cost.created_at.isoformat(),
         )

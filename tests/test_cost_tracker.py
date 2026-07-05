@@ -319,6 +319,26 @@ class TestOpencodeLogParsing:
         assert usage.input_tokens == 0
         assert usage.output_tokens == 0
 
+    def test_infinity_cost_ignored(self) -> None:
+        """Infinity must not leak in and poison downstream summaries."""
+        log = (
+            '{"type": "step_finish", "part": {"cost": Infinity, "tokens": '
+            '{"input": 1, "output": 1}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.cost_usd is None
+        assert usage.input_tokens == 1
+
+    def test_nan_cost_ignored(self) -> None:
+        """NaN must not fail the downstream ge=0.0 check and drop the row."""
+        log = (
+            '{"type": "step_finish", "part": {"cost": NaN, "tokens": '
+            '{"input": 1, "output": 1}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.cost_usd is None
+        assert usage.input_tokens == 1
+
 
 class TestHasPricing:
     """PRICING membership = "this harness has a priced rate card"."""
