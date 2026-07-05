@@ -1,0 +1,9 @@
+{
+  "_meta": {
+    "purpose": "Example observed-models manifest for `maestro models discover|update`.",
+    "how_to_fill": "By hand from provider docs/CLIs, or by a scheduled collector. Keys are vendors as in the catalog's Plane 1.",
+    "note": "A MISSING vendor key means 'not observed this run' (no deprecation candidates); an EMPTY list means 'observed, offers no models'."
+  },
+  "anthropic": ["claude-sonnet-4-6", "claude-opus-4-8"],
+  "openai": ["gpt-5.5"]
+}

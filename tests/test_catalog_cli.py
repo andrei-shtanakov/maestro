@@ -1,5 +1,6 @@
 """Tests for the `maestro models` CLI (ADR-ECO-003b D3)."""
 
+import json
 import subprocess
 import tomllib
 import zipfile
@@ -151,3 +152,182 @@ class TestModelsList:
         result = runner.invoke(app, ["models", "list"])
         assert result.exit_code == 1
         assert "corrupt" in result.output
+
+
+OBSERVED_UP_TO_DATE = {"openai": ["gpt-5.5"]}
+OBSERVED_WITH_NEW = {"openai": ["gpt-5.5", "gpt-6"]}
+
+
+def _write_manifest(path: Path, data: object) -> Path:
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+class TestModelsDiscover:
+    def _setup(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        target = tmp_path / "agents-catalog.toml"
+        _write_catalog(target, MINIMAL_CATALOG)
+        monkeypatch.setenv("ATP_CATALOG", str(target))
+        return target
+
+    def test_up_to_date_exit_0(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        manifest = _write_manifest(tmp_path / "obs.json", OBSERVED_UP_TO_DATE)
+        result = runner.invoke(app, ["models", "discover", "--observed", str(manifest)])
+        assert result.exit_code == 0
+        assert "up to date" in result.output
+
+    def test_new_models_exit_2_with_block(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        catalog_path = self._setup(tmp_path, monkeypatch)
+        before = catalog_path.read_text(encoding="utf-8")
+        manifest = _write_manifest(tmp_path / "obs.json", OBSERVED_WITH_NEW)
+        result = runner.invoke(app, ["models", "discover", "--observed", str(manifest)])
+        assert result.exit_code == 2
+        assert '[models."gpt-6"]' in result.output
+        # discover never edits the catalog
+        assert catalog_path.read_text(encoding="utf-8") == before
+
+    def test_out_writes_block_and_refuses_existing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        manifest = _write_manifest(tmp_path / "obs.json", OBSERVED_WITH_NEW)
+        out = tmp_path / "block.toml"
+        result = runner.invoke(
+            app,
+            ["models", "discover", "--observed", str(manifest), "--out", str(out)],
+        )
+        assert result.exit_code == 2
+        assert '[models."gpt-6"]' in out.read_text(encoding="utf-8")
+        result2 = runner.invoke(
+            app,
+            ["models", "discover", "--observed", str(manifest), "--out", str(out)],
+        )
+        assert result2.exit_code == 1
+        assert "refusing to overwrite" in result2.output
+
+    def test_malformed_manifest_exit_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        manifest = _write_manifest(tmp_path / "obs.json", {"openai": "gpt"})
+        result = runner.invoke(app, ["models", "discover", "--observed", str(manifest)])
+        assert result.exit_code == 1
+        assert "openai" in result.output
+
+    def test_vendor_conflict_warned(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        manifest = _write_manifest(tmp_path / "obs.json", {"someone-else": ["gpt-5.5"]})
+        result = runner.invoke(app, ["models", "discover", "--observed", str(manifest)])
+        assert result.exit_code == 0  # conflict alone does not change exit
+        assert "conflict" in result.output.lower()
+
+
+class TestModelsUpdate:
+    def _setup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[Path, Path]:
+        target = tmp_path / "agents-catalog.toml"
+        _write_catalog(target, MINIMAL_CATALOG)
+        monkeypatch.setenv("ATP_CATALOG", str(target))
+        manifest = _write_manifest(tmp_path / "obs.json", OBSERVED_WITH_NEW)
+        return target, manifest
+
+    def test_dry_run_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target, manifest = self._setup(tmp_path, monkeypatch)
+        before = target.read_text(encoding="utf-8")
+        result = runner.invoke(
+            app,
+            ["models", "update", "--observed", str(manifest), "--dry-run"],
+        )
+        assert result.exit_code == 0
+        assert '[models."gpt-6"]' in result.output
+        assert target.read_text(encoding="utf-8") == before
+
+    def test_yes_appends_and_second_run_noop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target, manifest = self._setup(tmp_path, monkeypatch)
+        before = target.read_text(encoding="utf-8")
+        result = runner.invoke(
+            app, ["models", "update", "--observed", str(manifest), "--yes"]
+        )
+        assert result.exit_code == 0
+        after = target.read_text(encoding="utf-8")
+        # existing bytes preserved verbatim as prefix
+        assert after.startswith(before)
+        assert '[models."gpt-6"]' in after
+        # result still loads as a valid catalog
+        cat = Catalog.model_validate(tomllib.loads(after))
+        assert "gpt-6" in cat.models
+        # idempotent: second run applies nothing
+        result2 = runner.invoke(
+            app, ["models", "update", "--observed", str(manifest), "--yes"]
+        )
+        assert result2.exit_code == 0
+        assert "nothing to apply" in result2.output
+        assert target.read_text(encoding="utf-8") == after
+
+    def test_declined_confirm_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target, manifest = self._setup(tmp_path, monkeypatch)
+        before = target.read_text(encoding="utf-8")
+        result = runner.invoke(
+            app, ["models", "update", "--observed", str(manifest)], input="n\n"
+        )
+        assert result.exit_code == 1
+        assert target.read_text(encoding="utf-8") == before
+
+    def test_invalid_result_refused_file_untouched(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If the composed content would not validate, nothing touches disk.
+        Simulated by corrupting the renderer's output."""
+        target, manifest = self._setup(tmp_path, monkeypatch)
+        before = target.read_bytes()
+        monkeypatch.setattr(
+            "maestro.catalog_cli.render_plane1_block",
+            lambda _: "[models.unclosed\n",
+        )
+        result = runner.invoke(
+            app, ["models", "update", "--observed", str(manifest), "--yes"]
+        )
+        assert result.exit_code == 1
+        assert target.read_bytes() == before
+
+    def test_fingerprint_mismatch_aborts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A concurrent writer between read and replace is detected."""
+        target, manifest = self._setup(tmp_path, monkeypatch)
+        import maestro.catalog_cli as cli_mod
+
+        original_render = cli_mod.render_plane1_block
+
+        def mutate_then_render(new_models):
+            target.write_text(
+                target.read_text(encoding="utf-8") + "\n# sneaky edit\n",
+                encoding="utf-8",
+            )
+            return original_render(new_models)
+
+        monkeypatch.setattr(cli_mod, "render_plane1_block", mutate_then_render)
+        result = runner.invoke(
+            app, ["models", "update", "--observed", str(manifest), "--yes"]
+        )
+        assert result.exit_code == 1
+        assert "changed underneath" in result.output
+        assert "# sneaky edit" in target.read_text(encoding="utf-8")

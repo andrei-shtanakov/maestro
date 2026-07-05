@@ -6,7 +6,12 @@ provider manifest and propose/apply Plane-1 additions. Plane 2/3 are never
 written by any command here.
 """
 
+import hashlib
+import json
 import os
+import tempfile
+import tomllib
+from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 
@@ -19,6 +24,13 @@ from maestro.catalog import (
     CatalogMalformed,
     load_catalog,
     resolve_catalog_path,
+)
+from maestro.catalog_discovery import (
+    DiscoveryReport,
+    ManifestInvalid,
+    diff_catalog,
+    parse_observed_manifest,
+    render_plane1_block,
 )
 
 
@@ -62,6 +74,59 @@ def _resolved_catalog_or_exit() -> tuple[Path, Catalog]:
         raise typer.Exit(1) from exc
     assert catalog is not None  # path existence checked above
     return path, catalog
+
+
+def _parse_manifest_or_exit(observed: Path) -> dict[str, list[str]]:
+    try:
+        raw = json.loads(observed.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        err_console.print(f"[red]cannot read manifest {observed}[/red]: {exc}")
+        raise typer.Exit(1) from exc
+    try:
+        return parse_observed_manifest(raw)
+    except ManifestInvalid as exc:
+        err_console.print(f"[red]invalid manifest[/red]: {exc}")
+        raise typer.Exit(1) from exc
+
+
+def _print_report(report: DiscoveryReport) -> None:
+    for conflict in report.vendor_conflicts:
+        err_console.print(
+            f"[bold yellow]WARNING vendor conflict:[/bold yellow] "
+            f"{conflict.model_id!r} is cataloged under "
+            f"{conflict.catalog_vendor!r} but observed under "
+            f"{conflict.observed_vendor!r} — not touching it"
+        )
+    if report.already_present:
+        for hit in report.already_present:
+            via = f" (alias of {hit.matched})" if hit.via_alias else ""
+            console.print(f"already present: {hit.model_id}{via}")
+    if report.deprecation_candidates:
+        console.print(
+            "[yellow]deprecation candidates[/yellow] "
+            "(review by hand — this tool never edits existing entries):"
+        )
+        for cand in report.deprecation_candidates:
+            console.print(f"  {cand.model_id} ({cand.vendor})")
+    if report.new_models:
+        console.print(f"new models: {len(report.new_models)}")
+
+
+def _atomic_write_new_file(target: Path, content: str) -> None:
+    """Atomically create `target`; refuses an existing file."""
+    if target.exists():
+        err_console.print(f"[red]{target} already exists[/red] — refusing to overwrite")
+        raise typer.Exit(1)
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        Path(tmp).replace(target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 @models_app.command("init")
@@ -128,3 +193,113 @@ def models_list() -> None:
                 str(agent.routable),
             )
         console.print(agents_table)
+
+
+@models_app.command("discover")
+def models_discover(
+    observed: Path = typer.Option(
+        ...,
+        "--observed",
+        help="Observed-models manifest: JSON {vendor: [model_id, ...]}.",
+    ),
+    out: Path | None = typer.Option(
+        None,
+        "--out",
+        help="Write the proposed Plane-1 TOML block here (never the catalog).",
+    ),
+) -> None:
+    """Compare observed provider offerings with the user catalog. Read-only.
+
+    Exit codes (public contract): 0 = catalog up to date, 2 = new models
+    found (a CI signal, not an error), 1 = error.
+    """
+    _path, catalog = _resolved_catalog_or_exit()
+    manifest = _parse_manifest_or_exit(observed)
+    report = diff_catalog(catalog, manifest)
+    _print_report(report)
+    if not report.new_models:
+        console.print("[green]catalog is up to date[/green]")
+        return
+    block = render_plane1_block(report.new_models)
+    # Use console.file.write to bypass Rich's markup interpretation of [...]
+    console.file.write(block)
+    if out is not None:
+        _atomic_write_new_file(out, block)
+        console.print(f"proposed block written to {out}")
+    raise typer.Exit(2)
+
+
+@models_app.command("update")
+def models_update(
+    observed: Path = typer.Option(
+        ...,
+        "--observed",
+        help="Observed-models manifest: JSON {vendor: [model_id, ...]}.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be appended; write nothing."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the confirmation prompt (CI/scripting)."
+    ),
+) -> None:
+    """Apply discover's proposals: append new Plane-1 entries to the catalog.
+
+    Never modifies existing entries and never touches [[agents]] — enrolling
+    a model for routing stays your editorial decision.
+    """
+    path, catalog = _resolved_catalog_or_exit()
+    manifest = _parse_manifest_or_exit(observed)
+    report = diff_catalog(catalog, manifest)
+    _print_report(report)
+    if not report.new_models:
+        console.print("nothing to apply — catalog is up to date")
+        return
+
+    original = path.read_bytes()
+    fingerprint = hashlib.sha256(original).hexdigest()
+
+    block = render_plane1_block(report.new_models)
+    # Use console.file.write to bypass Rich's markup interpretation of [...]
+    console.file.write(block)
+    if dry_run:
+        console.print("[yellow]dry-run[/yellow]: no changes written")
+        return
+    if not yes and not typer.confirm(
+        f"Append {len(report.new_models)} model(s) to {path}?"
+    ):
+        err_console.print("aborted — no changes written")
+        raise typer.Exit(1)
+
+    header = (
+        f"\n# added by maestro models update {datetime.now(UTC).date().isoformat()}\n"
+    )
+    new_content = original.decode("utf-8") + header + block
+
+    # Validate the FULL future content in memory BEFORE anything touches
+    # disk — an update must not be able to leave the catalog invalid.
+    try:
+        Catalog.model_validate(tomllib.loads(new_content))
+    except Exception as exc:
+        err_console.print(
+            f"[red]refusing to write: result would be invalid[/red]: {exc}"
+        )
+        raise typer.Exit(1) from exc
+
+    # Temp file in the same directory, fsync, fingerprint re-check, atomic
+    # replace. Best-effort lost-update guard, not a lock protocol.
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(new_content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        current = hashlib.sha256(path.read_bytes()).hexdigest()
+        if current != fingerprint:
+            err_console.print("[red]catalog changed underneath us[/red] — re-run")
+            raise typer.Exit(1)
+        Path(tmp).replace(path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    console.print(f"[green]added {len(report.new_models)} model(s) to {path}[/green]")
