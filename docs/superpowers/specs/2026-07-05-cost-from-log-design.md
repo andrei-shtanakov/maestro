@@ -40,6 +40,9 @@ claude_code (`total_cost_usd` in Claude CLI JSON) is a later iteration.
   - A `step_finish` without a numeric `cost` (missing / null / non-numeric)
     contributes nothing. If NO step reported a numeric cost, the total is
     None (unknown), not 0.0.
+  - "Numeric" guard: `isinstance(v, (int, float)) and not isinstance(v,
+    bool)` — in Python `bool` IS an `int` subclass and `float(True) == 1.0`,
+    so JSON `"cost": true` would otherwise leak in as $1.00. Test required.
   - Token extraction, drift canary, and malformed-line skipping are
     unchanged.
 - claude_code / codex / aider parsers are untouched; their `TokenUsage`
@@ -93,7 +96,16 @@ effective(row) = row.reported_cost_usd        if not None
 ```
 
 `cost_usd = sum(effective(r))` when EVERY matching row is known; None if any
-row is unknown. Consequences:
+row is unknown.
+
+Attempt scoping (review clarification): `matching` is filtered by
+`r.attempt == attempt` (scheduler.py:369) — the set covers ONE attempt, so an
+unknown-cost attempt never zeroes out a different attempt's known cost; each
+outcome reports its own attempt. The any-unknown→None rule is therefore a
+defensive guard for the theoretical multiple-rows-per-attempt case, not a
+practical cross-attempt interaction.
+
+Consequences:
 
 - Routed/declared opencode with `part.cost` in the log → the arbiter gets
   real dollars.
@@ -123,8 +135,9 @@ stays as the final guard.
 - Parser: real-fixture literal for summed cost — computed with jq
   independently of the parser: 0.0170512 + 0.00359536 = **0.02064656**
   (assert with `pytest.approx`). Edge cases: no cost in any step → None;
-  explicit `"cost": null` → skipped; cost present in one step only →
-  partial sum with that value; tokens still parsed when cost absent.
+  explicit `"cost": null` → skipped; `"cost": true` → ignored (bool is not
+  numeric); cost present in one step only → partial sum with that value;
+  tokens still parsed when cost absent.
 - Migration: a database created with the pre-#4 schema gains the column on
   connect; `schema_migrations` gets the (4, name) row; fresh DBs work; both
   paths round-trip a `TaskCost` with `reported_cost_usd` set and None.
@@ -158,11 +171,31 @@ stays as the final guard.
   `parse_log`'s existing blanket except.
 - Old DB rows have `reported_cost_usd IS NULL` → COALESCE falls back to the
   estimate everywhere; no backfill needed.
-- `TaskCost.agent_type` for routed tasks changes meaning from "declared" to
-  "effective" — acceptable: the column documents who ran; no existing
-  consumer relies on it being the declared type (verify with grep during
-  implementation; the only readers are `_build_outcome`, summaries, and
-  tests).
+- A cost-only row (zero tokens, reported cost) makes the outcome carry
+  `tokens_used=0` rather than None. Accepted: opencode in practice always
+  reports tokens alongside cost, so this occurs only for hypothetical
+  log shapes; not worth a special case.
+
+## Known limitation: `TaskCost.agent_type` semantics change at the migration
+boundary
+
+For routed tasks the column's meaning changes from "declared agent_type" to
+"effective harness" — WITHOUT backfill, so the column is heterogeneous
+across the boundary: pre-migration routed rows carry the declared type,
+post-migration rows carry who actually ran. Reader audit (grep performed
+2026-07-05, before implementation):
+
+- `scheduler.py:372` `has_pricing(r.agent_type)` in `_build_outcome` —
+  WANTS effective (that is the point of the change); old heterogeneous rows
+  only affect outcomes of already-terminal tasks, which are never rebuilt.
+- `database.py:1544` — INSERT (writer, not a reader).
+- `coordination/rest_api.py:136` — per-row display serialization; a
+  pre-migration routed row shows the declared type. Cosmetic.
+- No `GROUP BY agent_type` exists anywhere (database.py, rest_api.py), and
+  `CostSummary`/`build_summary` do not read `agent_type` at all — there are
+  NO per-agent historical aggregates to contaminate.
+
+Recorded as a known limitation, accepted without backfill.
 
 ## Out of scope
 
