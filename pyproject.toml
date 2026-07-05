@@ -59,6 +59,9 @@ build-backend = "setuptools.build_meta"
 where = ["."]
 include = ["maestro*"]
 
+[tool.setuptools.package-data]
+"maestro.resources" = ["*.toml"]
+
 [tool.pyrefly]
 project-includes = [
     "**/*.py*",
