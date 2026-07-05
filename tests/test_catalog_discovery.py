@@ -136,6 +136,27 @@ class TestDiffCatalog:
         report = diff_catalog(cat, {"anthropic": ["claude-sonnet-latest"]})
         assert report.deprecation_candidates == []
 
+    def test_alias_vendor_mismatch_is_conflict(self) -> None:
+        """An alias observed under a DIFFERENT vendor is a conflict, not a hit."""
+        cat = _catalog(
+            **{"claude-x": CatalogModel(vendor="anthropic", aliases=["shared-id"])}
+        )
+        report = diff_catalog(cat, {"openai": ["shared-id"]})
+        assert report.already_present == []
+        assert report.new_models == []
+        assert len(report.vendor_conflicts) == 1
+        conflict = report.vendor_conflicts[0]
+        assert conflict.catalog_vendor == "anthropic"
+        assert conflict.observed_vendor == "openai"
+
+    def test_alias_same_vendor_still_present(self) -> None:
+        cat = _catalog(
+            **{"claude-x": CatalogModel(vendor="anthropic", aliases=["shared-id"])}
+        )
+        report = diff_catalog(cat, {"anthropic": ["shared-id"]})
+        assert report.vendor_conflicts == []
+        assert report.already_present[0].via_alias is True
+
     def test_deprecated_entry_not_reproposed_as_new(self) -> None:
         cat = _catalog(
             **{"legacy-mini": CatalogModel(vendor="openai", status="deprecated")}

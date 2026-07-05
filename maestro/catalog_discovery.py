@@ -108,6 +108,9 @@ def diff_catalog(
     key (missing key = "vendor not observed this run" — a partial manifest
     must never mass-flag a vendor), checkable, the entry active, and
     neither the id nor any of its aliases observed for that vendor.
+
+    Alias matches are vendor-checked too: an alias observed under a
+    different vendor than its owner is a vendor conflict, not a hit.
     """
     models = catalog.models if catalog is not None else {}
     alias_owner: dict[str, str] = {}
@@ -129,9 +132,16 @@ def diff_catalog(
                         AlreadyPresent(model_id, model_id, via_alias=False)
                     )
             elif model_id in alias_owner:
-                report.already_present.append(
-                    AlreadyPresent(model_id, alias_owner[model_id], via_alias=True)
-                )
+                owner_key = alias_owner[model_id]
+                owner_vendor = models[owner_key].vendor
+                if owner_vendor != vendor:
+                    report.vendor_conflicts.append(
+                        VendorConflict(model_id, owner_vendor, vendor)
+                    )
+                else:
+                    report.already_present.append(
+                        AlreadyPresent(model_id, owner_key, via_alias=True)
+                    )
             else:
                 report.new_models.append(NewModel(model_id, vendor))
 
