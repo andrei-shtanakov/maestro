@@ -30,6 +30,22 @@ PRICING: dict[str, tuple[float, float]] = {
     "announce": (0.0, 0.0),
 }
 
+# opencode is deliberately absent: it is an open-model harness whose price
+# depends on the routed model, so Maestro cannot price it from a static
+# per-harness table. Absence from PRICING == "unpriced" (see has_pricing);
+# outcome reporting turns the resulting 0.0 into cost_usd=None so
+# cost-aware routing reads it as *unknown*, never as *free*.
+
+
+def has_pricing(agent_type: AgentType) -> bool:
+    """True if the harness has a rate card in PRICING.
+
+    announce's (0.0, 0.0) is an honest zero (it runs no model); a harness
+    absent from PRICING (opencode) has UNKNOWN cost — callers reporting
+    cost to the arbiter must send None, not 0.0.
+    """
+    return agent_type.value in PRICING
+
 
 # =========================================================================
 # Token Usage Data
@@ -128,6 +144,55 @@ def _extract_usage_from_dict(data: object) -> TokenUsage:
     return TokenUsage()
 
 
+def parse_opencode_log(log_content: str) -> TokenUsage:
+    """Parse opencode ``run --format json`` JSONL output for token usage.
+
+    opencode emits one JSON event per line; ``step_finish`` events carry
+    per-step usage in ``part.tokens`` (verified against a captured real run:
+    values are per-step increments, so they are summed across events).
+
+    ``part.tokens.cache_read`` / ``cache_write`` and ``part.cost`` are
+    intentionally dropped (tokens-only, spec variant A). The cost-from-log
+    follow-up must NOT bill cache_read at full input price — in real runs
+    cache_read is on the order of input itself.
+
+    Args:
+        log_content: Raw log file content (stderr shares the fd, so
+            non-JSON noise lines are expected and skipped).
+
+    Returns:
+        TokenUsage with input and output (+ reasoning) token sums.
+    """
+    usage = TokenUsage()
+    saw_step_finish = False
+    for raw_line in log_content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "step_finish":
+            continue
+        part = event.get("part")
+        if not isinstance(part, dict):
+            continue
+        tokens = part.get("tokens")
+        if not isinstance(tokens, dict):
+            continue
+        saw_step_finish = True
+        usage.input_tokens += int(tokens.get("input", 0))
+        usage.output_tokens += int(tokens.get("output", 0)) + int(
+            tokens.get("reasoning", 0)
+        )
+    if log_content.strip() and not saw_step_finish:
+        # Format-drift canary: opencode renaming/removing step_finish would
+        # otherwise zero out token tracking with no signal at all.
+        logger.debug("opencode log had no step_finish events — format drift?")
+    return usage
+
+
 def parse_log(log_content: str, agent_type: AgentType) -> TokenUsage:
     """Parse agent log content to extract token usage.
 
@@ -144,6 +209,7 @@ def parse_log(log_content: str, agent_type: AgentType) -> TokenUsage:
         AgentType.CLAUDE_CODE: parse_claude_code_log,
         AgentType.CODEX: parse_claude_code_log,
         AgentType.AIDER: parse_claude_code_log,
+        AgentType.OPENCODE: parse_opencode_log,
     }
 
     parser = parsers.get(agent_type)

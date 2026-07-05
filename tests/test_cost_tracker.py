@@ -18,9 +18,11 @@ from maestro.cost_tracker import (
     calculate_cost,
     create_task_cost,
     format_summary,
+    has_pricing,
     parse_and_create_cost,
     parse_claude_code_log,
     parse_log,
+    parse_opencode_log,
 )
 from maestro.database import Database, create_database
 from maestro.models import AgentType, Task, TaskCost, TaskStatus
@@ -163,6 +165,110 @@ class TestClaudeCodeLogParsing:
         assert usage.output_tokens == 200
 
 
+class TestOpencodeLogParsing:
+    """Tests for opencode `run --format json` JSONL parsing."""
+
+    FIXTURE = Path(__file__).parent / "fixtures" / "opencode_run.jsonl"
+
+    def test_parse_real_fixture_sums_step_finish(self) -> None:
+        """Real captured run: per-step tokens summed across step_finish events.
+
+        Expected literals were computed with jq over the fixture (independent
+        of this parser), so this is not a tautology. Guards the per-step (not
+        cumulative) aggregation verdict from the fixture-capture task.
+        """
+        usage = parse_opencode_log(self.FIXTURE.read_text(encoding="utf-8"))
+        assert usage.input_tokens == 11940
+        assert usage.output_tokens == 201
+
+    def test_reasoning_counted_into_output(self) -> None:
+        log = (
+            '{"type": "step_finish", "part": {"tokens": '
+            '{"input": 10, "output": 5, "reasoning": 7}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.input_tokens == 10
+        assert usage.output_tokens == 12
+
+    def test_multiple_steps_summed(self) -> None:
+        log = (
+            '{"type": "step_finish", "part": {"tokens": '
+            '{"input": 100, "output": 20, "reasoning": 0}}}\n'
+            '{"type": "tool_use", "part": {"name": "read"}}\n'
+            '{"type": "step_finish", "part": {"tokens": '
+            '{"input": 150, "output": 30, "reasoning": 5}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.input_tokens == 250
+        assert usage.output_tokens == 55
+
+    def test_malformed_lines_skipped(self) -> None:
+        log = (
+            "stderr noise: model warming up\n"
+            "{not json at all\n"
+            '{"type": "step_finish", "part": {"tokens": '
+            '{"input": 10, "output": 5}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.input_tokens == 10
+        assert usage.output_tokens == 5
+
+    def test_missing_tokens_fields_default_zero(self) -> None:
+        log = '{"type": "step_finish", "part": {"tokens": {"output": 3}}}\n'
+        usage = parse_opencode_log(log)
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 3
+
+    def test_non_step_finish_events_ignored(self) -> None:
+        log = (
+            '{"type": "step_start", "part": {}}\n'
+            '{"type": "error", "part": {"tokens": {"input": 999, "output": 999}}}\n'
+        )
+        assert parse_opencode_log(log) == TokenUsage()
+
+    def test_empty_log(self) -> None:
+        assert parse_opencode_log("") == TokenUsage()
+
+    def test_nonempty_log_without_step_finish_logs_drift_canary(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Format-drift canary: non-empty log, zero step_finish → debug log,
+        so a silent event rename in opencode doesn't quietly zero tracking."""
+        import logging
+
+        log = '{"type": "step_done", "part": {"tokens": {"input": 5}}}\n'
+        with caplog.at_level(logging.DEBUG, logger="maestro.cost_tracker"):
+            usage = parse_opencode_log(log)
+        assert usage == TokenUsage()
+        assert "no step_finish" in caplog.text
+
+    def test_step_finish_without_part_tokens_skipped(self) -> None:
+        log = (
+            '{"type": "step_finish"}\n'
+            '{"type": "step_finish", "part": {}}\n'
+            '{"type": "step_finish", "part": {"tokens": '
+            '{"input": 1, "output": 2}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.input_tokens == 1
+        assert usage.output_tokens == 2
+
+
+class TestHasPricing:
+    """PRICING membership = "this harness has a priced rate card"."""
+
+    def test_opencode_is_unpriced(self) -> None:
+        assert has_pricing(AgentType.OPENCODE) is False
+
+    def test_announce_zero_is_an_honest_price(self) -> None:
+        assert has_pricing(AgentType.ANNOUNCE) is True
+
+    def test_priced_harnesses(self) -> None:
+        assert has_pricing(AgentType.CLAUDE_CODE) is True
+        assert has_pricing(AgentType.CODEX) is True
+        assert has_pricing(AgentType.AIDER) is True
+
+
 class TestParseLog:
     """Tests for the generic parse_log dispatcher."""
 
@@ -192,6 +298,16 @@ class TestParseLog:
         usage = parse_log("anything", AgentType.ANNOUNCE)
         assert usage.input_tokens == 0
         assert usage.output_tokens == 0
+
+    def test_parse_log_opencode(self) -> None:
+        """parse_log dispatches OPENCODE to the JSONL parser."""
+        log = (
+            '{"type": "step_finish", "part": {"tokens": '
+            '{"input": 10, "output": 5, "reasoning": 1}}}\n'
+        )
+        usage = parse_log(log, AgentType.OPENCODE)
+        assert usage.input_tokens == 10
+        assert usage.output_tokens == 6
 
 
 # =============================================================================
@@ -235,6 +351,12 @@ class TestCostCalculation:
         # input: 1000 * $3/1M = $0.003, output: 500 * $15/1M = $0.0075
         expected = 0.003 + 0.0075
         assert abs(cost - expected) < 0.0001
+
+    def test_calculate_cost_opencode_unpriced_is_zero(self) -> None:
+        """No PRICING entry → calculate_cost falls back to 0.0 (TaskCost rows
+        keep recording 0.0); outcome reporting turns that into None upstream."""
+        usage = TokenUsage(input_tokens=1_000_000, output_tokens=1_000_000)
+        assert calculate_cost(usage, AgentType.OPENCODE) == 0.0
 
 
 class TestCreateTaskCost:
