@@ -172,6 +172,29 @@ async def test_responder_nonzero_exit_reports_error(tmp_path) -> None:
 
 
 @pytest.mark.anyio
+async def test_reported_cost_preferred_over_pricing(tmp_path) -> None:
+    """When the parsed usage carries agent-reported cost, the responder
+    forwards it instead of the PRICING estimate (0.0 for opencode)."""
+    log_content = (
+        '{"type": "step_finish", "part": {"cost": 0.02, "tokens": '
+        '{"input": 100, "output": 20, "reasoning": 0}}}'
+    )
+    spawner = FakeSpawner(agent_type_str="opencode", log_content=log_content)
+    responder = SpawnerResponder(
+        spawner=spawner,
+        workdir=tmp_path,
+        log_dir=tmp_path,
+        timeout_seconds=5.0,
+    )
+
+    response = await responder.respond("write hello world")
+
+    assert response.error is None
+    assert response.cost_usd == pytest.approx(0.02)
+    assert response.tokens_used == 120
+
+
+@pytest.mark.anyio
 async def test_responder_unknown_agent_type_short_circuits(tmp_path) -> None:
     """If a wrapped spawner reports an agent_type not in AgentType enum,
     the adapter must surface the error rather than crash mid-spawn."""

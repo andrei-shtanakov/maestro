@@ -372,12 +372,21 @@ def build_summary(costs: list[TaskCost]) -> CostSummary:
     for cost in costs:
         summary.total_input_tokens += cost.input_tokens
         summary.total_output_tokens += cost.output_tokens
-        summary.total_cost_usd += cost.estimated_cost_usd
+        # COALESCE semantics (same as get_cost_summary's SQL): reported
+        # wins; the estimate is the fallback. Summaries stay non-nullable
+        # floats — the None-vs-0 distinction lives only at the
+        # arbiter-outcome boundary (effective_cost).
+        row_cost = (
+            cost.reported_cost_usd
+            if cost.reported_cost_usd is not None
+            else cost.estimated_cost_usd
+        )
+        summary.total_cost_usd += row_cost
         task_ids.add(cost.task_id)
 
         if cost.task_id not in summary.costs_by_task:
             summary.costs_by_task[cost.task_id] = 0.0
-        summary.costs_by_task[cost.task_id] += cost.estimated_cost_usd
+        summary.costs_by_task[cost.task_id] += row_cost
 
     summary.task_count = len(task_ids)
     return summary

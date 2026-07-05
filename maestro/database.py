@@ -1638,7 +1638,8 @@ class Database:
             SELECT
                 COALESCE(SUM(input_tokens), 0) as total_input_tokens,
                 COALESCE(SUM(output_tokens), 0) as total_output_tokens,
-                COALESCE(SUM(estimated_cost_usd), 0.0) as total_cost_usd,
+                COALESCE(SUM(COALESCE(reported_cost_usd, estimated_cost_usd)), 0.0)
+                    as total_cost_usd,
                 COUNT(DISTINCT task_id) as task_count
             FROM task_costs
             """

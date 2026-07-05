@@ -1905,3 +1905,47 @@ class TestMigrationRenameZadachiToWorkstreams:
             assert rows[1].reported_cost_usd is None
         finally:
             await db.close()
+
+    @pytest.mark.anyio
+    async def test_get_cost_summary_coalesces_reported_cost(self, tmp_path) -> None:
+        """get_cost_summary prefers reported_cost_usd per row, falling
+        back to estimated_cost_usd when unreported."""
+        from maestro.models import Task, TaskStatus
+
+        db = Database(tmp_path / "c.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir=str(tmp_path),
+                agent_type=AgentType.OPENCODE,
+                status=TaskStatus.DONE,
+            )
+            await db.create_task(task)
+            await db.save_task_cost(
+                TaskCost(
+                    task_id="t1",
+                    agent_type=AgentType.OPENCODE,
+                    input_tokens=100,
+                    output_tokens=20,
+                    estimated_cost_usd=0.0,
+                    reported_cost_usd=0.02,
+                    attempt=1,
+                )
+            )
+            await db.save_task_cost(
+                TaskCost(
+                    task_id="t1",
+                    agent_type=AgentType.CLAUDE_CODE,
+                    input_tokens=10,
+                    output_tokens=5,
+                    estimated_cost_usd=0.001,
+                    attempt=2,
+                )
+            )
+            summary = await db.get_cost_summary()
+            assert summary["total_cost_usd"] == pytest.approx(0.021)
+        finally:
+            await db.close()

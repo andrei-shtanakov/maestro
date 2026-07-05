@@ -630,6 +630,30 @@ class TestBuildSummary:
         assert summary.task_count == 1
         assert abs(summary.costs_by_task["task-001"] - 0.022) < 0.001
 
+    def test_reported_cost_preferred_in_summary(self) -> None:
+        """COALESCE semantics: reported wins per row, estimate is fallback."""
+        costs = [
+            TaskCost(
+                task_id="t1",
+                agent_type=AgentType.OPENCODE,
+                input_tokens=100,
+                output_tokens=20,
+                estimated_cost_usd=0.0,
+                reported_cost_usd=0.02,
+            ),
+            TaskCost(
+                task_id="t2",
+                agent_type=AgentType.CLAUDE_CODE,
+                input_tokens=10,
+                output_tokens=5,
+                estimated_cost_usd=0.001,
+            ),
+        ]
+        summary = build_summary(costs)
+        assert summary.total_cost_usd == pytest.approx(0.021)
+        assert summary.costs_by_task["t1"] == pytest.approx(0.02)
+        assert summary.costs_by_task["t2"] == pytest.approx(0.001)
+
 
 class TestFormatSummary:
     """Tests for formatting cost summary as text."""
