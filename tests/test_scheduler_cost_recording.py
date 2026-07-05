@@ -268,3 +268,137 @@ async def test_build_outcome_announce_zero_cost_stays_zero(
         assert outcome.cost_usd == 0.0
     finally:
         await db.close()
+
+
+OPENCODE_LOG = (
+    '{"type": "step_finish", "part": {"cost": 0.005, "tokens": '
+    '{"input": 100, "output": 20, "reasoning": 0}}}\n'
+)
+
+
+def _make_scheduler(db, tmp_path) -> Scheduler:
+    return Scheduler(
+        db=db,
+        dag=DAG([]),
+        spawners={},
+        config=SchedulerConfig(workdir=tmp_path, log_dir=tmp_path / "logs"),
+    )
+
+
+@pytest.mark.anyio
+async def test_record_cost_routed_task_uses_effective_harness(tmp_path) -> None:
+    """agent_type=auto routed to opencode@glm-5.1: the log is opencode JSONL
+    and must be parsed by the opencode parser; the TaskCost row records the
+    EFFECTIVE harness (who actually ran), not the declared sentinel."""
+    db = Database(tmp_path / "c.db")
+    await db.connect()
+    try:
+        now = datetime.now(UTC)
+        task = Task(
+            id="t1",
+            title="T",
+            prompt="P",
+            workdir=str(tmp_path),
+            agent_type=AgentType.AUTO,
+            routed_agent_type="opencode@glm-5.1",
+            status=TaskStatus.RUNNING,
+            created_at=now,
+            started_at=now,
+        )
+        await db.create_task(task)
+        (tmp_path / "logs").mkdir(exist_ok=True)
+        log_file = tmp_path / "logs" / "t1.log"
+        log_file.write_text(OPENCODE_LOG, encoding="utf-8")
+
+        scheduler = _make_scheduler(db, tmp_path)
+        running = RunningTask(
+            task=task,
+            process=MagicMock(),
+            started_at=now,
+            log_file=log_file,
+        )
+        await scheduler._record_cost(running)
+
+        rows = await db.get_task_costs("t1")
+        assert len(rows) == 1
+        assert rows[0].agent_type is AgentType.OPENCODE
+        assert rows[0].input_tokens == 100
+        assert rows[0].output_tokens == 20
+        assert rows[0].reported_cost_usd == pytest.approx(0.005)
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
+async def test_record_cost_declared_override_uses_routed_harness(tmp_path) -> None:
+    """Declared claude_code overridden by the arbiter to opencode: the log is
+    opencode JSONL — the claude parser would find nothing; the routed harness
+    must win the dispatch."""
+    db = Database(tmp_path / "c.db")
+    await db.connect()
+    try:
+        now = datetime.now(UTC)
+        task = Task(
+            id="t1",
+            title="T",
+            prompt="P",
+            workdir=str(tmp_path),
+            agent_type=AgentType.CLAUDE_CODE,
+            routed_agent_type="opencode@glm-5.1",
+            status=TaskStatus.RUNNING,
+            created_at=now,
+            started_at=now,
+        )
+        await db.create_task(task)
+        (tmp_path / "logs").mkdir(exist_ok=True)
+        log_file = tmp_path / "logs" / "t1.log"
+        log_file.write_text(OPENCODE_LOG, encoding="utf-8")
+
+        scheduler = _make_scheduler(db, tmp_path)
+        running = RunningTask(
+            task=task, process=MagicMock(), started_at=now, log_file=log_file
+        )
+        await scheduler._record_cost(running)
+
+        rows = await db.get_task_costs("t1")
+        assert len(rows) == 1
+        assert rows[0].agent_type is AgentType.OPENCODE
+        assert rows[0].reported_cost_usd == pytest.approx(0.005)
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
+async def test_record_cost_non_enum_routed_harness_falls_back(tmp_path) -> None:
+    """A D2 custom harness (not an AgentType member) falls back to declared
+    dispatch: the declared claude parser finds nothing in opencode JSONL →
+    no row, exactly today's behavior."""
+    db = Database(tmp_path / "c.db")
+    await db.connect()
+    try:
+        now = datetime.now(UTC)
+        task = Task(
+            id="t1",
+            title="T",
+            prompt="P",
+            workdir=str(tmp_path),
+            agent_type=AgentType.CLAUDE_CODE,
+            routed_agent_type="fakeharness@x",
+            status=TaskStatus.RUNNING,
+            created_at=now,
+            started_at=now,
+        )
+        await db.create_task(task)
+        (tmp_path / "logs").mkdir(exist_ok=True)
+        log_file = tmp_path / "logs" / "t1.log"
+        log_file.write_text(OPENCODE_LOG, encoding="utf-8")
+
+        scheduler = _make_scheduler(db, tmp_path)
+        running = RunningTask(
+            task=task, process=MagicMock(), started_at=now, log_file=log_file
+        )
+        await scheduler._record_cost(running)
+
+        assert await db.get_task_costs("t1") == []
+    finally:
+        await db.close()

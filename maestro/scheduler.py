@@ -315,10 +315,24 @@ class Scheduler:
         """
         task = running_task.task
         attempt = task.retry_count + 1
+        # Dispatch the parser by the EFFECTIVE harness: a routed task's log
+        # was written by the routed agent, not the declared one (agent_type:
+        # auto routed to opencode writes opencode JSONL). A routed harness
+        # outside AgentType (D2 custom spawner) falls back to the declared
+        # type — no parser exists for it anyway, so behavior is unchanged.
+        harness = (
+            harness_of_agent_id(task.routed_agent_type)
+            if task.routed_agent_type
+            else task.agent_type.value
+        )
+        try:
+            effective_agent = AgentType(harness)
+        except ValueError:
+            effective_agent = task.agent_type
         try:
             cost = parse_and_create_cost(
                 task_id=task.id,
-                agent_type=task.agent_type,
+                agent_type=effective_agent,
                 log_file=running_task.log_file,
                 attempt=attempt,
             )
