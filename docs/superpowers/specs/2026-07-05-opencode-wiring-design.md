@@ -44,7 +44,7 @@ usage in `part.tokens`:
 {"type": "step_finish",
  "part": {"reason": "stop",
           "tokens": {"input": 22443, "output": 118, "reasoning": 0,
-                     "cache_read": 21415, "cache_write": 0},
+                     "cache": {"read": 21415, "write": 0}},
           "cost": 0.001}}
 ```
 

@@ -164,3 +164,14 @@ ls .github/workflows/
       ambiguity raise.
 - [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral
       conformance test (precedence + alias resolution across Maestro / ATP / arbiter).
+
+## opencode follow-ups (ADR-ECO-003c)
+
+- [ ] Cost-from-log: surface `part.cost` (and optionally cache_read/cache_write)
+      from opencode JSONL into TaskCost/TaskOutcome instead of PRICING-based 0.
+      Constraint (recorded in parse_opencode_log docstring): cache_read must
+      NOT be billed at full input price — in real runs cache_read ~= input.
+      Until then opencode reports cost_usd=None (unknown) to the arbiter.
+- [ ] opencode entry in the ecosystem SSOT catalog (atp-platform/method/
+      agents-catalog.toml) — cross-repo; the test fixture already carries
+      harness=opencode / glm-5.1.
