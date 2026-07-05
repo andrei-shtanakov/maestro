@@ -219,6 +219,16 @@ class TestOpencodeLogParsing:
         assert usage.input_tokens == 0
         assert usage.output_tokens == 3
 
+    def test_explicit_null_token_fields_default_zero(self) -> None:
+        """opencode may emit explicit null for unreported sub-metrics."""
+        log = (
+            '{"type": "step_finish", "part": {"tokens": '
+            '{"input": null, "output": 3, "reasoning": null}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 3
+
     def test_non_step_finish_events_ignored(self) -> None:
         log = (
             '{"type": "step_start", "part": {}}\n'

@@ -151,10 +151,10 @@ def parse_opencode_log(log_content: str) -> TokenUsage:
     per-step usage in ``part.tokens`` (verified against a captured real run:
     values are per-step increments, so they are summed across events).
 
-    ``part.tokens.cache_read`` / ``cache_write`` and ``part.cost`` are
-    intentionally dropped (tokens-only, spec variant A). The cost-from-log
-    follow-up must NOT bill cache_read at full input price — in real runs
-    cache_read is on the order of input itself.
+    ``part.tokens.cache.read`` / ``part.tokens.cache.write`` and ``part.cost``
+    are intentionally dropped (tokens-only, spec variant A). The cost-from-log
+    follow-up must NOT bill cache reads at full input price — in real runs
+    ``cache.read`` is on the order of input itself.
 
     Args:
         log_content: Raw log file content (stderr shares the fd, so
@@ -182,9 +182,9 @@ def parse_opencode_log(log_content: str) -> TokenUsage:
         if not isinstance(tokens, dict):
             continue
         saw_step_finish = True
-        usage.input_tokens += int(tokens.get("input", 0))
-        usage.output_tokens += int(tokens.get("output", 0)) + int(
-            tokens.get("reasoning", 0)
+        usage.input_tokens += int(tokens.get("input") or 0)
+        usage.output_tokens += int(tokens.get("output") or 0) + int(
+            tokens.get("reasoning") or 0
         )
     if log_content.strip() and not saw_step_finish:
         # Format-drift canary: opencode renaming/removing step_finish would
