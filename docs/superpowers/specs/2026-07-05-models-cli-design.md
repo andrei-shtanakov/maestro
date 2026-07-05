@@ -147,9 +147,11 @@ missing" (`catalog.py:120`) — the CLI must distinguish them itself:
 3. `diff_catalog` → print the report: new models (per vendor), deprecation
    candidates (with "review by hand — discover never edits" note),
    already-present matches, vendor-conflict WARNINGS, summary.
-4. New models exist → print the proposed Plane-1 block; `--out FILE` writes
-   it atomically (temp file + `os.replace`), REFUSING an existing target
-   (exit 1) — never the catalog itself. Exit 2.
+4. New models exist → print the proposed Plane-1 block; `--out FILE`
+   creates it EXCLUSIVELY (`open(..., "x")` — refusal and write are one
+   operation, no TOCTOU) — never the catalog itself. A crash mid-write can
+   leave a partial proposal file; acceptable for a regenerable artifact.
+   Exit 2.
 5. No new models → "catalog is up to date", exit 0. (Deprecation candidates
    and vendor conflicts alone do not change the exit code — same as the
    prototype.)

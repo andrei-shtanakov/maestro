@@ -264,6 +264,53 @@ class TestModelsDiscover:
         assert result.exit_code == 0  # conflict alone does not change exit
         assert "conflict" in result.output.lower()
 
+    def test_markup_like_model_id_is_not_interpreted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Model ids are arbitrary strings — Rich markup in them must render
+        literally instead of being interpreted as style tags.
+
+        The catalog carries a model whose id IS a well-formed markup tag
+        (`[red]oops[/red]`), quoted as a TOML key. Observing it again makes
+        it hit the "already present" branch of `_print_report`, which
+        interpolates `hit.model_id` into a markup-enabled `console.print`.
+        Without escaping, Rich applies the color instead of printing the
+        literal brackets.
+        """
+        target = self._setup(tmp_path, monkeypatch)
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(
+                '\n[models."[red]oops[/red]"]\nvendor = "openai"\nstatus = "active"\n'
+            )
+        manifest = _write_manifest(
+            tmp_path / "obs.json", {"openai": ["gpt-5.5", "[red]oops[/red]"]}
+        )
+        result = runner.invoke(app, ["models", "discover", "--observed", str(manifest)])
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert "[red]oops[/red]" in result.output
+
+    def test_unmatched_bracket_model_id_does_not_raise(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A model id containing an unmatched closing tag (`[/oops]`) is a
+        `rich.errors.MarkupError` waiting to happen if interpolated
+        unescaped into a markup-enabled `console.print` — reachable via the
+        deprecation-candidate branch of `_print_report`.
+        """
+        target = self._setup(tmp_path, monkeypatch)
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(
+                '\n[models."weird[/oops]"]\nvendor = "openai"\nstatus = "active"\n'
+            )
+        # openai observed with no models at all -> the catalog's active
+        # openai entries that aren't seen become deprecation candidates.
+        manifest = _write_manifest(tmp_path / "obs.json", {"openai": []})
+        result = runner.invoke(app, ["models", "discover", "--observed", str(manifest)])
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert "weird[/oops]" in result.output
+
 
 class TestModelsUpdate:
     def _setup(
@@ -388,3 +435,35 @@ class TestModelsUpdate:
         assert result.exit_code == 1
         assert "changed underneath" in result.output
         assert "# sneaky edit" in target.read_text(encoding="utf-8")
+
+    def test_catalog_unreadable_after_resolution_exits_cleanly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The catalog can vanish/become unreadable between resolution and
+        the initial `read_bytes()` — that must exit 1 with a message, not
+        propagate an uncaught OSError.
+
+        Note: `result.exception` is a `SystemExit(1)` here by design (every
+        `typer.Exit(1)` in this CLI surfaces that way through Click's test
+        runner) — the same convention the other "...not_traceback" tests in
+        this file use, so the real assertion is the absence of a traceback
+        in the output, not `result.exception is None`.
+        """
+        target, manifest = self._setup(tmp_path, monkeypatch)
+        import pathlib
+
+        real_read_bytes = pathlib.Path.read_bytes
+
+        def failing_read_bytes(self: Path) -> bytes:
+            if self == target:
+                raise PermissionError(13, "denied", str(self))
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", failing_read_bytes)
+        result = runner.invoke(
+            app, ["models", "update", "--observed", str(manifest), "--yes"]
+        )
+        assert result.exit_code == 1
+        assert "cannot read" in result.output
+        assert str(target) in result.output
+        assert "Traceback" not in result.output

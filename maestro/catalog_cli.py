@@ -17,6 +17,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from maestro.catalog import (
@@ -98,48 +99,42 @@ def _print_report(report: DiscoveryReport) -> None:
     for conflict in report.vendor_conflicts:
         err_console.print(
             f"[bold yellow]WARNING vendor conflict:[/bold yellow] "
-            f"{conflict.model_id!r} is cataloged under "
-            f"{conflict.catalog_vendor!r} but observed under "
-            f"{conflict.observed_vendor!r} — not touching it"
+            f"{escape(repr(conflict.model_id))} is cataloged under "
+            f"{escape(repr(conflict.catalog_vendor))} but observed under "
+            f"{escape(repr(conflict.observed_vendor))} — not touching it"
         )
     if report.already_present:
         for hit in report.already_present:
-            via = f" (alias of {hit.matched})" if hit.via_alias else ""
-            console.print(f"already present: {hit.model_id}{via}")
+            via = f" (alias of {escape(hit.matched)})" if hit.via_alias else ""
+            console.print(f"already present: {escape(hit.model_id)}{via}")
     if report.deprecation_candidates:
         console.print(
             "[yellow]deprecation candidates[/yellow] "
             "(review by hand — this tool never edits existing entries):"
         )
         for cand in report.deprecation_candidates:
-            console.print(f"  {cand.model_id} ({cand.vendor})")
+            console.print(f"  {escape(cand.model_id)} ({escape(cand.vendor)})")
     if report.new_models:
         console.print(f"new models: {len(report.new_models)}")
 
 
-def _atomic_write_new_file(target: Path, content: str) -> None:
-    """Atomically create `target`; refuses an existing file."""
-    if target.exists():
-        err_console.print(f"[red]{target} already exists[/red] — refusing to overwrite")
-        raise typer.Exit(1)
+def _write_new_file_exclusive(target: Path, content: str) -> None:
+    """Create `target` exclusively; refuses an existing file (no TOCTOU).
+
+    `--out` is a regenerable proposal artifact: it needs EXCLUSIVITY, not
+    atomicity. A single `open(..., "x")` makes the existence check and the
+    write one operation, closing the check-then-replace race that a
+    separate `exists()` + temp-file-replace dance would leave open.
+    """
     try:
-        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.")
-    except OSError as exc:
-        err_console.print(f"[red]cannot write {target}: {exc}[/red]")
-        raise typer.Exit(1) from exc
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with target.open("x", encoding="utf-8") as fh:
             fh.write(content)
-            fh.flush()
-            os.fsync(fh.fileno())
-        Path(tmp).replace(target)
+    except FileExistsError:
+        err_console.print(f"[red]{target} already exists[/red] — refusing to overwrite")
+        raise typer.Exit(1) from None
     except OSError as exc:
-        Path(tmp).unlink(missing_ok=True)
-        err_console.print(f"[red]cannot write {target}: {exc}[/red]")
+        err_console.print(f"[red]cannot write {target}[/red]: {exc}")
         raise typer.Exit(1) from exc
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
 
 
 @models_app.command("init")
@@ -240,7 +235,7 @@ def models_discover(
     # Use console.file.write to bypass Rich's markup interpretation of [...]
     console.file.write(block)
     if out is not None:
-        _atomic_write_new_file(out, block)
+        _write_new_file_exclusive(out, block)
         console.print(f"proposed block written to {out}")
     raise typer.Exit(2)
 
@@ -272,7 +267,11 @@ def models_update(
         console.print("nothing to apply — catalog is up to date")
         return
 
-    original = path.read_bytes()
+    try:
+        original = path.read_bytes()
+    except OSError as exc:
+        err_console.print(f"[red]cannot read {path}[/red]: {exc}")
+        raise typer.Exit(1) from exc
     fingerprint = hashlib.sha256(original).hexdigest()
 
     block = render_plane1_block(report.new_models)
