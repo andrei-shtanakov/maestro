@@ -982,3 +982,44 @@ class TestBackgroundGeneration:
         # _cleanup found the process in _running and terminated it.
         fake_process.terminate.assert_called_once()
         assert "z1" not in orchestrator._running
+
+    @pytest.mark.anyio
+    async def test_spawn_ready_does_not_duplicate_in_flight_generation(
+        self, orchestrator, mock_db, mock_decomposer
+    ) -> None:
+        """A workstream already in `_generating` must not be re-spawned.
+
+        Regression guard: `_resolve_ready` used to exclude only
+        `_running`, not `_generating`, so a workstream whose generation
+        task had been created but whose DB status hadn't yet flipped to
+        DECOMPOSING would be returned as ready again on the next loop
+        tick. `_spawn_ready` then overwrote the `_generating[zid]` entry
+        with a second task, leaking the first task reference and running
+        spec generation twice for the same workstream.
+        """
+        import asyncio
+
+        gate = asyncio.Event()
+
+        async def block(*a, **k):
+            await gate.wait()
+
+        mock_decomposer.generate_spec = AsyncMock(side_effect=block)
+        mock_db.get_workstream = AsyncMock(
+            side_effect=lambda zid: _ws(zid, WorkstreamStatus.READY)
+        )
+
+        await orchestrator._spawn_ready(["z1"])
+        first = orchestrator._generating["z1"]
+        await asyncio.sleep(0)  # let the task run up to the blocked call
+
+        # Second tick before z1 flips to DECOMPOSING: must not overwrite.
+        await orchestrator._spawn_ready(["z1"])
+        assert orchestrator._generating["z1"] is first
+        assert len(orchestrator._generating) == 1
+        assert mock_decomposer.generate_spec.call_count == 1
+
+        gate.set()
+        for t in list(orchestrator._generating.values()):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t

@@ -252,6 +252,8 @@ class Orchestrator:
         for z in all_z:
             if z.id in self._running:
                 continue
+            if z.id in self._generating:
+                continue
             if z.status not in (
                 WorkstreamStatus.PENDING,
                 WorkstreamStatus.READY,
@@ -284,6 +286,8 @@ class Orchestrator:
         for zid in ready_ids[:available]:
             if self._shutdown_requested:
                 break
+            if zid in self._generating or zid in self._running:
+                continue
             self._generating[zid] = asyncio.create_task(self._generate_and_launch(zid))
 
     async def _generate_and_launch(self, workstream_id: str) -> None:
@@ -304,7 +308,7 @@ class Orchestrator:
             raise
         except Exception as e:
             self._logger.error(
-                "Spec generation failed for workstream '%s': %s",
+                "Failed to generate spec or launch workstream '%s': %s",
                 workstream_id,
                 e,
             )
