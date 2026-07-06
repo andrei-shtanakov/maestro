@@ -305,13 +305,14 @@ class ProjectDecomposer:
             f"Description: {workstream.description}\n\n"
             f"Scope: {', '.join(workstream.scope)}"
         )
-        with tempfile.NamedTemporaryFile(
+        desc_file = tempfile.NamedTemporaryFile(  # noqa: SIM115
             "w", encoding="utf-8", suffix=".md", delete=False
-        ) as desc_file:
-            desc_file.write(description)
+        )
         desc_path = Path(desc_file.name)
-
         try:
+            with desc_file:
+                desc_file.write(description)
+
             cmd = [
                 "spec-runner",
                 "plan",

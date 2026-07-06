@@ -467,6 +467,44 @@ class TestGenerateSpec:
             await dec.generate_spec(workstream, workspace)
         proc.terminate.assert_called_once()
 
+    @pytest.mark.anyio
+    async def test_temp_desc_file_removed_on_success(
+        self, temp_dir: Path, workstream: WorkstreamConfig
+    ) -> None:
+        workspace = temp_dir / "ws"
+        (workspace / "spec").mkdir(parents=True)
+        (workspace / "spec" / "tasks.md").write_text("x", encoding="utf-8")
+        dec = ProjectDecomposer(repo_path=temp_dir)
+        captured: dict[str, str] = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["desc"] = args[args.index("--from-file") + 1]
+            return self._fake_proc()
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            await dec.generate_spec(workstream, workspace)
+        assert not Path(captured["desc"]).exists()  # noqa: ASYNC240
+
+    @pytest.mark.anyio
+    async def test_temp_desc_file_removed_on_failure(
+        self, temp_dir: Path, workstream: WorkstreamConfig
+    ) -> None:
+        workspace = temp_dir / "ws"
+        (workspace / "spec").mkdir(parents=True)
+        dec = ProjectDecomposer(repo_path=temp_dir)
+        captured: dict[str, str] = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["desc"] = args[args.index("--from-file") + 1]
+            return self._fake_proc(returncode=1, stderr=b"boom")
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+            pytest.raises(DecomposerError, match="boom"),
+        ):
+            await dec.generate_spec(workstream, workspace)
+        assert not Path(captured["desc"]).exists()  # noqa: ASYNC240
+
 
 # =============================================================================
 # Unit Tests: validate_non_overlap()
