@@ -916,3 +916,69 @@ class TestBackgroundGeneration:
         assert "z1" not in orchestrator._generating
         assert "z1" in orchestrator._running
         assert orchestrator._running["z1"].process is fake_process
+
+    @pytest.mark.anyio
+    async def test_cleanup_terminates_process_when_cancel_hits_pid_update(
+        self, orchestrator, mock_db, mock_decomposer, tmp_path
+    ) -> None:
+        """Discriminating regression guard for the shutdown-orphan window.
+
+        Suspend `_spawn_workstream` exactly on the `process_pid` DB
+        update — AFTER the process is spawned and registered in
+        `_running`. Then shut down. `_cleanup` must find the process in
+        `_running` and terminate it. This FAILS if registration is moved
+        back to AFTER the pid update: on cancel the process would not yet
+        be in `_running`, `_cleanup` would never touch it, and it would
+        survive as an orphan.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        orchestrator._log_dir = tmp_path
+        orchestrator._shutdown_grace_seconds = 0  # no 5s sleep in _cleanup
+        workspace = tmp_path / "ws-z1"
+        workspace.mkdir()
+        orchestrator._workspace_mgr.workspace_exists = MagicMock(return_value=True)
+        orchestrator._workspace_mgr.get_workspace_path = MagicMock(
+            return_value=workspace
+        )
+        orchestrator._commit_spec_in_workspace = MagicMock()
+        mock_db.get_workstream = AsyncMock(
+            return_value=_ws("z1", WorkstreamStatus.READY)
+        )
+
+        # Fake process mirroring how _cleanup drives it:
+        # terminate() -> sleep(grace) -> returncode check -> wait().
+        fake_process = MagicMock()
+        fake_process.pid = 4242
+        fake_process.returncode = 0  # already exited: skip kill()
+        fake_process.terminate = MagicMock()
+        fake_process.kill = MagicMock()
+        fake_process.wait = AsyncMock(return_value=0)
+
+        # Suspend on the RUNNING+pid update (fired right after registration),
+        # signalling `reached` so the test can proceed to shutdown.
+        reached = asyncio.Event()
+
+        async def hang_on_pid(*args, **kwargs):
+            if kwargs.get("process_pid") is not None:
+                reached.set()
+                await asyncio.sleep(3600)  # hang here until cancelled
+            return None
+
+        mock_db.update_workstream_status = AsyncMock(side_effect=hang_on_pid)
+
+        with patch(
+            "maestro.orchestrator.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=fake_process),
+        ):
+            await orchestrator._spawn_ready(["z1"])
+            await reached.wait()  # generation is now parked on the pid update
+            # Process is spawned + registered but the pid-update await is
+            # still pending — the exact orphan window.
+            assert "z1" in orchestrator._running
+            await orchestrator._cleanup()
+
+        # _cleanup found the process in _running and terminated it.
+        fake_process.terminate.assert_called_once()
+        assert "z1" not in orchestrator._running
