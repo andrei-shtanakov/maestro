@@ -48,7 +48,6 @@ class FakeAdapter:
     def __init__(self, platform_url: str) -> None:
         self.platform_url = platform_url
         self.started: list[tuple[str, str]] = []
-        self.run_ids_requested: list[str | None] = []
         FakeAdapter.instances.append(self)
 
     @classmethod
@@ -143,6 +142,12 @@ class TestAgentValidation:
         assert result.exit_code == 2
         assert FakeAdapter.instances == []
 
+    def test_markup_hostile_agent_name_no_traceback(self) -> None:
+        result = runner.invoke(app, ["benchmark", "b1", "--agent", "[/]"])
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "Traceback" not in result.output
+
 
 class TestHappyPath:
     def test_run_prints_score_and_tasks(self, tmp_path: Path) -> None:
@@ -159,7 +164,7 @@ class TestHappyPath:
         )
         assert result.exit_code == 0
         assert "0.75" in result.output
-        assert "prompt" in result.output
+        assert "duration" in result.output
         assert "swe-mini" in result.output
         assert str(tmp_path / "wd") in result.output  # workdir announced
         assert "skipped" in result.output  # arbiter note (env unset)
@@ -203,6 +208,44 @@ class TestHappyPath:
         assert result.exit_code == 0
         parsed = BenchmarkResult.model_validate_json(result.stdout)
         assert parsed.run_id == "ci-42"
+
+    def test_task_error_still_exit_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failing task lands in the table, not the exit code."""
+
+        class ErroringSpawner(FakeBenchSpawner):
+            def spawn(
+                self,
+                task,
+                context,
+                workdir,
+                log_file,
+                retry_context="",
+                *,
+                model=None,
+            ):
+                import subprocess
+
+                log_file.write_text("no usable json", encoding="utf-8")
+                return subprocess.Popen(["false"])
+
+        monkeypatch.setattr(
+            cli_mod, "_bench_spawner_for", lambda agent: ErroringSpawner(agent)
+        )
+        result = runner.invoke(
+            app,
+            [
+                "benchmark",
+                "b",
+                "--agent",
+                "claude_code",
+                "--workdir",
+                str(tmp_path / "wd"),
+            ],
+        )
+        assert result.exit_code == 0
+        assert "exit code" in result.output  # responder's error string in the table
 
 
 class TestAtpUrl:
@@ -257,6 +300,28 @@ class TestAtpFailure:
         assert "401 Unauthorized" in result.output
         assert "ATP_TOKEN" in result.output  # resolution-chain hint
         assert "Traceback" not in result.output
+
+    def test_markup_hostile_atp_error_keeps_hint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FailingAdapter(FakeAdapter):
+            async def start_run(self, benchmark_id: str, agent_name: str):
+                raise RuntimeError("boom [/][bold]")
+
+        monkeypatch.setattr(cli_mod, "MaestroATPAdapter", FailingAdapter)
+        result = runner.invoke(
+            app,
+            [
+                "benchmark",
+                "b",
+                "--agent",
+                "claude_code",
+                "--workdir",
+                str(tmp_path / "wd"),
+            ],
+        )
+        assert result.exit_code == 1
+        assert "ATP_TOKEN" in result.output  # hint survived the hostile text
 
 
 class FakeArbiterClient:
@@ -345,6 +410,25 @@ class TestArbiterReport:
         assert result.exit_code == 0
         assert FakeArbiterClient.instances == []
         assert "skipped (--no-report)" in result.output
+
+    def test_stop_failure_is_swallowed(
+        self, tmp_path: Path, _arbiter_env: Path
+    ) -> None:
+        """A raising stop() must not fail the run or lose the result."""
+
+        class StopFails(FakeArbiterClient):
+            async def stop(self) -> None:
+                self.calls.append("stop")
+                raise RuntimeError("stop exploded")
+
+        # NB: fixture already monkeypatched ArbiterClient to FakeArbiterClient;
+        # re-patch to the failing subclass for this test.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(cli_mod, "ArbiterClient", StopFails)
+            result = self._invoke(tmp_path, "--json")
+        assert result.exit_code == 0
+        parsed = BenchmarkResult.model_validate_json(result.stdout)
+        assert parsed.report_status == "ok"  # report succeeded before stop blew up
 
     def test_env_unset_skips_with_note(self, tmp_path: Path) -> None:
         result = self._invoke(tmp_path)

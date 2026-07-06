@@ -166,11 +166,8 @@ async def _report_with_lifecycle(
     finally:
         # stop() is idempotent and safe after failed start(), so
         # unconditional best-effort cleanup is sufficient.
-        try:  # noqa: SIM105 — async context requires try-except
+        with contextlib.suppress(Exception):
             await client.stop()
-        except Exception:
-            pass
-    notes.print(f"arbiter report: {result.report_status}")
     return result
 
 
@@ -1043,7 +1040,6 @@ def _print_benchmark_summary(result: BenchmarkResult, wd: Path, notes: Console) 
     )
     table = Table(title="Tasks")
     table.add_column("#")
-    table.add_column("prompt")
     table.add_column("duration s")
     table.add_column("tokens")
     table.add_column("cost")
@@ -1051,7 +1047,6 @@ def _print_benchmark_summary(result: BenchmarkResult, wd: Path, notes: Console) 
     for t in result.per_task:
         table.add_row(
             str(t.task_index),
-            t.prompt,
             f"{t.duration_seconds:.1f}",
             str(t.tokens_used) if t.tokens_used is not None else "-",
             f"{t.cost_usd:.4f}" if t.cost_usd is not None else "-",
@@ -1066,7 +1061,7 @@ def _print_benchmark_summary(result: BenchmarkResult, wd: Path, notes: Console) 
         f"arbiter report: {result.report_status}"
         + (f" ({result.report_error})" if result.report_error else "")
     )
-    notes.print(f"logs: {wd / 'logs'}")
+    notes.print(f"logs: {escape(str(wd / 'logs'))}")
 
 
 @app.command("benchmark")
@@ -1126,7 +1121,7 @@ def benchmark(
         raise typer.Exit(1)
     if agent not in _ALLOWED_BENCH_AGENTS:
         err.print(
-            f"[red]unknown agent {agent!r}[/red] — allowed: "
+            f"[red]unknown agent {escape(repr(agent))}[/red] — allowed: "
             f"{', '.join(_ALLOWED_BENCH_AGENTS)}"
         )
         raise typer.Exit(1)
@@ -1137,7 +1132,7 @@ def benchmark(
 
     spawner = _bench_spawner_for(agent)
     if not spawner.is_available():
-        err.print(f"[red]agent CLI '{agent}' not found in PATH[/red]")
+        err.print(f"[red]agent CLI '{escape(agent)}' not found in PATH[/red]")
         raise typer.Exit(1)
 
     wd = workdir or Path(tempfile.mkdtemp(prefix="maestro-bench-"))
@@ -1147,6 +1142,7 @@ def benchmark(
     # Announce BEFORE the run: on a crash the partial logs must be findable.
     # Write directly to file to avoid Rich's line wrapping.
     notes.file.write(f"workdir: {wd}\n")
+    notes.file.flush()
 
     url = atp_url or os.environ.get("MAESTRO_ATP_BASE_URL") or "http://localhost:8000"
     adapter = MaestroATPAdapter.from_env(platform_url=url)
@@ -1168,7 +1164,7 @@ def benchmark(
             )
         )
     except Exception as exc:
-        err.print(f"[red]benchmark failed[/red]: {exc}")
+        err.print(f"[red]benchmark failed[/red]: {escape(str(exc))}")
         err.print(
             "hint: check the ATP endpoint (--atp-url / $MAESTRO_ATP_BASE_URL) "
             "and token (ATP_TOKEN env or ~/.atp/config.json)"
