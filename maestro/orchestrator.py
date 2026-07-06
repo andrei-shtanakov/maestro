@@ -395,17 +395,14 @@ class Orchestrator:
                     stdout=log_fd,
                     stderr=asyncio.subprocess.STDOUT,
                 )
-        except Exception:
+        except BaseException:
             os.close(log_fd)
             raise
 
-        # Update PID in DB
-        await self._db.update_workstream_status(
-            workstream_id,
-            WorkstreamStatus.RUNNING,
-            process_pid=process.pid,
-        )
-
+        # Register in _running BEFORE any further await, so a shutdown
+        # cancellation can never orphan the spawned process: once it's
+        # here, _cleanup's termination loop will reach it regardless of
+        # where a later cancel lands.
         self._running[workstream_id] = RunningWorkstream(
             workstream=workstream.model_copy(
                 update={
@@ -417,6 +414,13 @@ class Orchestrator:
             started_at=datetime.now(UTC),
             workspace_path=workspace,
             log_file=log_file,
+        )
+
+        # Update PID in DB
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.RUNNING,
+            process_pid=process.pid,
         )
 
         self._logger.info(

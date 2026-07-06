@@ -869,3 +869,50 @@ class TestBackgroundGeneration:
         # generation task cancelled, workstream returned to READY (no retry used)
         calls = [c.args for c in mock_db.update_workstream_status.await_args_list]
         assert any(WorkstreamStatus.READY in c for c in calls)
+
+    @pytest.mark.anyio
+    async def test_happy_path_registers_in_running_before_pid_update(
+        self, orchestrator, mock_db, mock_decomposer, tmp_path
+    ) -> None:
+        """Full success path: generate_spec succeeds, the process is
+        spawned, and _spawn_workstream must land the workstream in
+        `_running` (with `_generating` emptied).
+
+        Regression test for the shutdown-orphan bug: the pid DB update
+        used to happen *before* the `_running` registration, so a
+        cancellation landing between those two awaits left the spawned
+        `run --all` process untracked by `_cleanup`. Registration now
+        happens first, so this success-path assertion also pins down
+        that ordering (see `test_shutdown_cancels_generation_back_to_ready`
+        for the cancellation side of the invariant).
+        """
+        from unittest.mock import patch
+
+        # Route log file + workspace through a real tmp dir so os.open()
+        # and the (mocked-out) commit step don't touch the repo.
+        orchestrator._log_dir = tmp_path
+        workspace = tmp_path / "ws-z1"
+        workspace.mkdir()
+        orchestrator._workspace_mgr.workspace_exists = MagicMock(return_value=True)
+        orchestrator._workspace_mgr.get_workspace_path = MagicMock(
+            return_value=workspace
+        )
+        orchestrator._commit_spec_in_workspace = MagicMock()
+
+        mock_db.get_workstream = AsyncMock(
+            return_value=_ws("z1", WorkstreamStatus.READY)
+        )
+
+        fake_process = MagicMock()
+        fake_process.pid = 4242
+
+        with patch(
+            "maestro.orchestrator.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=fake_process),
+        ):
+            await orchestrator._spawn_ready(["z1"])
+            await orchestrator._generating["z1"]
+
+        assert "z1" not in orchestrator._generating
+        assert "z1" in orchestrator._running
+        assert orchestrator._running["z1"].process is fake_process
