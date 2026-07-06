@@ -257,3 +257,96 @@ class TestAtpFailure:
         assert "401 Unauthorized" in result.output
         assert "ATP_TOKEN" in result.output  # resolution-chain hint
         assert "Traceback" not in result.output
+
+
+class FakeArbiterClient:
+    """Records lifecycle calls; behavior configured by class attrs."""
+
+    instances: ClassVar[list["FakeArbiterClient"]] = []
+    fail_start: ClassVar[bool] = False
+
+    def __init__(self, config) -> None:
+        self.config = config
+        self.calls: list[str] = []
+        FakeArbiterClient.instances.append(self)
+
+    async def start(self) -> None:
+        self.calls.append("start")
+        if FakeArbiterClient.fail_start:
+            raise RuntimeError("arbiter binary refused to start")
+
+    async def stop(self) -> None:
+        self.calls.append("stop")
+
+    async def report_benchmark_raw(self, payload: dict) -> dict:
+        self.calls.append("report")
+        return {"status": "created"}
+
+
+@pytest.fixture()
+def _arbiter_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """MAESTRO_ARBITER_BIN pointing at a plausible repo layout."""
+    repo = tmp_path / "arbiter-repo"
+    bin_path = repo / "target" / "release" / "arbiter-mcp"
+    bin_path.parent.mkdir(parents=True)
+    bin_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    (repo / "config").mkdir()
+    (repo / "models").mkdir()
+    (repo / "models" / "agent_policy_tree.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("MAESTRO_ARBITER_BIN", str(bin_path))
+    FakeArbiterClient.instances = []
+    FakeArbiterClient.fail_start = False
+    monkeypatch.setattr(cli_mod, "ArbiterClient", FakeArbiterClient)
+    return bin_path
+
+
+class TestArbiterReport:
+    def _invoke(self, tmp_path: Path, *extra: str):
+        return runner.invoke(
+            app,
+            [
+                "benchmark",
+                "b",
+                "--agent",
+                "claude_code",
+                "--workdir",
+                str(tmp_path / "wd"),
+                *extra,
+            ],
+        )
+
+    def test_lifecycle_start_report_stop(
+        self, tmp_path: Path, _arbiter_env: Path
+    ) -> None:
+        result = self._invoke(tmp_path, "--json")
+        assert result.exit_code == 0
+        client = FakeArbiterClient.instances[0]
+        assert client.calls == ["start", "report", "stop"]
+        parsed = BenchmarkResult.model_validate_json(result.stdout)
+        assert parsed.report_status == "ok"
+
+    def test_start_failure_is_report_failure_not_run_failure(
+        self, tmp_path: Path, _arbiter_env: Path
+    ) -> None:
+        FakeArbiterClient.fail_start = True
+        result = self._invoke(tmp_path, "--json")
+        assert result.exit_code == 0  # fire-and-forget
+        parsed = BenchmarkResult.model_validate_json(result.stdout)
+        assert parsed.report_status == "failed"
+        assert "refused to start" in (parsed.report_error or "")
+        client = FakeArbiterClient.instances[0]
+        assert client.calls[0] == "start"
+        assert client.calls[-1] == "stop"  # stop() on the failure path too
+
+    def test_no_report_skips_client_entirely(
+        self, tmp_path: Path, _arbiter_env: Path
+    ) -> None:
+        result = self._invoke(tmp_path, "--no-report")
+        assert result.exit_code == 0
+        assert FakeArbiterClient.instances == []
+        assert "skipped (--no-report)" in result.output
+
+    def test_env_unset_skips_with_note(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path)
+        assert result.exit_code == 0
+        assert "MAESTRO_ARBITER_BIN unset" in result.output

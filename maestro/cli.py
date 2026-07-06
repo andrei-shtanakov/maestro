@@ -41,10 +41,16 @@ from maestro import (
 )
 from maestro import merge_logs as _merge_logs
 from maestro._vendor.obs import init_logging
-from maestro.benchmark import BenchmarkRunner, MaestroATPAdapter, SpawnerResponder
+from maestro.benchmark import (
+    BenchmarkRunner,
+    MaestroATPAdapter,
+    SpawnerResponder,
+    report_benchmark_to_arbiter,
+)
 from maestro.benchmark.models import BenchmarkResult
 from maestro.catalog_cli import models_app
 from maestro.config import load_orchestrator_config
+from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
 from maestro.decomposer import ProjectDecomposer
@@ -135,7 +141,37 @@ async def _benchmark_flow(
 async def _report_with_lifecycle(
     result: BenchmarkResult, arbiter_bin: str, notes: Console
 ) -> BenchmarkResult:
-    raise NotImplementedError  # Task 2 (unreachable in Task 1: gated on env)
+    """M4 fire-and-forget report with explicit client lifecycle.
+
+    start() failure counts as a report failure (report_status="failed"),
+    never as a run failure; stop() is awaited on every path so the
+    subprocess can't leak. Paths follow the smoke-script convention:
+    the binary lives at <repo>/target/release/arbiter-mcp.
+    """
+    bin_path = Path(arbiter_bin)
+    repo = bin_path.parent.parent.parent
+    config = ArbiterClientConfig(
+        binary_path=str(bin_path),
+        config_dir=str(repo / "config"),
+        tree_path=str(repo / "models" / "agent_policy_tree.json"),
+    )
+    client = ArbiterClient(config)
+    try:
+        await client.start()
+        result = await report_benchmark_to_arbiter(result, client)
+    except Exception as exc:  # start() failure = report failure, not run failure
+        result = result.model_copy(
+            update={"report_status": "failed", "report_error": str(exc)}
+        )
+    finally:
+        # stop() is idempotent and safe after failed start(), so
+        # unconditional best-effort cleanup is sufficient.
+        try:  # noqa: SIM105 — async context requires try-except
+            await client.stop()
+        except Exception:
+            pass
+    notes.print(f"arbiter report: {result.report_status}")
+    return result
 
 
 def _get_status_style(status: TaskStatus) -> str:
@@ -1071,6 +1107,7 @@ def benchmark(
     --timeout. With MAESTRO_ARBITER_BIN set, the result is reported to the
     arbiter fire-and-forget (a report failure never fails the run).
     """
+    init_logging("maestro")
     err = Console(stderr=True)
     # With --json, stdout must stay byte-for-byte JSON: ALL notes → stderr.
     notes = err if json_output else console
