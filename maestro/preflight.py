@@ -92,7 +92,10 @@ def _check_dangling_deps(
     known = {w.id for w in workstreams}
     issues: list[ValidationIssue] = []
     for w in workstreams:
-        unknown = [d for d in w.depends_on if d not in known]
+        # De-duplicated (depends_on has no dedupe validator, so a
+        # mutate-after-load caller can leave repeats) and sorted for a stable,
+        # non-repeating message — mirrors the Pydantic validator's set logic.
+        unknown = sorted({d for d in w.depends_on if d not in known})
         if unknown:
             issues.append(
                 ValidationIssue(
@@ -101,7 +104,7 @@ def _check_dangling_deps(
                     workstream_ids=[w.id],
                     message=(
                         f"Workstream '{w.id}' depends on unknown "
-                        f"workstream(s): {', '.join(sorted(unknown))}. "
+                        f"workstream(s): {', '.join(unknown)}. "
                         "Check the depends_on ids."
                     ),
                 )

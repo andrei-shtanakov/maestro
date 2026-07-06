@@ -307,6 +307,18 @@ class TestDanglingDeps:
         assert len(issues) == 1
         assert "a-missing, z-missing" in issues[0].message
 
+    def test_repeated_unknown_id_deduplicated_in_message(self) -> None:
+        from maestro.preflight import _check_dangling_deps
+
+        # depends_on has no dedupe validator; a mutate-after-load caller can
+        # leave repeats — the message must list the id once, not "ghost, ghost".
+        w = ws("a", ["src/a/**"], [])
+        w.depends_on.extend(["ghost", "ghost"])
+        issues = _check_dangling_deps([w])
+        assert len(issues) == 1
+        assert "ghost" in issues[0].message
+        assert "ghost, ghost" not in issues[0].message
+
     def test_integration_mutate_after_load(self) -> None:
         # bypass the Pydantic load validator by mutating post-construction
         config = make_config([ws("a", ["src/a/**"], []), ws("b", ["src/b/**"], ["a"])])
