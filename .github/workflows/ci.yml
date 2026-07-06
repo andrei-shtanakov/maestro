@@ -141,3 +141,25 @@ jobs:
         env:
           MAESTRO_ARBITER_BIN: ${{ github.workspace }}/arbiter/target/release/arbiter-mcp
         run: uv run python scripts/smoke_benchmark_report.py
+
+  spec-runner-plan-e2e:
+    name: C4 golden — spec-runner plan --full (weekly)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      # No ANTHROPIC_API_KEY/Claude-auth secret is established in this repo's
+      # CI yet (arbiter-e2e above needs none — it never invokes the Claude
+      # CLI). This job is wired skip-safe: the actual test step below only
+      # runs if the secret exists, so an unconfigured repo shows a skipped
+      # step instead of a chronically red weekly job. Add the
+      # ANTHROPIC_API_KEY repo/org secret to make this job exercise for real.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync
+      - name: Install spec-runner
+        run: uv tool install spec-runner
+      - name: Run golden drift test
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        run: uv run pytest tests/test_spec_runner_plan_e2e.py -m slow -v
