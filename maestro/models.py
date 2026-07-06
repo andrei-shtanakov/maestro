@@ -1154,6 +1154,14 @@ class SpecRunnerConfig(BaseModel):
         description="Lint command to run",
     )
     run_lint_on_done: bool = Field(default=True, description="Run lint after task")
+    spec_gen_budget_usd: float | None = Field(
+        default=1.0,
+        ge=0,
+        description=(
+            "USD cap for `spec-runner plan --full` spec generation; "
+            "None disables the cap"
+        ),
+    )
 
     def to_executor_config(self) -> dict[str, Any]:
         """Convert to executor.config.yaml format."""

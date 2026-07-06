@@ -1315,6 +1315,7 @@ async def _run_orchestrator(
         )
         decomposer = ProjectDecomposer(
             repo_path=repo_path,
+            spec_gen_budget_usd=config.spec_runner.spec_gen_budget_usd,
         )
         pr_manager = PRManager(git_manager=git_mgr)
 

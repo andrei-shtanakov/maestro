@@ -14,6 +14,7 @@ from maestro.models import (
     NotificationConfig,
     Priority,
     ProjectConfig,
+    SpecRunnerConfig,
     Task,
     TaskConfig,
     TaskStatus,
@@ -1327,3 +1328,24 @@ class TestFromConfigAutoValidation:
         cfg = TaskConfig(id="t4", title="T", prompt="P")  # default agent=CLAUDE_CODE
         task = Task.from_config(cfg, workdir="/tmp")
         assert task.agent_type is AgentType.CLAUDE_CODE
+
+
+class TestSpecRunnerConfig:
+    """Tests for SpecRunnerConfig model."""
+
+    def test_spec_runner_config_budget_default(self) -> None:
+        """Test that spec_gen_budget_usd defaults to 1.0."""
+        cfg = SpecRunnerConfig()
+        assert cfg.spec_gen_budget_usd == 1.0
+
+    def test_spec_runner_config_budget_none_allowed(self) -> None:
+        """Test that spec_gen_budget_usd can be set to None."""
+        cfg = SpecRunnerConfig(spec_gen_budget_usd=None)
+        assert cfg.spec_gen_budget_usd is None
+
+    def test_spec_runner_config_budget_rejects_negative(self) -> None:
+        """Test that spec_gen_budget_usd rejects negative values."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            SpecRunnerConfig(spec_gen_budget_usd=-1.0)
