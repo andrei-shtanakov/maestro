@@ -5,12 +5,17 @@ and decompose it into independent, non-overlapping work units
 (workstreams). It also generates spec files for each workstream.
 """
 
+import asyncio
+import contextlib
 import json
 import logging
+import os
 import subprocess
+import tempfile
 from fnmatch import fnmatch
 from pathlib import Path
 
+from maestro._vendor.obs import child_env
 from maestro.models import WorkstreamConfig
 
 
@@ -82,57 +87,6 @@ depends_on: list of workstream IDs that must complete first.
 scope: glob patterns for files/dirs this workstream will modify.
 """
 
-SPEC_GENERATION_PROMPT = """\
-Generate a tasks.md file for the following development task. \
-Output ONLY the file content, no explanations or preamble.
-
-## Task
-Title: {title}
-Description: {description}
-Scope: {scope}
-
-## Required Format
-
-spec-runner parses this EXACT format — deviations break parsing.
-
-```
-# Title — Tasks Specification
-
-## Milestone 1: Core Implementation
-
-### TASK-001: First Task Name
-🔴 P0 | ⬜ TODO | Est: 2h
-
-Description of what this task does.
-
-**Checklist:**
-- [ ] First step
-- [ ] Second step
-
-**Depends on:**
-
-### TASK-002: Second Task Name
-🟠 P1 | ⬜ TODO | Est: 1h
-
-Description here.
-
-**Checklist:**
-- [ ] Step one
-- [ ] Step two
-
-**Depends on:** TASK-001
-```
-
-Rules for tasks.md:
-- Task headers MUST be exactly: ### TASK-NNN: Name
-- Metadata line MUST be: EMOJI PRIORITY | EMOJI STATUS | Est: TIME
-- Priority emojis: 🔴 P0 (critical), 🟠 P1 (high), 🟡 P2 (medium), 🟢 P3 (low)
-- Status MUST be: ⬜ TODO (for all new tasks)
-- Estimate format: 1h, 2h, 1-2h, 1d
-- Keep tasks granular (30min-4h each). Include test tasks.
-- Every task MUST have a **Checklist:** section with checkboxes
-"""
-
 
 class ProjectDecomposer:
     """Decomposes a project into independent workstreams.
@@ -145,15 +99,19 @@ class ProjectDecomposer:
         self,
         repo_path: Path,
         claude_command: str = "claude",
+        spec_gen_budget_usd: float | None = 1.0,
     ) -> None:
         """Initialize the decomposer.
 
         Args:
             repo_path: Path to the git repository.
             claude_command: Claude CLI command name.
+            spec_gen_budget_usd: USD cap for `spec-runner plan --full`;
+                None disables the cap.
         """
         self._repo_path = repo_path
         self._claude_command = claude_command
+        self._spec_gen_budget_usd = spec_gen_budget_usd
         self._logger = logging.getLogger(__name__)
 
     def _get_repo_tree(self, max_depth: int = 3) -> str:
@@ -324,77 +282,111 @@ class ProjectDecomposer:
         self._logger.info("Decomposed into %d workstreams", len(workstreams))
         return workstreams
 
-    def generate_spec(
+    async def generate_spec(
         self,
         workstream: WorkstreamConfig,
         workspace_path: Path,
+        timeout_minutes: int = 30,
     ) -> None:
-        """Generate spec files for a workstream.
+        """Generate spec files by delegating to `spec-runner plan --full`.
 
-        Creates spec/requirements.md, spec/design.md, and
-        spec/tasks.md in the workspace directory.
-
-        Args:
-            workstream: The workstream configuration.
-            workspace_path: Path to the workspace directory.
+        Writes spec/{requirements,design,tasks}.md into the workspace.
+        spec-runner owns the tasks.md format (no built-in prompt copy).
 
         Raises:
-            DecomposerError: If spec generation fails.
+            DecomposerError: if spec-runner is missing, exits non-zero,
+                times out, or exits 0 without producing spec/tasks.md.
         """
         spec_dir = workspace_path / "spec"
         spec_dir.mkdir(exist_ok=True)
 
-        prompt = SPEC_GENERATION_PROMPT.format(
-            title=workstream.title,
-            description=workstream.description,
-            scope=", ".join(workstream.scope),
+        description = (
+            f"Title: {workstream.title}\n\n"
+            f"Description: {workstream.description}\n\n"
+            f"Scope: {', '.join(workstream.scope)}"
         )
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", suffix=".md", delete=False
+        ) as desc_file:
+            desc_file.write(description)
+        desc_path = Path(desc_file.name)
 
-        self._logger.info("Generating spec for workstream '%s'", workstream.id)
-        response = self._run_claude(prompt)
+        try:
+            cmd = [
+                "spec-runner",
+                "plan",
+                "--full",
+                "--from-file",
+                desc_file.name,
+                "--no-branch",
+                "--no-commit",
+                "--no-interactive",
+            ]
+            if self._spec_gen_budget_usd is not None:
+                cmd += ["--budget", str(self._spec_gen_budget_usd)]
 
-        # Write tasks.md directly (prompt generates only tasks.md)
-        tasks_path = spec_dir / "tasks.md"
-        tasks_path.write_text(response.strip() + "\n")
-        self._logger.info("Wrote %s", tasks_path)
-
-    def _write_spec_files(self, spec_dir: Path, response: str) -> None:
-        """Parse and write spec files from Claude response.
-
-        Args:
-            spec_dir: Directory to write spec files.
-            response: Claude's response with file markers.
-        """
-        files: dict[str, list[str]] = {}
-        current_file: str | None = None
-
-        for line in response.split("\n"):
-            if line.startswith("--- FILE:") and line.endswith("---"):
-                # Extract filename
-                filename = line.replace("--- FILE:", "").replace("---", "").strip()
-                # Normalize: spec/tasks.md → tasks.md
-                if filename.startswith("spec/"):
-                    filename = filename[5:]
-                current_file = filename
-                files[current_file] = []
-            elif current_file is not None:
-                files[current_file].append(line)
-
-        # If no file markers found, write entire response
-        # as tasks.md
-        if not files:
-            self._logger.warning(
-                "No file markers found in response, writing as tasks.md"
+            self._logger.info(
+                "Generating spec for workstream '%s' via spec-runner plan --full",
+                workstream.id,
             )
-            tasks_path = spec_dir / "tasks.md"
-            tasks_path.write_text(response)
-            return
+            await self._run_spec_runner(cmd, workspace_path, timeout_minutes)
+        finally:
+            desc_path.unlink(missing_ok=True)  # noqa: ASYNC240
 
-        for filename, lines in files.items():
-            filepath = spec_dir / filename
-            content = "\n".join(lines).strip() + "\n"
-            filepath.write_text(content)
-            self._logger.info("Wrote %s", filepath)
+        tasks_path = spec_dir / "tasks.md"
+        if not tasks_path.is_file():
+            msg = (
+                "spec-runner plan --full exited 0 but spec/tasks.md was not "
+                f"created (workstream '{workstream.id}')"
+            )
+            raise DecomposerError(msg)
+        self._logger.info("Spec generated for workstream '%s'", workstream.id)
+
+    async def _run_spec_runner(
+        self, cmd: list[str], cwd: Path, timeout_minutes: int
+    ) -> None:
+        """Run a spec-runner subprocess; terminate it on cancel/timeout."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=cwd,
+                env={**os.environ, **child_env()},
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as e:
+            msg = "spec-runner command not found — is spec-runner installed?"
+            raise DecomposerError(msg) from e
+
+        try:
+            _out, err = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_minutes * 60
+            )
+        except (TimeoutError, asyncio.CancelledError) as e:
+            await self._terminate(proc)
+            if isinstance(e, asyncio.CancelledError):
+                raise  # shutdown-driven; propagate so the caller can go READY
+            msg = f"spec-runner plan --full timed out after {timeout_minutes} min"
+            raise DecomposerError(msg) from e
+
+        if proc.returncode != 0:
+            stderr_text = err.decode("utf-8", "replace")[:500] if err else ""
+            msg = (
+                f"spec-runner plan --full failed with code "
+                f"{proc.returncode}: {stderr_text}"
+            )
+            raise DecomposerError(msg)
+
+    async def _terminate(self, proc: asyncio.subprocess.Process) -> None:
+        """Terminate a spec-runner subprocess, escalating to kill."""
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            await proc.wait()
 
     @staticmethod
     def validate_non_overlap(

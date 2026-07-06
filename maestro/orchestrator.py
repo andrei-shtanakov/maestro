@@ -331,7 +331,7 @@ class Orchestrator:
             depends_on=workstream.depends_on,
             priority=workstream.priority,
         )
-        self._decomposer.generate_spec(workstream_config, workspace)
+        await self._decomposer.generate_spec(workstream_config, workspace)
 
         # Setup spec-runner config
         executor_config = self._config.spec_runner.to_executor_config()

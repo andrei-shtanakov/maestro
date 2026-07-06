@@ -1,9 +1,10 @@
 """Tests for the ProjectDecomposer module."""
 
+import asyncio
 import json
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -327,152 +328,144 @@ class TestDecompose:
 
 
 class TestGenerateSpec:
-    """Tests for the generate_spec method."""
+    """generate_spec delegates to `spec-runner plan --full` (async)."""
 
-    @patch("maestro.decomposer.subprocess.run")
-    def test_generate_spec_creates_tasks_file(
-        self, mock_run: MagicMock, temp_dir: Path
+    @pytest.fixture
+    def workstream(self) -> WorkstreamConfig:
+        return WorkstreamConfig(
+            id="ws1",
+            title="Feature X",
+            description="Do the thing",
+            scope=["src/x.py", "tests/test_x.py"],
+        )
+
+    def _fake_proc(self, returncode: int = 0, stderr: bytes = b""):
+        proc = MagicMock()
+        proc.returncode = returncode
+        proc.communicate = AsyncMock(return_value=(b"", stderr))
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock(return_value=returncode)
+        return proc
+
+    @pytest.mark.anyio
+    async def test_invokes_spec_runner_plan_full(
+        self, temp_dir: Path, workstream: WorkstreamConfig
     ) -> None:
-        """Test generate_spec creates tasks.md in spec/ directory."""
-        mock_run.return_value = _make_subprocess_result(
-            stdout=_make_spec_response(),
-        )
-
-        workstream = WorkstreamConfig(
-            id="auth-module",
-            title="Authentication Module",
-            description="Implement user authentication",
-            scope=["src/auth/**"],
-        )
-        workspace = temp_dir / "workspace"
+        workspace = temp_dir / "ws"
         workspace.mkdir()
+        (workspace / "spec").mkdir()
+        (workspace / "spec" / "tasks.md").write_text("# tasks\n", encoding="utf-8")
+        dec = ProjectDecomposer(repo_path=temp_dir)
+        proc = self._fake_proc()
+        with patch(
+            "asyncio.create_subprocess_exec", AsyncMock(return_value=proc)
+        ) as exec_mock:
+            await dec.generate_spec(workstream, workspace)
+        cmd = list(exec_mock.call_args[0])
+        assert cmd[:4] == ["spec-runner", "plan", "--full", "--from-file"]
+        assert "--no-branch" in cmd and "--no-commit" in cmd
+        assert "--no-interactive" in cmd
+        assert "--budget" in cmd and cmd[cmd.index("--budget") + 1] == "1.0"
+        assert exec_mock.call_args.kwargs["cwd"] == workspace
 
-        decomposer = ProjectDecomposer(temp_dir)
-        decomposer.generate_spec(workstream, workspace)
-
-        spec_dir = workspace / "spec"
-        assert spec_dir.is_dir()
-        assert (spec_dir / "tasks.md").exists()
-
-    @patch("maestro.decomposer.subprocess.run")
-    def test_generate_spec_tasks_content(
-        self, mock_run: MagicMock, temp_dir: Path
+    @pytest.mark.anyio
+    async def test_description_file_has_workstream_fields(
+        self, temp_dir: Path, workstream: WorkstreamConfig
     ) -> None:
-        """Test generate_spec writes correct content to tasks.md."""
-        mock_run.return_value = _make_subprocess_result(
-            stdout=_make_spec_response(),
-        )
+        workspace = temp_dir / "ws"
+        (workspace / "spec").mkdir(parents=True)
+        (workspace / "spec" / "tasks.md").write_text("x", encoding="utf-8")
+        dec = ProjectDecomposer(repo_path=temp_dir)
+        captured = {}
 
-        workstream = WorkstreamConfig(
-            id="auth-module",
-            title="Authentication Module",
-            description="Implement user authentication",
-            scope=["src/auth/**"],
-        )
-        workspace = temp_dir / "workspace"
-        workspace.mkdir()
+        async def fake_exec(*args, **kwargs):
+            desc_path = args[args.index("--from-file") + 1]
+            captured["text"] = Path(desc_path).read_text(  # noqa: ASYNC240
+                encoding="utf-8"
+            )
+            return self._fake_proc()
 
-        decomposer = ProjectDecomposer(temp_dir)
-        decomposer.generate_spec(workstream, workspace)
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            await dec.generate_spec(workstream, workspace)
+        assert "Feature X" in captured["text"]
+        assert "Do the thing" in captured["text"]
+        assert "src/x.py" in captured["text"]
 
-        spec_dir = workspace / "spec"
-        tasks_text = (spec_dir / "tasks.md").read_text()
-        assert "Tasks" in tasks_text
-        assert "TASK-001" in tasks_text
-
-    @patch("maestro.decomposer.subprocess.run")
-    def test_generate_spec_raises_on_claude_failure(
-        self, mock_run: MagicMock, temp_dir: Path
+    @pytest.mark.anyio
+    async def test_budget_none_omits_flag(
+        self, temp_dir: Path, workstream: WorkstreamConfig
     ) -> None:
-        """Test generate_spec raises DecomposerError on Claude CLI failure."""
-        mock_run.return_value = _make_subprocess_result(
-            returncode=1,
-            stderr="Error: something went wrong",
-        )
+        workspace = temp_dir / "ws"
+        (workspace / "spec").mkdir(parents=True)
+        (workspace / "spec" / "tasks.md").write_text("x", encoding="utf-8")
+        dec = ProjectDecomposer(repo_path=temp_dir, spec_gen_budget_usd=None)
+        proc = self._fake_proc()
+        with patch(
+            "asyncio.create_subprocess_exec", AsyncMock(return_value=proc)
+        ) as exec_mock:
+            await dec.generate_spec(workstream, workspace)
+        assert "--budget" not in list(exec_mock.call_args[0])
 
-        workstream = WorkstreamConfig(
-            id="auth-module",
-            title="Authentication Module",
-            description="Implement user authentication",
-            scope=["src/auth/**"],
-        )
-        workspace = temp_dir / "workspace"
-        workspace.mkdir()
-
-        decomposer = ProjectDecomposer(temp_dir)
-
-        with pytest.raises(DecomposerError, match="Claude CLI failed"):
-            decomposer.generate_spec(workstream, workspace)
-
-    @patch("maestro.decomposer.subprocess.run")
-    def test_generate_spec_fallback_when_no_markers(
-        self, mock_run: MagicMock, temp_dir: Path
+    @pytest.mark.anyio
+    async def test_nonzero_exit_raises(
+        self, temp_dir: Path, workstream: WorkstreamConfig
     ) -> None:
-        """Test generate_spec writes tasks.md when no file markers found."""
-        mock_run.return_value = _make_subprocess_result(
-            stdout="Some plain text response without file markers.\n",
-        )
+        workspace = temp_dir / "ws"
+        (workspace / "spec").mkdir(parents=True)
+        dec = ProjectDecomposer(repo_path=temp_dir)
+        proc = self._fake_proc(returncode=1, stderr=b"boom")
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(DecomposerError, match="boom"),
+        ):
+            await dec.generate_spec(workstream, workspace)
 
-        workstream = WorkstreamConfig(
-            id="auth-module",
-            title="Authentication Module",
-            description="Implement user authentication",
-            scope=["src/auth/**"],
-        )
-        workspace = temp_dir / "workspace"
-        workspace.mkdir()
-
-        decomposer = ProjectDecomposer(temp_dir)
-        decomposer.generate_spec(workstream, workspace)
-
-        spec_dir = workspace / "spec"
-        assert (spec_dir / "tasks.md").exists()
-        content = (spec_dir / "tasks.md").read_text()
-        assert "Some plain text response" in content
-
-    @patch("maestro.decomposer.subprocess.run")
-    def test_generate_spec_creates_spec_directory(
-        self, mock_run: MagicMock, temp_dir: Path
+    @pytest.mark.anyio
+    async def test_zero_exit_but_no_tasks_file_raises(
+        self, temp_dir: Path, workstream: WorkstreamConfig
     ) -> None:
-        """Test generate_spec creates spec/ directory if it does not exist."""
-        mock_run.return_value = _make_subprocess_result(
-            stdout=_make_spec_response(),
-        )
+        workspace = temp_dir / "ws"
+        (workspace / "spec").mkdir(parents=True)  # no tasks.md written
+        dec = ProjectDecomposer(repo_path=temp_dir)
+        proc = self._fake_proc(returncode=0)
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(DecomposerError, match=r"tasks\.md"),
+        ):
+            await dec.generate_spec(workstream, workspace)
 
-        workstream = WorkstreamConfig(
-            id="auth-module",
-            title="Authentication Module",
-            description="Implement user authentication",
-            scope=["src/auth/**"],
-        )
-        workspace = temp_dir / "workspace"
-        workspace.mkdir()
-
-        decomposer = ProjectDecomposer(temp_dir)
-        decomposer.generate_spec(workstream, workspace)
-
-        assert (workspace / "spec").is_dir()
-
-    @patch("maestro.decomposer.subprocess.run")
-    def test_generate_spec_raises_on_timeout(
-        self, mock_run: MagicMock, temp_dir: Path
+    @pytest.mark.anyio
+    async def test_spec_runner_not_found_raises(
+        self, temp_dir: Path, workstream: WorkstreamConfig
     ) -> None:
-        """Test generate_spec raises DecomposerError on timeout."""
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["claude"], timeout=600)
+        workspace = temp_dir / "ws"
+        (workspace / "spec").mkdir(parents=True)
+        dec = ProjectDecomposer(repo_path=temp_dir)
+        with (
+            patch(
+                "asyncio.create_subprocess_exec",
+                AsyncMock(side_effect=FileNotFoundError("spec-runner")),
+            ),
+            pytest.raises(DecomposerError, match="spec-runner"),
+        ):
+            await dec.generate_spec(workstream, workspace)
 
-        workstream = WorkstreamConfig(
-            id="auth-module",
-            title="Authentication Module",
-            description="Implement user authentication",
-            scope=["src/auth/**"],
-        )
-        workspace = temp_dir / "workspace"
-        workspace.mkdir()
-
-        decomposer = ProjectDecomposer(temp_dir)
-
-        with pytest.raises(DecomposerError, match="timed out"):
-            decomposer.generate_spec(workstream, workspace)
+    @pytest.mark.anyio
+    async def test_cancellation_terminates_subprocess(
+        self, temp_dir: Path, workstream: WorkstreamConfig
+    ) -> None:
+        workspace = temp_dir / "ws"
+        (workspace / "spec").mkdir(parents=True)
+        dec = ProjectDecomposer(repo_path=temp_dir)
+        proc = self._fake_proc()
+        proc.communicate = AsyncMock(side_effect=asyncio.CancelledError())
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await dec.generate_spec(workstream, workspace)
+        proc.terminate.assert_called_once()
 
 
 # =============================================================================

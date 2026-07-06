@@ -65,7 +65,7 @@ def mock_decomposer() -> MagicMock:
     """Provide a mock ProjectDecomposer."""
     decomposer = MagicMock()
     decomposer.decompose = MagicMock(return_value=[])
-    decomposer.generate_spec = MagicMock()
+    decomposer.generate_spec = AsyncMock()
     return decomposer
 
 
