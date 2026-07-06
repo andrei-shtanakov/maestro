@@ -265,3 +265,81 @@ class TestInvalidScopePatterns:
         config = make_config([ws("a", ["src/foo..bar/**"], [])], repo_path=str(repo))
         report = validate_project(config)
         assert not any(i.code == "scope-invalid-pattern" for i in report.issues)
+
+
+class TestDanglingDeps:
+    def test_single_unknown_dep_is_error(self) -> None:
+        from maestro.preflight import _check_dangling_deps
+
+        issues = _check_dangling_deps(
+            [ws("a", ["src/a/**"], []), ws("b", ["src/b/**"], ["nope"])]
+        )
+        assert len(issues) == 1
+        assert issues[0].severity == "error"
+        assert issues[0].code == "dangling-dep"
+        assert issues[0].workstream_ids == ["b"]
+        assert "nope" in issues[0].message
+
+    def test_all_deps_valid_is_empty(self) -> None:
+        from maestro.preflight import _check_dangling_deps
+
+        issues = _check_dangling_deps(
+            [ws("a", ["src/a/**"], []), ws("b", ["src/b/**"], ["a"])]
+        )
+        assert issues == []
+
+    def test_each_dangling_workstream_gets_one_issue(self) -> None:
+        from maestro.preflight import _check_dangling_deps
+
+        issues = _check_dangling_deps(
+            [ws("a", ["src/a/**"], ["x"]), ws("b", ["src/b/**"], ["y"])]
+        )
+        assert {i.workstream_ids[0] for i in issues} == {"a", "b"}
+        assert len(issues) == 2
+
+    def test_multiple_unknown_ids_sorted_in_message(self) -> None:
+        from maestro.preflight import _check_dangling_deps
+
+        issues = _check_dangling_deps(
+            [ws("a", ["src/a/**"], ["z-missing", "a-missing"])]
+        )
+        # one issue, unknown ids listed sorted (a-missing before z-missing)
+        assert len(issues) == 1
+        assert "a-missing, z-missing" in issues[0].message
+
+    def test_repeated_unknown_id_deduplicated_in_message(self) -> None:
+        from maestro.preflight import _check_dangling_deps
+
+        # depends_on has no dedupe validator; a mutate-after-load caller can
+        # leave repeats — the message must list the id once, not "ghost, ghost".
+        w = ws("a", ["src/a/**"], [])
+        w.depends_on.extend(["ghost", "ghost"])
+        issues = _check_dangling_deps([w])
+        assert len(issues) == 1
+        assert "ghost" in issues[0].message
+        assert "ghost, ghost" not in issues[0].message
+
+    def test_integration_mutate_after_load(self) -> None:
+        # bypass the Pydantic load validator by mutating post-construction
+        config = make_config([ws("a", ["src/a/**"], []), ws("b", ["src/b/**"], ["a"])])
+        config.workstreams[1].depends_on.append("does-not-exist")
+        report = validate_project(config, check_fs=False)
+        assert report.ok is False
+        assert any(i.code == "dangling-dep" for i in report.issues)
+
+    def test_integration_cyclic_and_dangling_independent(self) -> None:
+        # a<->b cycle constructs at load (validator accepts pure cycles),
+        # then mutate in a dangling edge → both codes present, independently
+        config = make_config(
+            [ws("a", ["src/a/**"], ["b"]), ws("b", ["src/b/**"], ["a"])]
+        )
+        config.workstreams[0].depends_on.append("ghost")
+        report = validate_project(config, check_fs=False)
+        codes = {i.code for i in report.issues}
+        assert "dangling-dep" in codes
+        assert "dag-cycle" in codes
+
+    def test_valid_project_has_no_dangling_dep(self) -> None:
+        config = make_config([ws("a", ["src/a/**"], []), ws("b", ["src/b/**"], ["a"])])
+        report = validate_project(config, check_fs=False)
+        assert all(i.code != "dangling-dep" for i in report.issues)

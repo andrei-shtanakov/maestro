@@ -93,7 +93,7 @@ uv add --dev <package>
 - **cost_tracker.py**: Token usage parsing and cost calculation
 - **event_log.py**: Structured event logging for task lifecycle
 - **merge_logs.py**: Standalone merge-logs CLI — time-sorts per-pid JSONL into merged.jsonl
-- **preflight.py**: Mode-2 config validation — ValidationReport (errors/warnings), cycle detection via shared dag.find_cycle, two-tier scope-overlap (static heuristic + exact file-set intersection), repo/glob filesystem checks; runs standalone (`maestro validate`) and as a fail-fast gate inside `maestro orchestrate`
+- **preflight.py**: Mode-2 config validation — ValidationReport (errors/warnings), dangling-dep + cycle detection (shared dag.find_cycle), two-tier scope-overlap (static heuristic + exact file-set intersection), repo/glob filesystem checks; runs standalone (`maestro validate`) and as a fail-fast gate inside `maestro orchestrate`
 - **scaffold.py**: `maestro init` generator — commented project.yaml template with git-derived autofill, self-checked against OrchestratorConfig before writing
 - **spec_runner.py**: Integration boundary between Maestro and the external spec-runner
 
