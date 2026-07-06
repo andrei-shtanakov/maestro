@@ -1070,8 +1070,9 @@ def benchmark(
     agent: str = typer.Option(
         ...,
         "--agent",
-        help="Harness: claude_code | codex_cli | aider | opencode. "
-        "Model comes from MAESTRO_<HARNESS>_MODEL / the catalog default.",
+        help="Harness: claude_code | codex_cli | aider | opencode. Model "
+        "comes from MAESTRO_CLAUDE_MODEL / MAESTRO_CODEX_MODEL / "
+        "MAESTRO_OPENCODE_MODEL or the catalog default (aider ignores model).",
     ),
     workdir: Path | None = typer.Option(
         None, "--workdir", help="Working dir (default: fresh temp dir; kept)"

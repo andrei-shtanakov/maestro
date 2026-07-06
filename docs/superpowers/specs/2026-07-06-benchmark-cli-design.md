@@ -46,8 +46,11 @@ optionally report it to the arbiter for routing signal.
   "agent CLI '<type>' not found in PATH" (exit 1). No tokens are spent on
   a doomed run.
 - Model override is NOT part of M5 (`SpawnerResponder` does not take a
-  model). The existing env layer works: `MAESTRO_<HARNESS>_MODEL` /
-  catalog default. The command help mentions this.
+  model). The existing env layer works: the per-harness env var
+  (`MAESTRO_CLAUDE_MODEL` / `MAESTRO_CODEX_MODEL` /
+  `MAESTRO_OPENCODE_MODEL` — the names are NOT a mechanical uppercase of
+  the harness id) or the catalog default; aider ignores model selection
+  entirely. The command help mentions this.
 
 ### Working directory / timeout validation
 
@@ -57,8 +60,9 @@ optionally report it to the arbiter for routing signal.
   must still know where the partial logs live.
 - `log_dir = <workdir>/logs` (created). Neither is cleaned up after the
   run — logs are the post-mortem material.
-- `--timeout` validated `> 0` (Typer `min=` constraint), default 300.0
-  (the responder's own default).
+- `--timeout` validated `> 0` via a body check (`<= 0` → exit 2 with our
+  own message, not a Typer `min=` usage error), default 300.0 (the
+  responder's own default).
 
 ### Run
 
