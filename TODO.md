@@ -128,6 +128,12 @@
 
 ---
 
+## C4 — Decomposer delegation
+
+- [x] **Delegate spec generation to spec-runner plan --full** (closed by feat/c4-decomposer-delegation): spec-runner owns the tasks.md format; removed SPEC_GENERATION_PROMPT and _write_spec_files.
+
+---
+
 ## Чего НЕ делать до стабилизации
 
 - ❌ Shared type library (R-14, XL) — преждевременно, сначала зафиксировать схемы
