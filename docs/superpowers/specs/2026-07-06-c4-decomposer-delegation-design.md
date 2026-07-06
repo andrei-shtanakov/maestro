@@ -7,7 +7,11 @@
 `decomposer.py` carries a built-in copy of spec-runner's `tasks.md` format
 (`SPEC_GENERATION_PROMPT`, "spec-runner parses this EXACT format") — a
 duplicated format contract with a single true owner (spec-runner). This spec
-replaces the built-in prompt with a delegation to `spec-runner plan --full`.
+replaces the built-in prompt with a delegation to `spec-runner plan --full`,
+and — because `--full` runs ~6 min vs today's ~54s — also converts the
+now-longer spec generation to an async background task so it does not
+serialize Mode-2's parallel pipeline (see §1b). So C4 is delegation PLUS a
+targeted orchestrator concurrency change, not pure wiring.
 
 ## Delegation mode decided by measurement (2026-07-06)
 
@@ -30,34 +34,79 @@ See memory `project_c4_full_deferred` for the full measurement.
 
 ## Changes
 
-### 1. `generate_spec` delegates to spec-runner (REQ-501/503/504)
+### 1. `generate_spec` delegates to spec-runner, ASYNC (REQ-501/503/504)
 
-`ProjectDecomposer.generate_spec(workstream, workspace_path)`
-(decomposer.py:327) — replace the `SPEC_GENERATION_PROMPT` + `_run_claude` +
-write-`tasks.md` body with a spec-runner subprocess:
+`ProjectDecomposer.generate_spec` becomes
+`async def generate_spec(workstream, workspace_path)` (decomposer.py:327) —
+replacing the `SPEC_GENERATION_PROMPT` + `_run_claude` + write-`tasks.md` body
+with an async spec-runner subprocess. Async is REQUIRED, not cosmetic: `--full`
+runs ~6 min and today's call blocks the orchestrator's event loop inline (see
+§1b).
 
 - Build the feature description from `WorkstreamConfig` fields:
   `"Title: {title}\n\nDescription: {description}\n\nScope: {', '.join(scope)}"`
   (the shape verified working with `--from-file` during the measurement).
-  Write it to a `tempfile.NamedTemporaryFile` OUTSIDE `workspace_path`
-  (the workspace is a git worktree that gets committed — a desc file inside
-  it could be swept into the spec commit); delete it in a `finally`.
-- `subprocess.run(cmd, cwd=workspace_path, capture_output=True, text=True,
-  timeout=..., check=False)` where
+  Write it to a `tempfile.NamedTemporaryFile("w", encoding="utf-8",
+  delete=False)` OUTSIDE `workspace_path` (the workspace is a git worktree
+  that gets committed — a desc file inside it could be swept into the spec
+  commit); `Path(tmp).unlink(missing_ok=True)` in a `finally` (delete=False +
+  explicit unlink is the Windows-safe pattern).
+- `proc = await asyncio.create_subprocess_exec(*cmd, cwd=workspace_path,
+  env={**os.environ, **child_env()}, stdout=PIPE, stderr=PIPE)` then
+  `await asyncio.wait_for(proc.communicate(), timeout=...)` where
   `cmd = ["spec-runner", "plan", "--full", "--from-file", <desc_path>,
   "--no-branch", "--no-commit", "--no-interactive"]` plus
-  `["--budget", str(budget)]` when a budget is set (see §4). `--full` writes
-  `spec/{requirements,design,tasks}.md` into `cwd` — exactly where the
-  orchestrator already expects them.
-- Timeout: `--full` runs ~6 min; use a generous default (e.g. 30 min,
-  matching `_run_claude`'s existing 15-min-per-call ×~2 headroom — parametrize
-  so tests don't wait).
+  `["--budget", str(budget)]` when a budget is set (§4). This mirrors the
+  existing `run --all` spawn (orchestrator.py:360), including `child_env()`
+  for trace propagation. `--full` writes `spec/{requirements,design,tasks}.md`
+  into `cwd`.
+- Timeout: `--full` runs ~6 min; default 30 min (parametrized so tests don't
+  wait). `asyncio.TimeoutError` → kill the subprocess → `DecomposerError`.
 - Non-zero exit → `DecomposerError` with the return code and `stderr[:500]`
-  logged (mirrors `_run_claude`'s existing error shape). `FileNotFoundError`
+  (mirrors `_run_claude`'s existing error shape). `FileNotFoundError`
   (spec-runner not installed) → `DecomposerError` with an actionable message.
-- The subprocess runs synchronously (`subprocess.run`), matching the current
-  synchronous `generate_spec` contract; the orchestrator calls it the same
-  way (orchestrator.py:334).
+- **Post-condition check (fail fast):** after a zero exit, assert
+  `(workspace_path / "spec" / "tasks.md").is_file()`; if absent →
+  `DecomposerError("spec-runner plan --full exited 0 but spec/tasks.md was
+  not created")`. A silent output-path/behavior shift must fail HERE, not
+  surface later inside `run --all`.
+
+### 1b. Concurrency model — generation is a background task (fixes the 6-min block)
+
+**Problem this change would otherwise cause:** `_spawn_ready` (orchestrator.py:
+279) loops `for zid in ready[:available]: await self._spawn_workstream(zid)`,
+and `_spawn_workstream` calls `generate_spec` inline. Today's ~54s Claude call
+already blocks the event loop per workstream; `--full`'s ~6 min turns
+max_concurrent=3 into ~18 min of blocked loop during which `_monitor_running`
+and shutdown cannot run — silently converting Mode-2's parallel pipeline into
+a serial queue.
+
+**Design:**
+
+- `_spawn_workstream` no longer runs generation inline. It launches a
+  background task: `self._generating[zid] = asyncio.create_task(
+  self._generate_and_launch(zid))` and returns immediately.
+- `_generate_and_launch(zid)` runs the former inline body as a coroutine:
+  DECOMPOSING → create workspace → `await generate_spec(...)` → setup
+  spec-runner config → commit spec (existing `run_in_executor` git step) →
+  spawn `run --all` (existing `create_subprocess_exec`) → add to
+  `self._running`. On completion it removes `zid` from `self._generating`;
+  any exception → workstream FAILED (same handling as today's spawn error).
+- **Slot accounting (no overspawn):**
+  `available = max_concurrent - len(self._running) - len(self._generating)` —
+  a DECOMPOSING workstream occupies a slot for the whole generation, so the
+  loop never launches more than `max_concurrent` concurrent
+  generation+run pipelines.
+- The main loop is unchanged in shape (`_spawn_ready` → `_monitor_running` →
+  wait) but `_spawn_ready` now returns in milliseconds; monitoring and
+  shutdown stay responsive while generations proceed concurrently in the
+  background.
+- **Shutdown:** on `_shutdown_requested`, in-flight `_generating` tasks are
+  cancelled and their subprocesses terminated; the affected workstreams are
+  left in a resumable state (returned to READY, since no `run --all` started
+  yet) so `--resume` can re-generate. Generations already past the
+  `run --all` spawn are tracked in `_running` and handled by the existing
+  shutdown path.
 
 ### 2. Remove the format duplication (REQ-502)
 
@@ -75,12 +124,14 @@ remains anywhere in `decomposer.py`. spec-runner is the sole format owner.
 
 ### 4. Budget cap (plumbed, user decision 2026-07-06)
 
-- New `SpecRunnerConfig.spec_gen_budget_usd: float | None = Field(default=5.0,
+- New `SpecRunnerConfig.spec_gen_budget_usd: float | None = Field(default=1.0,
   ge=0, description="USD cap for `spec-runner plan --full` spec generation; "
-  "None disables the cap")` — configurable per project.yaml; the 5.0 default
-  is ~20× the measured ~$0.25/workstream, generous headroom against a
-  runaway plan.
-- `ProjectDecomposer.__init__` gains `spec_gen_budget_usd: float | None = 5.0`.
+  "None disables the cap")` — configurable per project.yaml. Default 1.0 is
+  ~4-10× the measured ~$0.1-0.25/workstream: real protection against a runaway
+  plan without being a de-facto no-cap (5.0 × 10-20 workstreams would be a
+  meaningless ceiling). Explicit `None` is the opt-out for large/unusual
+  specs.
+- `ProjectDecomposer.__init__` gains `spec_gen_budget_usd: float | None = 1.0`.
 - The `orchestrate` CLI (where the decomposer is constructed) passes
   `config.spec_runner.spec_gen_budget_usd` into the decomposer.
 - `generate_spec` appends `["--budget", str(budget)]` only when the value is
@@ -105,30 +156,55 @@ that fact would be guesswork.
 
 ### 6. Backward compatibility (REQ-506)
 
-`generate_spec`'s signature and its contract ("writes `spec/` into the
-workspace") are unchanged. orchestrator (spawn/scope/PR), workspace lifecycle,
-and downstream `spec-runner run --all` are untouched. The only observable
-change: `spec/` now also contains `requirements.md` and `design.md` (extra
-files; harmless — `run --all` reads only `tasks.md`).
+`generate_spec`'s output contract ("writes `spec/` into the workspace") is
+unchanged; its signature gains `async` (the sole caller is the orchestrator,
+updated in §1b). workspace lifecycle, scope, PR flow, and downstream
+`spec-runner run --all` are untouched. Observable changes: (a) `spec/` now
+also contains `requirements.md` and `design.md` (harmless — `run --all` reads
+only `tasks.md`); (b) Mode-2 spec generation now runs concurrently in the
+background instead of blocking the loop (a strict improvement). `--resume`
+semantics are preserved: a workstream interrupted during DECOMPOSING returns
+to READY and re-generates on resume.
 
 ## Testing
 
-- Unit (mock `subprocess.run`): command shape is
-  `["spec-runner", "plan", "--full", "--from-file", <path>, "--no-branch",
-  "--no-commit", "--no-interactive", "--budget", "5.0"]`; `cwd=workspace_path`;
-  the description file contains title/description/scope; non-zero exit →
-  `DecomposerError` carrying the code + stderr; `FileNotFoundError` →
-  `DecomposerError` with an actionable message.
-- Budget: `spec_gen_budget_usd=None` → no `--budget` flag; a custom value →
-  `--budget <value>`.
-- Regression: `decompose()` still works via `_run_claude` (untouched);
-  existing decomposer tests green.
-- Grep guard: `SPEC_GENERATION_PROMPT` and `_write_spec_files` absent from the
-  repo after the change.
-- Golden (optional, real subprocess): a real `spec-runner plan --full` on a
-  fixture workstream produces a `spec/tasks.md` that `spec-runner`'s own task
-  parser accepts — auto-skipped when spec-runner is absent (mirrors the
-  `arbiter-e2e` optional-binary pattern), NOT in the default suite.
+**Decomposer unit (mock `asyncio.create_subprocess_exec`):** command shape is
+`["spec-runner", "plan", "--full", "--from-file", <path>, "--no-branch",
+"--no-commit", "--no-interactive", "--budget", "1.0"]`; `cwd=workspace_path`;
+the description file contains title/description/scope; non-zero exit →
+`DecomposerError` carrying code + stderr; `FileNotFoundError` →
+`DecomposerError` with an actionable message; timeout → subprocess killed +
+`DecomposerError`. Post-condition: zero exit but no `spec/tasks.md` →
+`DecomposerError` (mock the subprocess to exit 0 without writing the file).
+Budget: `None` → no `--budget` flag; a custom value → `--budget <value>`. The
+async test uses `@pytest.mark.anyio`.
+
+**Orchestration-level (the point-1 regression guard, mock decomposer +
+spawner):**
+- Generation runs as a background task: `_spawn_ready` returns promptly while
+  a slow (awaitable) `generate_spec` is still in flight; `_monitor_running`
+  gets to run in the same period.
+- Slot accounting: with `max_concurrent=2` and 3 ready workstreams, at most 2
+  are in `_generating`+`_running` at once — the 3rd waits (no overspawn).
+- On generation success the workstream moves `_generating` → `_running` and
+  `run --all` is spawned; on generation failure → FAILED, slot freed.
+- Shutdown mid-generation: in-flight generation is cancelled, its subprocess
+  terminated, the workstream returns to READY.
+
+**Regression:** `decompose()` still works via `_run_claude` (untouched);
+existing decomposer/orchestrator tests green.
+
+**Grep guard:** `SPEC_GENERATION_PROMPT` and `_write_spec_files` absent from
+the repo after the change.
+
+**Golden — a real CI job (drift guard, not optional):** with the runtime
+version gate deferred (§5), a real `spec-runner plan --full` on a fixture
+workstream, asserting the produced `spec/tasks.md` is accepted by
+spec-runner's own task parser, is the ONLY protection against authoring-format
+drift. It runs as a **weekly-scheduled** CI job (mirroring the `arbiter-e2e`
+drift-check cadence) — NOT per-PR, because `plan --full` spends real Claude
+tokens. Locally it auto-skips when spec-runner is absent. This job is a
+required deliverable of C4, not a nice-to-have.
 
 ## Out of scope
 
