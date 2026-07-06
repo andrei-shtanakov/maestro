@@ -83,3 +83,7 @@ re-validation). Реальный остаток бага: `preflight.validate_pr
 Severity понижен: low (defense-in-depth для программного пути, не user-facing).
 Фикс из отчёта (`dangling-dep` issue в validate_project) остаётся уместным и
 дешёвым — но как hardening, не как баг CLI.
+
+**Resolved** by `fix/preflight-dangling-dep` (commit 0e92a39): `_check_dangling_deps`
+in preflight emits an `error` `dangling-dep` for unknown `depends_on` ids, covering
+the programmatic mutate-after-load path.

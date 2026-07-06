@@ -2,8 +2,9 @@
 
 Aggregates errors and warnings into a ValidationReport instead of raising,
 so callers can render everything at once. Schema-level validation (duplicate
-ids, unknown deps, self-deps) stays in the pydantic models and is NOT
-re-implemented here.
+ids, unknown deps, self-deps) catches these on config load in the pydantic
+models; preflight repeats selected graph-integrity checks (dangling deps,
+cycles) as defense-in-depth for configs mutated programmatically after load.
 
 Used by the `maestro validate` CLI command and by `maestro orchestrate`
 as a fail-fast preflight.
@@ -70,6 +71,7 @@ def validate_project(
     overlap_pairs: set[frozenset[str]] = set()
 
     if config.workstreams:
+        issues.extend(_check_dangling_deps(config.workstreams))
         issues.extend(_check_cycles(config.workstreams))
         issues.extend(_check_scope_empty(config.workstreams))
         issues.extend(_check_overlap_static(config.workstreams, overlap_pairs))
@@ -82,6 +84,29 @@ def validate_project(
             issues.extend(_check_scope_fs(config.workstreams, repo, overlap_pairs))
 
     return ValidationReport(issues=issues)
+
+
+def _check_dangling_deps(
+    workstreams: list[WorkstreamConfig],
+) -> list[ValidationIssue]:
+    known = {w.id for w in workstreams}
+    issues: list[ValidationIssue] = []
+    for w in workstreams:
+        unknown = [d for d in w.depends_on if d not in known]
+        if unknown:
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    code="dangling-dep",
+                    workstream_ids=[w.id],
+                    message=(
+                        f"Workstream '{w.id}' depends on unknown "
+                        f"workstream(s): {', '.join(sorted(unknown))}. "
+                        "Check the depends_on ids."
+                    ),
+                )
+            )
+    return issues
 
 
 def _check_cycles(workstreams: list[WorkstreamConfig]) -> list[ValidationIssue]:
