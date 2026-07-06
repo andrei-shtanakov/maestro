@@ -25,9 +25,14 @@ from maestro.models import (
 logger = logging.getLogger(__name__)
 
 
-# Pinned spec-runner version. Maestro generates `spec-runner.config.yaml`
-# and parses `.executor-state.{db,json}` against this version's schema.
-# Bumping requires reviewing the contract tests and any format changes.
+# Pinned spec-runner version. Maestro generates `spec-runner.config.yaml`,
+# parses `.executor-state.{db,json}`, AND delegates spec generation to
+# `spec-runner plan --full` (C4) against this version's contract: the
+# `--full` / `--from-file` / `--no-interactive` flags and the
+# `spec/{requirements,design,tasks}.md` output layout. This constant is a
+# DOC pin — it is not asserted at runtime (a runtime version gate is a
+# separate hardening ticket). Bumping requires reviewing the contract tests
+# and any format changes.
 SPEC_RUNNER_REQUIRED_VERSION = "2.0.0"
 
 # Filenames inside the workspace's `spec/` directory. SQLite is the canonical

@@ -5,6 +5,7 @@ covering initialization, workstream resolution, failure handling,
 PR body formatting, and shutdown behavior.
 """
 
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
@@ -65,7 +66,7 @@ def mock_decomposer() -> MagicMock:
     """Provide a mock ProjectDecomposer."""
     decomposer = MagicMock()
     decomposer.decompose = MagicMock(return_value=[])
-    decomposer.generate_spec = MagicMock()
+    decomposer.generate_spec = AsyncMock()
     return decomposer
 
 
@@ -204,6 +205,26 @@ class TestOrchestratorInit:
     ) -> None:
         """Test that is_running is False before run() is called."""
         assert orchestrator.is_running is False
+
+
+def _ws(
+    zid: str,
+    status: WorkstreamStatus,
+    *,
+    retry_count: int = 0,
+    max_retries: int = 3,
+) -> Workstream:
+    """Create a minimal valid Workstream for background-generation tests."""
+    return Workstream(
+        id=zid,
+        title=zid,
+        description="d",
+        scope=["s"],
+        branch=f"feature/{zid}",
+        status=status,
+        retry_count=retry_count,
+        max_retries=max_retries,
+    )
 
 
 # =============================================================================
@@ -717,3 +738,288 @@ class TestShutdown:
 
         assert orchestrator._shutdown_event.is_set()
         assert orchestrator._shutdown_requested is True
+
+
+# =============================================================================
+# Background generation Tests
+# =============================================================================
+
+
+class TestBackgroundGeneration:
+    """Tests for async background-task spec generation (_spawn_ready,
+    _generate_and_launch, _cleanup)."""
+
+    @pytest.mark.anyio
+    async def test_spawn_ready_does_not_block_on_generation(
+        self, orchestrator, mock_db, mock_decomposer
+    ) -> None:
+        """generate_spec is launched as a background task; _spawn_ready
+        returns before it completes."""
+        import asyncio
+
+        gate = asyncio.Event()
+
+        async def slow_generate(*a, **k):
+            await gate.wait()
+
+        mock_decomposer.generate_spec = AsyncMock(side_effect=slow_generate)
+        mock_db.get_workstream = AsyncMock(
+            return_value=_ws("z1", WorkstreamStatus.READY)
+        )
+
+        await orchestrator._spawn_ready(["z1"])
+        # generation still in flight, but _spawn_ready already returned:
+        assert "z1" in orchestrator._generating
+        assert not orchestrator._generating["z1"].done()
+        gate.set()
+        await orchestrator._generating["z1"]  # let it finish/cleanup
+
+    @pytest.mark.anyio
+    async def test_slot_accounting_counts_generating(
+        self, orchestrator, mock_db, mock_decomposer
+    ) -> None:
+        """max_concurrent bounds generating + running (no overspawn)."""
+        import asyncio
+
+        orchestrator._config.max_concurrent = 2
+        gate = asyncio.Event()
+
+        async def block(*a, **k):
+            await gate.wait()
+
+        mock_decomposer.generate_spec = AsyncMock(side_effect=block)
+        mock_db.get_workstream = AsyncMock(
+            side_effect=lambda zid: _ws(zid, WorkstreamStatus.READY)
+        )
+
+        await orchestrator._spawn_ready(["z1", "z2", "z3"])
+        assert len(orchestrator._generating) == 2  # z3 held back
+        gate.set()
+        for t in list(orchestrator._generating.values()):
+            with contextlib.suppress(Exception):
+                await t
+
+    @pytest.mark.anyio
+    async def test_existing_generating_reduces_available_slots(
+        self, orchestrator, mock_db, mock_decomposer
+    ) -> None:
+        import asyncio
+
+        orchestrator._config.max_concurrent = 2
+        # one slot already taken by an in-flight generation
+        orchestrator._generating["busy"] = asyncio.create_task(asyncio.sleep(3600))
+        gate = asyncio.Event()
+
+        async def block(*a, **k):
+            await gate.wait()
+
+        mock_decomposer.generate_spec = AsyncMock(side_effect=block)
+        mock_db.get_workstream = AsyncMock(
+            side_effect=lambda zid: _ws(zid, WorkstreamStatus.READY)
+        )
+        await orchestrator._spawn_ready(["z1", "z2"])
+        # only 1 free slot (2 - 0 running - 1 generating) → exactly one launched
+        assert len([k for k in orchestrator._generating if k != "busy"]) == 1
+        orchestrator._generating["busy"].cancel()
+        gate.set()
+        for t in list(orchestrator._generating.values()):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
+
+    @pytest.mark.anyio
+    async def test_generation_failure_routes_through_handle_failure(
+        self, orchestrator, mock_db, mock_decomposer
+    ) -> None:
+        import asyncio
+
+        from maestro.decomposer import DecomposerError
+
+        mock_decomposer.generate_spec = AsyncMock(side_effect=DecomposerError("nope"))
+        mock_db.get_workstream = AsyncMock(
+            return_value=_ws("z1", WorkstreamStatus.READY, retry_count=0, max_retries=2)
+        )
+        orchestrator._handle_failure = AsyncMock()
+
+        # pre-seed as _spawn_ready would, so the finally-pop is actually tested
+        orchestrator._generating["z1"] = asyncio.create_task(asyncio.sleep(0))
+        await orchestrator._generate_and_launch("z1")
+        orchestrator._handle_failure.assert_awaited_once()
+        assert "z1" not in orchestrator._generating  # genuinely freed in finally
+
+    @pytest.mark.anyio
+    async def test_shutdown_cancels_generation_back_to_ready(
+        self, orchestrator, mock_db, mock_decomposer
+    ) -> None:
+        import asyncio
+
+        started = asyncio.Event()
+
+        async def hang(*a, **k):
+            started.set()
+            await asyncio.sleep(3600)
+
+        mock_decomposer.generate_spec = AsyncMock(side_effect=hang)
+        mock_db.get_workstream = AsyncMock(
+            return_value=_ws("z1", WorkstreamStatus.READY)
+        )
+
+        await orchestrator._spawn_ready(["z1"])
+        await started.wait()
+        await orchestrator._cleanup()
+        # generation task cancelled, workstream returned to READY (no retry used)
+        calls = [c.args for c in mock_db.update_workstream_status.await_args_list]
+        assert any(WorkstreamStatus.READY in c for c in calls)
+
+    @pytest.mark.anyio
+    async def test_happy_path_registers_in_running_before_pid_update(
+        self, orchestrator, mock_db, mock_decomposer, tmp_path
+    ) -> None:
+        """Full success path: generate_spec succeeds, the process is
+        spawned, and _spawn_workstream must land the workstream in
+        `_running` (with `_generating` emptied).
+
+        Regression test for the shutdown-orphan bug: the pid DB update
+        used to happen *before* the `_running` registration, so a
+        cancellation landing between those two awaits left the spawned
+        `run --all` process untracked by `_cleanup`. Registration now
+        happens first, so this success-path assertion also pins down
+        that ordering (see `test_shutdown_cancels_generation_back_to_ready`
+        for the cancellation side of the invariant).
+        """
+        from unittest.mock import patch
+
+        # Route log file + workspace through a real tmp dir so os.open()
+        # and the (mocked-out) commit step don't touch the repo.
+        orchestrator._log_dir = tmp_path
+        workspace = tmp_path / "ws-z1"
+        workspace.mkdir()
+        orchestrator._workspace_mgr.workspace_exists = MagicMock(return_value=True)
+        orchestrator._workspace_mgr.get_workspace_path = MagicMock(
+            return_value=workspace
+        )
+        orchestrator._commit_spec_in_workspace = MagicMock()
+
+        mock_db.get_workstream = AsyncMock(
+            return_value=_ws("z1", WorkstreamStatus.READY)
+        )
+
+        fake_process = MagicMock()
+        fake_process.pid = 4242
+
+        with patch(
+            "maestro.orchestrator.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=fake_process),
+        ):
+            await orchestrator._spawn_ready(["z1"])
+            await orchestrator._generating["z1"]
+
+        assert "z1" not in orchestrator._generating
+        assert "z1" in orchestrator._running
+        assert orchestrator._running["z1"].process is fake_process
+
+    @pytest.mark.anyio
+    async def test_cleanup_terminates_process_when_cancel_hits_pid_update(
+        self, orchestrator, mock_db, mock_decomposer, tmp_path
+    ) -> None:
+        """Discriminating regression guard for the shutdown-orphan window.
+
+        Suspend `_spawn_workstream` exactly on the `process_pid` DB
+        update — AFTER the process is spawned and registered in
+        `_running`. Then shut down. `_cleanup` must find the process in
+        `_running` and terminate it. This FAILS if registration is moved
+        back to AFTER the pid update: on cancel the process would not yet
+        be in `_running`, `_cleanup` would never touch it, and it would
+        survive as an orphan.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        orchestrator._log_dir = tmp_path
+        orchestrator._shutdown_grace_seconds = 0  # no 5s sleep in _cleanup
+        workspace = tmp_path / "ws-z1"
+        workspace.mkdir()
+        orchestrator._workspace_mgr.workspace_exists = MagicMock(return_value=True)
+        orchestrator._workspace_mgr.get_workspace_path = MagicMock(
+            return_value=workspace
+        )
+        orchestrator._commit_spec_in_workspace = MagicMock()
+        mock_db.get_workstream = AsyncMock(
+            return_value=_ws("z1", WorkstreamStatus.READY)
+        )
+
+        # Fake process mirroring how _cleanup drives it:
+        # terminate() -> sleep(grace) -> returncode check -> wait().
+        fake_process = MagicMock()
+        fake_process.pid = 4242
+        fake_process.returncode = 0  # already exited: skip kill()
+        fake_process.terminate = MagicMock()
+        fake_process.kill = MagicMock()
+        fake_process.wait = AsyncMock(return_value=0)
+
+        # Suspend on the RUNNING+pid update (fired right after registration),
+        # signalling `reached` so the test can proceed to shutdown.
+        reached = asyncio.Event()
+
+        async def hang_on_pid(*args, **kwargs):
+            if kwargs.get("process_pid") is not None:
+                reached.set()
+                await asyncio.sleep(3600)  # hang here until cancelled
+            return None
+
+        mock_db.update_workstream_status = AsyncMock(side_effect=hang_on_pid)
+
+        with patch(
+            "maestro.orchestrator.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=fake_process),
+        ):
+            await orchestrator._spawn_ready(["z1"])
+            await reached.wait()  # generation is now parked on the pid update
+            # Process is spawned + registered but the pid-update await is
+            # still pending — the exact orphan window.
+            assert "z1" in orchestrator._running
+            await orchestrator._cleanup()
+
+        # _cleanup found the process in _running and terminated it.
+        fake_process.terminate.assert_called_once()
+        assert "z1" not in orchestrator._running
+
+    @pytest.mark.anyio
+    async def test_spawn_ready_does_not_duplicate_in_flight_generation(
+        self, orchestrator, mock_db, mock_decomposer
+    ) -> None:
+        """A workstream already in `_generating` must not be re-spawned.
+
+        Regression guard: `_resolve_ready` used to exclude only
+        `_running`, not `_generating`, so a workstream whose generation
+        task had been created but whose DB status hadn't yet flipped to
+        DECOMPOSING would be returned as ready again on the next loop
+        tick. `_spawn_ready` then overwrote the `_generating[zid]` entry
+        with a second task, leaking the first task reference and running
+        spec generation twice for the same workstream.
+        """
+        import asyncio
+
+        gate = asyncio.Event()
+
+        async def block(*a, **k):
+            await gate.wait()
+
+        mock_decomposer.generate_spec = AsyncMock(side_effect=block)
+        mock_db.get_workstream = AsyncMock(
+            side_effect=lambda zid: _ws(zid, WorkstreamStatus.READY)
+        )
+
+        await orchestrator._spawn_ready(["z1"])
+        first = orchestrator._generating["z1"]
+        await asyncio.sleep(0)  # let the task run up to the blocked call
+
+        # Second tick before z1 flips to DECOMPOSING: must not overwrite.
+        await orchestrator._spawn_ready(["z1"])
+        assert orchestrator._generating["z1"] is first
+        assert len(orchestrator._generating) == 1
+        assert mock_decomposer.generate_spec.call_count == 1
+
+        gate.set()
+        for t in list(orchestrator._generating.values()):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t

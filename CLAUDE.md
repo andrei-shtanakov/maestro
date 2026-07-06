@@ -100,7 +100,7 @@ uv add --dev <package>
 **Multi-process orchestration (new):**
 - **orchestrator.py**: Main async loop — decompose, spawn, monitor, PR creation
 - **workspace.py**: Git worktree lifecycle (create, setup, cleanup)
-- **decomposer.py**: Project decomposition via Claude CLI into workstreams + spec generation
+- **decomposer.py**: Project decomposition via Claude CLI into workstreams (`decompose`) + async spec generation delegated to `spec-runner plan --full` (`generate_spec` — spec-runner owns the tasks.md format; runs as a background task in the orchestrator, budget-capped via `SpecRunnerConfig.spec_gen_budget_usd`)
 - **pr_manager.py**: GitHub PR creation via `gh` CLI
 
 **Subpackages:**

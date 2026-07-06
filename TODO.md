@@ -128,6 +128,12 @@
 
 ---
 
+## C4 — Decomposer delegation
+
+- [x] **Delegate spec generation to spec-runner plan --full** (closed by feat/c4-decomposer-delegation): spec-runner owns the tasks.md format; removed SPEC_GENERATION_PROMPT and _write_spec_files.
+
+---
+
 ## Чего НЕ делать до стабилизации
 
 - ❌ Shared type library (R-14, XL) — преждевременно, сначала зафиксировать схемы
@@ -205,3 +211,8 @@ ls .github/workflows/
 - [ ] Responder `cost or None` (spawner_responder.py) collapses a genuine
       reported $0.00 into None ("confirmed free" reads as "unknown") — becomes
       real when free/local open models run under opencode.
+
+- [ ] Orchestrator startup recovery: workstreams stranded in DECOMPOSING or
+      RUNNING after a hard crash are not re-resolved on `--resume`
+      (`_resolve_ready` only picks PENDING/READY). Pre-existing; surfaced during
+      C4 final review (Minor #4). Add crash-recovery re-resolution.

@@ -95,6 +95,7 @@ class Orchestrator:
         self._log_dir = log_dir or Path(config.repo_path).expanduser() / "logs"
 
         self._running: dict[str, RunningWorkstream] = {}
+        self._generating: dict[str, asyncio.Task[None]] = {}
         self._shutdown_grace_seconds: float = 5.0
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
@@ -251,6 +252,8 @@ class Orchestrator:
         for z in all_z:
             if z.id in self._running:
                 continue
+            if z.id in self._generating:
+                continue
             if z.status not in (
                 WorkstreamStatus.PENDING,
                 WorkstreamStatus.READY,
@@ -273,26 +276,45 @@ class Orchestrator:
         return ready
 
     async def _spawn_ready(self, ready_ids: list[str]) -> None:
-        """Spawn ready workstreams up to concurrency limit."""
-        available = self._config.max_concurrent - len(self._running)
-
+        """Launch background spec generation for ready workstreams up to the
+        concurrency limit. Generation runs off the main loop so monitoring
+        and shutdown stay responsive."""
+        available = max(
+            0,
+            self._config.max_concurrent - len(self._running) - len(self._generating),
+        )
         for zid in ready_ids[:available]:
             if self._shutdown_requested:
                 break
+            if zid in self._generating or zid in self._running:
+                continue
+            self._generating[zid] = asyncio.create_task(self._generate_and_launch(zid))
 
-            try:
-                await self._spawn_workstream(zid)
-            except Exception as e:
-                self._logger.error(
-                    "Failed to spawn workstream '%s': %s",
-                    zid,
-                    e,
-                )
+    async def _generate_and_launch(self, workstream_id: str) -> None:
+        """Background task: generate the spec, then spawn `run --all`.
+
+        - Cancellation (shutdown) → return the workstream to READY, no retry
+          consumed, and propagate the cancel.
+        - Any other error → _handle_failure (retry accounting).
+        - The _generating slot is always freed in `finally`.
+        """
+        try:
+            await self._spawn_workstream(workstream_id)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
                 await self._db.update_workstream_status(
-                    zid,
-                    WorkstreamStatus.FAILED,
-                    error_message=str(e),
+                    workstream_id, WorkstreamStatus.READY
                 )
+            raise
+        except Exception as e:
+            self._logger.error(
+                "Failed to generate spec or launch workstream '%s': %s",
+                workstream_id,
+                e,
+            )
+            await self._handle_failure(workstream_id, str(e))
+        finally:
+            self._generating.pop(workstream_id, None)
 
     async def _spawn_workstream(self, workstream_id: str) -> None:
         """Spawn a spec-runner process for a workstream."""
@@ -331,7 +353,7 @@ class Orchestrator:
             depends_on=workstream.depends_on,
             priority=workstream.priority,
         )
-        self._decomposer.generate_spec(workstream_config, workspace)
+        await self._decomposer.generate_spec(workstream_config, workspace)
 
         # Setup spec-runner config
         executor_config = self._config.spec_runner.to_executor_config()
@@ -377,17 +399,14 @@ class Orchestrator:
                     stdout=log_fd,
                     stderr=asyncio.subprocess.STDOUT,
                 )
-        except Exception:
+        except BaseException:
             os.close(log_fd)
             raise
 
-        # Update PID in DB
-        await self._db.update_workstream_status(
-            workstream_id,
-            WorkstreamStatus.RUNNING,
-            process_pid=process.pid,
-        )
-
+        # Register in _running BEFORE any further await, so a shutdown
+        # cancellation can never orphan the spawned process: once it's
+        # here, _cleanup's termination loop will reach it regardless of
+        # where a later cancel lands.
         self._running[workstream_id] = RunningWorkstream(
             workstream=workstream.model_copy(
                 update={
@@ -399,6 +418,13 @@ class Orchestrator:
             started_at=datetime.now(UTC),
             workspace_path=workspace,
             log_file=log_file,
+        )
+
+        # Update PID in DB
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.RUNNING,
+            process_pid=process.pid,
         )
 
         self._logger.info(
@@ -699,7 +725,13 @@ class Orchestrator:
         self._shutdown_event.set()
 
     async def _cleanup(self) -> None:
-        """Cleanup running processes on shutdown."""
+        """Cleanup running processes and in-flight generations on shutdown."""
+        for _zid, task in list(self._generating.items()):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._generating.clear()
+
         for zid, running in list(self._running.items()):
             try:
                 running.process.terminate()
