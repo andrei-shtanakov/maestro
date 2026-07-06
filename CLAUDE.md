@@ -46,6 +46,11 @@ uv run maestro models list                                            # Show res
 uv run maestro models discover --observed observed.json               # Propose additions (exit 2 = new found)
 uv run maestro models update --observed observed.json --dry-run       # Apply proposals (Plane 1 only)
 
+# === Agent benchmarking (R-06b M5) ===
+uv run maestro benchmark swe-mini --agent claude_code            # Run one ATP benchmark
+uv run maestro benchmark swe-mini --agent opencode --json        # Machine output (stdout = JSON)
+# MAESTRO_ARBITER_BIN set -> result reported to arbiter (fire-and-forget)
+
 # === Log utilities ===
 uv run maestro merge-logs <pipeline-dir>     # Time-sort per-pid JSONL into merged.jsonl
 

@@ -14,6 +14,8 @@ import fcntl
 import os
 import signal
 import subprocess
+import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -39,8 +41,16 @@ from maestro import (
 )
 from maestro import merge_logs as _merge_logs
 from maestro._vendor.obs import init_logging
+from maestro.benchmark import (
+    BenchmarkRunner,
+    MaestroATPAdapter,
+    SpawnerResponder,
+    report_benchmark_to_arbiter,
+)
+from maestro.benchmark.models import BenchmarkResult
 from maestro.catalog_cli import models_app
 from maestro.config import load_orchestrator_config
+from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
 from maestro.decomposer import ProjectDecomposer
@@ -60,7 +70,7 @@ from maestro.spawners import (
     CodexSpawner,
     OpencodeSpawner,
 )
-from maestro.spawners.base import AgentSpawner  # noqa: TC001 — runtime use
+from maestro.spawners.base import AgentSpawner
 from maestro.workspace import WorkspaceManager
 
 
@@ -81,6 +91,84 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(models_app, name="models")
+
+
+# Benchmark constants and helpers
+_ALLOWED_BENCH_AGENTS = ("claude_code", "codex_cli", "aider", "opencode")
+
+
+def _bench_spawner_for(agent: str) -> AgentSpawner:
+    """Fresh spawner for a benchmark run. Module-level for test monkeypatching."""
+    from maestro.spawners import (
+        AiderSpawner,
+        ClaudeCodeSpawner,
+        CodexSpawner,
+        OpencodeSpawner,
+    )
+
+    factories: dict[str, type[AgentSpawner]] = {
+        "claude_code": ClaudeCodeSpawner,
+        "codex_cli": CodexSpawner,
+        "aider": AiderSpawner,
+        "opencode": OpencodeSpawner,
+    }
+    return factories[agent]()
+
+
+async def _benchmark_flow(
+    adapter,
+    responder,
+    benchmark_id: str,
+    run_id: str | None,
+    arbiter_bin: str | None,
+    no_report: bool,
+    notes: Console,
+) -> BenchmarkResult:
+    """Run the benchmark, then dispatch the (optional) arbiter report."""
+    async with adapter:
+        result = await BenchmarkRunner(adapter, responder).run(
+            benchmark_id, run_id=run_id
+        )
+    if no_report:
+        notes.print("arbiter report skipped (--no-report)")
+        return result
+    if not arbiter_bin:
+        notes.print("arbiter report skipped (MAESTRO_ARBITER_BIN unset)")
+        return result
+    return await _report_with_lifecycle(result, arbiter_bin, notes)
+
+
+async def _report_with_lifecycle(
+    result: BenchmarkResult, arbiter_bin: str, notes: Console
+) -> BenchmarkResult:
+    """M4 fire-and-forget report with explicit client lifecycle.
+
+    start() failure counts as a report failure (report_status="failed"),
+    never as a run failure; stop() is awaited on every path so the
+    subprocess can't leak. Paths follow the smoke-script convention:
+    the binary lives at <repo>/target/release/arbiter-mcp.
+    """
+    bin_path = Path(arbiter_bin)
+    repo = bin_path.parent.parent.parent
+    config = ArbiterClientConfig(
+        binary_path=str(bin_path),
+        config_dir=str(repo / "config"),
+        tree_path=str(repo / "models" / "agent_policy_tree.json"),
+    )
+    client = ArbiterClient(config)
+    try:
+        await client.start()
+        result = await report_benchmark_to_arbiter(result, client)
+    except Exception as exc:  # start() failure = report failure, not run failure
+        result = result.model_copy(
+            update={"report_status": "failed", "report_error": str(exc)}
+        )
+    finally:
+        # stop() is idempotent and safe after failed start(), so
+        # unconditional best-effort cleanup is sufficient.
+        with contextlib.suppress(Exception):
+            await client.stop()
+    return result
 
 
 def _get_status_style(status: TaskStatus) -> str:
@@ -935,6 +1023,159 @@ def init_command(
         f"[green]Wrote {path}.[/green] Next: edit the workstreams, "
         f"then run 'maestro validate {path}'."
     )
+
+
+def _print_benchmark_summary(result: BenchmarkResult, wd: Path, notes: Console) -> None:
+    notes.print(
+        f"benchmark [bold]{escape(result.benchmark_id)}[/bold] | agent "
+        f"{escape(result.agent_id)} | run {escape(result.run_id)}"
+    )
+    notes.print(
+        f"score: [bold]{result.score}[/bold]"
+        + (
+            f" | components: {result.score_components}"
+            if result.score_components
+            else ""
+        )
+    )
+    table = Table(title="Tasks")
+    table.add_column("#")
+    table.add_column("duration s")
+    table.add_column("tokens")
+    table.add_column("cost")
+    table.add_column("error")
+    for t in result.per_task:
+        table.add_row(
+            str(t.task_index),
+            f"{t.duration_seconds:.1f}",
+            str(t.tokens_used) if t.tokens_used is not None else "-",
+            f"{t.cost_usd:.4f}" if t.cost_usd is not None else "-",
+            escape(t.error) if t.error else "",
+        )
+    notes.print(table)
+    notes.print(
+        f"totals: tokens={result.total_tokens} cost={result.total_cost_usd} "
+        f"duration={result.duration_seconds:.1f}s"
+    )
+    notes.print(
+        f"arbiter report: {result.report_status}"
+        + (f" ({escape(result.report_error)})" if result.report_error else "")
+    )
+    notes.print(f"logs: {escape(str(wd / 'logs'))}")
+
+
+@app.command("benchmark")
+def benchmark(
+    benchmark_id: str = typer.Argument(..., help="ATP benchmark id to run"),
+    agent: str = typer.Option(
+        ...,
+        "--agent",
+        help="Harness: claude_code | codex_cli | aider | opencode. Model "
+        "comes from MAESTRO_CLAUDE_MODEL / MAESTRO_CODEX_MODEL / "
+        "MAESTRO_OPENCODE_MODEL or the catalog default (aider ignores model).",
+    ),
+    workdir: Path | None = typer.Option(
+        None, "--workdir", help="Working dir (default: fresh temp dir; kept)"
+    ),
+    timeout: float = typer.Option(
+        300.0, "--timeout", help="Per-task timeout in seconds (must be > 0)"
+    ),
+    run_id: str | None = typer.Option(
+        None, "--run-id", help="Explicit run id (CI retry idempotency)"
+    ),
+    atp_url: str | None = typer.Option(
+        None,
+        "--atp-url",
+        help="ATP base URL (default: $MAESTRO_ATP_BASE_URL, else "
+        "http://localhost:8000)",
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Print BenchmarkResult JSON on stdout (notes → stderr)"
+    ),
+    no_report: bool = typer.Option(
+        False, "--no-report", help="Skip arbiter reporting even if configured"
+    ),
+) -> None:
+    """Run one ATP benchmark against one local agent harness (R-06b M5).
+
+    Exit codes: 0 = run completed (per-task errors live in the score and
+    the table, not the exit code); 1 = infrastructure failure; 2 = bad
+    --timeout. With MAESTRO_ARBITER_BIN set, the result is reported to the
+    arbiter fire-and-forget (a report failure never fails the run).
+    """
+    init_logging("maestro")
+    err = Console(stderr=True)
+    # With --json, stdout must stay byte-for-byte JSON: ALL notes → stderr.
+    notes = err if json_output else console
+
+    if agent == "auto":
+        err.print(
+            "[red]--agent auto is a routing sentinel[/red] — pick a concrete "
+            f"harness: {', '.join(_ALLOWED_BENCH_AGENTS)}"
+        )
+        raise typer.Exit(1)
+    if agent == "announce":
+        err.print(
+            "[red]announce is a no-op echo harness[/red] — benchmarking it "
+            "would record a fake success as routing signal"
+        )
+        raise typer.Exit(1)
+    if agent not in _ALLOWED_BENCH_AGENTS:
+        err.print(
+            f"[red]unknown agent {escape(repr(agent))}[/red] — allowed: "
+            f"{', '.join(_ALLOWED_BENCH_AGENTS)}"
+        )
+        raise typer.Exit(1)
+
+    if timeout <= 0:
+        err.print("[red]--timeout must be > 0[/red]")
+        raise typer.Exit(2)
+
+    spawner = _bench_spawner_for(agent)
+    if not spawner.is_available():
+        err.print(f"[red]agent CLI '{escape(agent)}' not found in PATH[/red]")
+        raise typer.Exit(1)
+
+    wd = workdir or Path(tempfile.mkdtemp(prefix="maestro-bench-"))
+    wd.mkdir(parents=True, exist_ok=True)
+    log_dir = wd / "logs"
+    log_dir.mkdir(exist_ok=True)
+    # Announce BEFORE the run: on a crash the partial logs must be findable.
+    # Write directly to file to avoid Rich's line wrapping.
+    notes.file.write(f"workdir: {wd}\n")
+    notes.file.flush()
+
+    url = atp_url or os.environ.get("MAESTRO_ATP_BASE_URL") or "http://localhost:8000"
+    adapter = MaestroATPAdapter.from_env(platform_url=url)
+    responder = SpawnerResponder(
+        spawner, workdir=wd, log_dir=log_dir, timeout_seconds=timeout
+    )
+    arbiter_bin = os.environ.get("MAESTRO_ARBITER_BIN")
+
+    try:
+        result = asyncio.run(
+            _benchmark_flow(
+                adapter,
+                responder,
+                benchmark_id,
+                run_id,
+                arbiter_bin,
+                no_report,
+                notes,
+            )
+        )
+    except Exception as exc:
+        err.print(f"[red]benchmark failed[/red]: {escape(str(exc))}")
+        err.print(
+            "hint: check the ATP endpoint (--atp-url / $MAESTRO_ATP_BASE_URL) "
+            "and token (ATP_TOKEN env or ~/.atp/config.json)"
+        )
+        raise typer.Exit(1) from exc
+
+    _print_benchmark_summary(result, wd, notes)
+    if json_output:
+        # sys.stdout directly: byte-for-byte JSON, no Rich wrapping.
+        sys.stdout.write(result.model_dump_json(indent=2) + "\n")
 
 
 # =================================================================
