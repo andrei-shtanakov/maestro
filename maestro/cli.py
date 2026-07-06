@@ -1027,8 +1027,8 @@ def init_command(
 
 def _print_benchmark_summary(result: BenchmarkResult, wd: Path, notes: Console) -> None:
     notes.print(
-        f"benchmark [bold]{result.benchmark_id}[/bold] | agent "
-        f"{result.agent_id} | run {result.run_id}"
+        f"benchmark [bold]{escape(result.benchmark_id)}[/bold] | agent "
+        f"{escape(result.agent_id)} | run {escape(result.run_id)}"
     )
     notes.print(
         f"score: [bold]{result.score}[/bold]"
@@ -1050,7 +1050,7 @@ def _print_benchmark_summary(result: BenchmarkResult, wd: Path, notes: Console) 
             f"{t.duration_seconds:.1f}",
             str(t.tokens_used) if t.tokens_used is not None else "-",
             f"{t.cost_usd:.4f}" if t.cost_usd is not None else "-",
-            t.error or "",
+            escape(t.error) if t.error else "",
         )
     notes.print(table)
     notes.print(
@@ -1059,7 +1059,7 @@ def _print_benchmark_summary(result: BenchmarkResult, wd: Path, notes: Console) 
     )
     notes.print(
         f"arbiter report: {result.report_status}"
-        + (f" ({result.report_error})" if result.report_error else "")
+        + (f" ({escape(result.report_error)})" if result.report_error else "")
     )
     notes.print(f"logs: {escape(str(wd / 'logs'))}")
 
