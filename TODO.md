@@ -211,3 +211,8 @@ ls .github/workflows/
 - [ ] Responder `cost or None` (spawner_responder.py) collapses a genuine
       reported $0.00 into None ("confirmed free" reads as "unknown") — becomes
       real when free/local open models run under opencode.
+
+- [ ] Orchestrator startup recovery: workstreams stranded in DECOMPOSING or
+      RUNNING after a hard crash are not re-resolved on `--resume`
+      (`_resolve_ready` only picks PENDING/READY). Pre-existing; surfaced during
+      C4 final review (Minor #4). Add crash-recovery re-resolution.
