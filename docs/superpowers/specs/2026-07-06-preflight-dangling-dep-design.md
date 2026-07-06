@@ -78,11 +78,29 @@ Ordering: dangling-deps first, so an unknown-id error is reported before the
 cycle check (which ignores that edge anyway) — the more actionable message
 leads.
 
+### Module docstring correction (required)
+
+`maestro/preflight.py`'s header currently claims (lines 4-6): "Schema-level
+validation (duplicate ids, unknown deps, self-deps) stays in the pydantic
+models and is NOT re-implemented here." After this change that is false —
+preflight now repeats the unknown-deps check. Reword to:
+
+> Schema-level validation (duplicate ids, unknown deps, self-deps) catches
+> these on config load in the pydantic models. Preflight repeats selected
+> graph-integrity checks (dangling deps, cycles) as defense-in-depth for
+> configs mutated programmatically after load.
+
+Without this edit the code contradicts its own documentation.
+
 ### Design decisions
 
-- **Severity `error`**, consistent with `dag-cycle`: a dangling edge means
-  the DAG references a nonexistent node; scheduling would break on it. Matches
-  the bug report's Acceptance.
+- **Severity `error`**, consistent with `dag-cycle`: a dangling edge is an
+  invalid DAG (references a node that does not exist). Matches the bug
+  report's Acceptance. (Precise on the failure mode: in the normal path such
+  a config never reaches scheduling — Pydantic rejects it at load; a
+  programmatic mutate-after-load caller breaks earlier, when it tries to act
+  on the bad edge. Either way the config is structurally invalid, so `error`
+  is right.)
 - **One issue per workstream**, listing all of that workstream's unknown ids
   (sorted for deterministic output), rather than one issue per bad edge — less
   noise, groups by the workstream the author edits.
@@ -93,21 +111,46 @@ leads.
 
 ## Testing
 
-- Unit `_check_dangling_deps`: one unknown id → single `error` `dangling-dep`
-  with the right `workstream_ids` and the unknown id named in the message;
-  multiple unknown ids on one workstream → one issue listing all (sorted);
-  all deps valid → empty; several workstreams each with a dangling edge → one
-  issue each.
-- Integration via `validate_project(config, check_fs=False)`: the bug
-  report's exact repro — load a valid config, then mutate
-  `w.depends_on += ["does-not-exist"]` — yields `report.ok is False` with a
-  `dangling-dep` error. A cyclic-AND-dangling config still reports both
-  (dangling-dep and dag-cycle), proving the checks are independent.
+- Unit `_check_dangling_deps` (call the function directly on
+  `list[WorkstreamConfig]` — no `OrchestratorConfig`, so no Pydantic gate):
+  one unknown id → single `error` `dangling-dep` with the right
+  `workstream_ids` and the unknown id named; all deps valid → empty; several
+  workstreams each with a dangling edge → one issue each.
+- **Deterministic sort assertion:** a workstream with unknown ids given
+  OUT of order (e.g. `depends_on = ["a", "z-missing", "a-missing"]`) → the
+  message lists them sorted (`a-missing, z-missing`), asserted by exact
+  substring — protects CLI snapshot stability.
+- **Integration MUST bypass the Pydantic load validator by mutating after
+  construction** — a `make_config([... dangling ...])` won't even build
+  (`OrchestratorConfig.validate_workstream_dependencies_exist` raises at
+  load), so a naive test would exercise Pydantic, not preflight:
+  ```python
+  config = make_config([ws("a", ...), ws("b", ..., depends_on=["a"])])
+  config.workstreams[1].depends_on.append("does-not-exist")  # post-load mutate
+  report = validate_project(config, check_fs=False)
+  assert report.ok is False
+  assert any(i.code == "dangling-dep" for i in report.issues)
+  ```
+- **Cyclic-AND-dangling, also via mutation** — proves independence:
+  ```python
+  config = make_config([ws("a", ..., depends_on=["b"]),
+                        ws("b", ..., depends_on=["a"])])
+  config.workstreams[0].depends_on.append("ghost")
+  report = validate_project(config, check_fs=False)
+  codes = {i.code for i in report.issues}
+  assert "dangling-dep" in codes and "dag-cycle" in codes
+  ```
+  (Build the cycle itself via mutation too if `make_config` rejects the
+  a↔b cycle at load — the config validator may or may not reject pure
+  cycles; check and adjust so the test constructs successfully, then
+  mutates in the dangling edge.)
 - Regression: existing preflight tests stay green; a fully valid project is
   still `ok=True` with no `dangling-dep` issue.
 
 ## Documentation
 
+- `maestro/preflight.py` module docstring — corrected (see "Module docstring
+  correction" above; required, not optional).
 - CLAUDE.md preflight blurb enumerates the codes — add `dangling-dep`.
 - `docs/bugs/2026-07-05-validate-dangling-depends-on.md` — mark resolved with
   the commit hash.
