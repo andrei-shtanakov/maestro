@@ -62,6 +62,14 @@ runs ~6 min and today's call blocks the orchestrator's event loop inline (see
   into `cwd`.
 - Timeout: `--full` runs ~6 min; default 30 min (parametrized so tests don't
   wait). `asyncio.TimeoutError` → kill the subprocess → `DecomposerError`.
+- **Cancellation kills the subprocess (no orphan burning tokens):**
+  `generate_spec` itself catches `asyncio.CancelledError` around the
+  `communicate()` await, calls `proc.terminate()` (escalating to
+  `proc.kill()` if it does not exit within a short grace), awaits the proc,
+  and re-raises `CancelledError`. Without this, cancelling the background
+  task (§1b shutdown) unwinds the coroutine but leaves `spec-runner plan
+  --full` alive, spending real money. Timeout and generic-error paths
+  terminate the proc the same way.
 - Non-zero exit → `DecomposerError` with the return code and `stderr[:500]`
   (mirrors `_run_claude`'s existing error shape). `FileNotFoundError`
   (spec-runner not installed) → `DecomposerError` with an actionable message.
@@ -90,8 +98,20 @@ a serial queue.
   DECOMPOSING → create workspace → `await generate_spec(...)` → setup
   spec-runner config → commit spec (existing `run_in_executor` git step) →
   spawn `run --all` (existing `create_subprocess_exec`) → add to
-  `self._running`. On completion it removes `zid` from `self._generating`;
-  any exception → workstream FAILED (same handling as today's spawn error).
+  `self._running`. Lifecycle discipline:
+  - **`self._generating.pop(zid, None)` runs in a `finally`** so a slot never
+    hangs on any error, cancel, or success.
+  - **Failures route through `_handle_failure(zid, str(exc))`, NOT a raw
+    `update_workstream_status(..., FAILED)`.** `_handle_failure`
+    (orchestrator.py:625) does the retry accounting — retries left →
+    FAILED→READY with `retry_count++`; exhausted → FAILED→NEEDS_REVIEW +
+    `stats.failed++`. A raw FAILED (what today's inline spawn-error handler
+    does) would silently break retry semantics; the background path must be
+    at least as correct.
+  - **`CancelledError` is distinct from `DecomposerError`.** A shutdown
+    cancel (§ below) → return the workstream to READY (resumable, no retry
+    consumed) and re-raise/propagate the cancellation. A real
+    `DecomposerError` → `_handle_failure` (retry path). Do not conflate them.
 - **Slot accounting (no overspawn):**
   `available = max_concurrent - len(self._running) - len(self._generating)` —
   a DECOMPOSING workstream occupies a slot for the whole generation, so the
@@ -102,11 +122,13 @@ a serial queue.
   shutdown stay responsive while generations proceed concurrently in the
   background.
 - **Shutdown:** on `_shutdown_requested`, in-flight `_generating` tasks are
-  cancelled and their subprocesses terminated; the affected workstreams are
-  left in a resumable state (returned to READY, since no `run --all` started
-  yet) so `--resume` can re-generate. Generations already past the
-  `run --all` spawn are tracked in `_running` and handled by the existing
-  shutdown path.
+  cancelled; the cancellation propagates into `generate_spec`, which
+  terminates the spec-runner subprocess (see §1's CancelledError handling —
+  this is what prevents an orphaned token-burning process). Because the
+  cancel is shutdown-driven (not a `DecomposerError`), `_generate_and_launch`
+  returns the workstream to READY (no retry consumed) so `--resume`
+  re-generates. Generations already past the `run --all` spawn are in
+  `_running` and handled by the existing shutdown path.
 
 ### 2. Remove the format duplication (REQ-502)
 
@@ -177,7 +199,10 @@ the description file contains title/description/scope; non-zero exit →
 `DecomposerError`. Post-condition: zero exit but no `spec/tasks.md` →
 `DecomposerError` (mock the subprocess to exit 0 without writing the file).
 Budget: `None` → no `--budget` flag; a custom value → `--budget <value>`. The
-async test uses `@pytest.mark.anyio`.
+async test uses `@pytest.mark.anyio`. **Cancellation:** cancelling an
+in-flight `generate_spec` calls `proc.terminate()` (assert against a fake
+proc, not merely that the task was cancelled) and re-raises `CancelledError`;
+the temp desc file is still unlinked.
 
 **Orchestration-level (the point-1 regression guard, mock decomposer +
 spawner):**
@@ -187,9 +212,13 @@ spawner):**
 - Slot accounting: with `max_concurrent=2` and 3 ready workstreams, at most 2
   are in `_generating`+`_running` at once — the 3rd waits (no overspawn).
 - On generation success the workstream moves `_generating` → `_running` and
-  `run --all` is spawned; on generation failure → FAILED, slot freed.
+  `run --all` is spawned; the `_generating` slot is freed in `finally`.
+- Generation `DecomposerError` routes through `_handle_failure`: with retries
+  left → workstream back to READY and `retry_count` incremented (NOT a raw
+  terminal FAILED); with retries exhausted → NEEDS_REVIEW + `stats.failed++`.
 - Shutdown mid-generation: in-flight generation is cancelled, its subprocess
-  terminated, the workstream returns to READY.
+  terminated (assert terminate called), the workstream returns to READY with
+  `retry_count` UNCHANGED (a shutdown is not a failure).
 
 **Regression:** `decompose()` still works via `_run_claude` (untouched);
 existing decomposer/orchestrator tests green.
