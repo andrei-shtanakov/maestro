@@ -800,9 +800,38 @@ class TestBackgroundGeneration:
                 await t
 
     @pytest.mark.anyio
+    async def test_existing_generating_reduces_available_slots(
+        self, orchestrator, mock_db, mock_decomposer
+    ) -> None:
+        import asyncio
+
+        orchestrator._config.max_concurrent = 2
+        # one slot already taken by an in-flight generation
+        orchestrator._generating["busy"] = asyncio.create_task(asyncio.sleep(3600))
+        gate = asyncio.Event()
+
+        async def block(*a, **k):
+            await gate.wait()
+
+        mock_decomposer.generate_spec = AsyncMock(side_effect=block)
+        mock_db.get_workstream = AsyncMock(
+            side_effect=lambda zid: _ws(zid, WorkstreamStatus.READY)
+        )
+        await orchestrator._spawn_ready(["z1", "z2"])
+        # only 1 free slot (2 - 0 running - 1 generating) → exactly one launched
+        assert len([k for k in orchestrator._generating if k != "busy"]) == 1
+        orchestrator._generating["busy"].cancel()
+        gate.set()
+        for t in list(orchestrator._generating.values()):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
+
+    @pytest.mark.anyio
     async def test_generation_failure_routes_through_handle_failure(
         self, orchestrator, mock_db, mock_decomposer
     ) -> None:
+        import asyncio
+
         from maestro.decomposer import DecomposerError
 
         mock_decomposer.generate_spec = AsyncMock(side_effect=DecomposerError("nope"))
@@ -811,9 +840,11 @@ class TestBackgroundGeneration:
         )
         orchestrator._handle_failure = AsyncMock()
 
+        # pre-seed as _spawn_ready would, so the finally-pop is actually tested
+        orchestrator._generating["z1"] = asyncio.create_task(asyncio.sleep(0))
         await orchestrator._generate_and_launch("z1")
         orchestrator._handle_failure.assert_awaited_once()
-        assert "z1" not in orchestrator._generating  # slot freed in finally
+        assert "z1" not in orchestrator._generating  # genuinely freed in finally
 
     @pytest.mark.anyio
     async def test_shutdown_cancels_generation_back_to_ready(

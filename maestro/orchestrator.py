@@ -277,8 +277,9 @@ class Orchestrator:
         """Launch background spec generation for ready workstreams up to the
         concurrency limit. Generation runs off the main loop so monitoring
         and shutdown stay responsive."""
-        available = (
-            self._config.max_concurrent - len(self._running) - len(self._generating)
+        available = max(
+            0,
+            self._config.max_concurrent - len(self._running) - len(self._generating),
         )
         for zid in ready_ids[:available]:
             if self._shutdown_requested:
