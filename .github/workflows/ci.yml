@@ -162,4 +162,6 @@ jobs:
         run: uv tool install spec-runner
       - name: Run golden drift test
         if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        env:
+          MAESTRO_RUN_GOLDEN: "1"
         run: uv run pytest tests/test_spec_runner_plan_e2e.py -m slow -v

@@ -2,6 +2,7 @@
 that spec-runner's own parser accepts. Auto-skipped without spec-runner;
 runs as a weekly CI job (plan --full spends real Claude tokens)."""
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -12,8 +13,16 @@ from maestro.decomposer import ProjectDecomposer
 from maestro.models import WorkstreamConfig
 
 
+# Real-cost opt-in guard. `spec-runner` is a normal PyPI tool present on many
+# dev boxes, so `shutil.which` alone would let a bare `uv run pytest` fire a
+# real `plan --full` and spend Claude tokens. Mirror the repo's env-var
+# opt-in pattern for real-cost/real-subprocess tests (cf. MAESTRO_ARBITER_BIN
+# gating the arbiter real-subprocess suite): require an explicit opt-in AND
+# spec-runner present. The CI weekly job sets MAESTRO_RUN_GOLDEN=1.
 pytestmark = pytest.mark.skipif(
-    shutil.which("spec-runner") is None, reason="spec-runner not installed"
+    os.environ.get("MAESTRO_RUN_GOLDEN") != "1" or shutil.which("spec-runner") is None,
+    reason="golden drift test is opt-in: set MAESTRO_RUN_GOLDEN=1 "
+    "(spends real Claude tokens) and install spec-runner",
 )
 
 
