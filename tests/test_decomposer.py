@@ -571,6 +571,27 @@ class TestOnPidCallback:
             await dec._run_spec_runner(["spec-runner"], temp_dir, 1, on_pid=bad_on_pid)
         assert proc.terminated is True  # process killed, not orphaned
 
+    @pytest.mark.anyio
+    async def test_on_pid_cancel_terminates_and_reraises(self, temp_dir: Path) -> None:
+        proc = _FakeProc(pid=5152)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        dec = ProjectDecomposer(repo_path=temp_dir)
+
+        async def cancelled_on_pid(pid: int) -> None:
+            raise asyncio.CancelledError()
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await dec._run_spec_runner(
+                ["spec-runner"], temp_dir, 1, on_pid=cancelled_on_pid
+            )
+        assert proc.terminated is True  # not orphaned on cancel-during-persist
+
 
 # =============================================================================
 # Unit Tests: validate_non_overlap()

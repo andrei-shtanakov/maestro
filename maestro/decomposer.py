@@ -356,7 +356,8 @@ class ProjectDecomposer:
         *,
         on_pid: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
-        """Run a spec-runner subprocess; terminate it on cancel/timeout."""
+        """Run a spec-runner subprocess; report its pid via on_pid, and
+        terminate it on persist-failure/cancel/timeout."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -370,12 +371,13 @@ class ProjectDecomposer:
             raise DecomposerError(msg) from e
 
         if on_pid is not None:
-            # Persist the pid before awaiting the process. If the persist
-            # fails we cannot track this process, so terminate it rather than
-            # leave an untracked orphan, and propagate the failure.
+            # Persist the pid before awaiting the process.
             try:
                 await on_pid(proc.pid)
-            except Exception:
+            except BaseException:
+                # Persist failed OR the task was cancelled mid-persist — we
+                # cannot track this process, so terminate it rather than leave
+                # an orphan, and propagate (re-raises CancelledError too).
                 await self._terminate(proc)
                 raise
 
