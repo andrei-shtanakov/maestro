@@ -151,6 +151,7 @@ CREATE TABLE IF NOT EXISTS workstreams (
     priority INTEGER DEFAULT 0,
     pr_url TEXT,
     process_pid INTEGER,
+    generation_pid INTEGER,
     subtask_progress TEXT,
     error_message TEXT,
     retry_count INTEGER DEFAULT 0,
@@ -297,6 +298,7 @@ def _row_to_workstream(row: aiosqlite.Row) -> Workstream:
         priority=row["priority"],
         pr_url=row["pr_url"],
         process_pid=row["process_pid"],
+        generation_pid=row["generation_pid"],
         subtask_progress=row["subtask_progress"],
         error_message=row["error_message"],
         retry_count=row["retry_count"],
@@ -389,6 +391,11 @@ class Database:
                 4,
                 "cost_from_log_reported_cost",
                 self._migrate_task_costs_reported_cost,
+            ),
+            (
+                5,
+                "decomposing_generation_pid",
+                self._migrate_workstreams_generation_pid,
             ),
         ]
 
@@ -500,10 +507,24 @@ class Database:
         else:
             # Case 3: both tables exist (SCHEMA_SQL created workstreams before
             # migration ran). Copy any data from zadachi → workstreams and drop.
+            # Column list is explicit (not `SELECT *`) and pinned to the
+            # historical zadachi shape: workstreams has since grown columns
+            # (e.g. generation_pid) that a wildcard copy would misalign or
+            # fail on, while zadachi itself never gains new ones.
             await self._connection.execute(
                 """
-                INSERT OR IGNORE INTO workstreams
-                SELECT * FROM zadachi
+                INSERT OR IGNORE INTO workstreams (
+                    id, title, description, branch, workspace_path, status,
+                    scope, priority, pr_url, process_pid, subtask_progress,
+                    error_message, retry_count, max_retries, created_at,
+                    started_at, completed_at
+                )
+                SELECT
+                    id, title, description, branch, workspace_path, status,
+                    scope, priority, pr_url, process_pid, subtask_progress,
+                    error_message, retry_count, max_retries, created_at,
+                    started_at, completed_at
+                FROM zadachi
                 """
             )
             # Migrate dependency rows too
@@ -539,6 +560,20 @@ class Database:
         if "reported_cost_usd" not in columns:
             await self._connection.execute(
                 "ALTER TABLE task_costs ADD COLUMN reported_cost_usd REAL"
+            )
+
+    async def _migrate_workstreams_generation_pid(self) -> None:
+        """DECOMPOSING liveness: add `generation_pid` to `workstreams`.
+
+        NULL for all pre-existing rows. Idempotent via PRAGMA table_info
+        (same shape as the cost-from-log migration).
+        """
+        assert self._connection is not None  # narrowed by caller
+        cursor = await self._connection.execute("PRAGMA table_info(workstreams)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "generation_pid" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE workstreams ADD COLUMN generation_pid INTEGER"
             )
 
     @asynccontextmanager
@@ -1688,12 +1723,12 @@ class Database:
                 INSERT INTO workstreams (
                     id, title, description, branch,
                     workspace_path, status, scope, priority,
-                    pr_url, process_pid, subtask_progress,
+                    pr_url, process_pid, generation_pid, subtask_progress,
                     error_message, retry_count, max_retries,
                     created_at, started_at, completed_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -1707,6 +1742,7 @@ class Database:
                     workstream.priority,
                     workstream.pr_url,
                     workstream.process_pid,
+                    workstream.generation_pid,
                     workstream.subtask_progress,
                     workstream.error_message,
                     workstream.retry_count,
@@ -1851,6 +1887,7 @@ class Database:
             "error_message",
             "workspace_path",
             "process_pid",
+            "generation_pid",
             "subtask_progress",
             "pr_url",
             "retry_count",

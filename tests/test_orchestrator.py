@@ -7,7 +7,7 @@ PR body formatting, and shutdown behavior.
 
 import contextlib
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -1026,6 +1026,194 @@ class TestBackgroundGeneration:
 
 
 # =============================================================================
+# generation_pid Lifecycle Tests
+# =============================================================================
+
+
+class TestGenerationPidLifecycle:
+    """generation_pid is written while `plan --full` runs (DECOMPOSING) and
+    cleared on every exit from `_generate_and_launch` (success/failure)."""
+
+    async def _orch_db(
+        self, tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+    ):
+        from maestro.database import Database
+
+        db = Database(tmp_path / "o.db")
+        await db.connect()
+        decomposer = MagicMock()
+
+        async def gen(workstream, workspace_path, *, on_pid=None):
+            if on_pid is not None:
+                await on_pid(7777)  # simulate plan --full pid
+
+        decomposer.generate_spec = gen
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        orch = Orchestrator(
+            db=db,
+            workspace_mgr=mock_workspace_mgr,
+            decomposer=decomposer,
+            config=orch_config,
+            pr_manager=mock_pr_manager,
+            log_dir=log_dir,
+        )
+        return orch, db
+
+    def _seed(self, zid, *, generation_pid: int | None = None):
+        return Workstream(
+            id=zid,
+            title=zid,
+            description="d",
+            scope=["s"],
+            branch=f"feature/{zid}",
+            status=WorkstreamStatus.READY,
+            generation_pid=generation_pid,
+        )
+
+    @staticmethod
+    def _spy_generation_pid_writes(db) -> list[int | None]:
+        """Wrap db.update_workstream_status to record every value passed
+        for `generation_pid`, so tests can assert it was actually written
+        mid-flight — not just that it ends up None, which would trivially
+        pass even without the on_pid wiring (None is also the untouched
+        default)."""
+        calls: list[int | None] = []
+        original = db.update_workstream_status
+
+        async def spy(*args, **kwargs):
+            if "generation_pid" in kwargs:
+                calls.append(kwargs["generation_pid"])
+            return await original(*args, **kwargs)
+
+        db.update_workstream_status = spy
+        return calls
+
+    @pytest.mark.anyio
+    async def test_success_records_and_clears_generation_pid(
+        self, tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+    ) -> None:
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+        )
+        try:
+            # Seed with a stale pid from a prior aborted decompose, so the
+            # entry-clear assertion actually proves the re-decompose window
+            # is closed (rather than the field coincidentally being None).
+            await db.create_workstream(self._seed("a", generation_pid=4242))
+            # Stub the downstream _spawn_workstream steps that would
+            # otherwise touch the real filesystem/subprocess so the happy
+            # path can reach a clean end: committing the generated spec in
+            # the worktree, and the `spec-runner run --all` process spawn.
+            orch._commit_spec_in_workspace = MagicMock()
+            fake_process = MagicMock(pid=12345)
+            pid_calls = self._spy_generation_pid_writes(db)
+            with patch(
+                "maestro.orchestrator.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=fake_process),
+            ):
+                await orch._generate_and_launch("a")
+
+            # entry clear: the first DECOMPOSING transition wipes the
+            # stale pid up front.
+            assert pid_calls[0] is None
+            # on_pid write: the plan --full pid is recorded mid-flight.
+            assert 7777 in pid_calls
+            # finally clear: cleared again on exit.
+            assert pid_calls[-1] is None
+            assert (await db.get_workstream("a")).generation_pid is None
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_failure_records_and_clears_generation_pid(
+        self, tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+    ) -> None:
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+        )
+        try:
+            await db.create_workstream(self._seed("b"))
+            pid_calls = self._spy_generation_pid_writes(db)
+
+            async def gen_then_fail(
+                workstream, workspace_path, timeout_minutes=30, *, on_pid=None
+            ) -> None:
+                if on_pid is not None:
+                    await on_pid(8888)
+                raise RuntimeError("spec gen failed")
+
+            orch._decomposer.generate_spec = gen_then_fail
+            await orch._generate_and_launch("b")  # routed to _handle_failure
+
+            # recorded mid-DECOMPOSING despite the later failure
+            assert 8888 in pid_calls
+            # cleared despite failure
+            assert pid_calls[-1] is None
+            w = await db.get_workstream("b")
+            assert w.generation_pid is None
+            assert w.status in (
+                WorkstreamStatus.READY,
+                WorkstreamStatus.NEEDS_REVIEW,
+            )  # _handle_failure outcome
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_cancel_clears_generation_pid_in_ready_write(
+        self, tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+    ) -> None:
+        """On cancel, the READY write must itself carry generation_pid=None —
+        so cleanup does not depend on the (interruptible) finally clear."""
+        import asyncio
+
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+        )
+        try:
+            await db.create_workstream(self._seed("c"))
+
+            # Record (new_status, generation_pid) for every status write.
+            # Use a sentinel so "explicitly passed None" (the clear) is
+            # distinguishable from "not passed at all" — otherwise a READY
+            # write that omits generation_pid would falsely look cleared.
+            _absent = object()
+            writes: list[tuple[WorkstreamStatus, object]] = []
+            original = db.update_workstream_status
+
+            async def spy(workstream_id, new_status, *args, **kwargs):
+                writes.append((new_status, kwargs.get("generation_pid", _absent)))
+                return await original(workstream_id, new_status, *args, **kwargs)
+
+            db.update_workstream_status = spy
+
+            async def gen_then_cancel(
+                workstream, workspace_path, timeout_minutes=30, *, on_pid=None
+            ) -> None:
+                if on_pid is not None:
+                    await on_pid(9999)  # stale pid recorded mid-DECOMPOSING
+                raise asyncio.CancelledError
+
+            orch._decomposer.generate_spec = gen_then_cancel
+
+            with pytest.raises(asyncio.CancelledError):
+                await orch._generate_and_launch("c")
+
+            # The cancel handler's READY write directly carried the clear —
+            # not merely the (interruptible) finally.
+            ready_writes = [
+                pid for status, pid in writes if status == WorkstreamStatus.READY
+            ]
+            assert ready_writes == [None]
+            # And the end state is clean.
+            w = await db.get_workstream("c")
+            assert w.generation_pid is None
+            assert w.status == WorkstreamStatus.READY
+        finally:
+            await db.close()
+
+
+# =============================================================================
 # Startup Recovery Tests
 # =============================================================================
 
@@ -1132,6 +1320,68 @@ class TestStartupRecovery:
                 assert w.retry_count == 0  # no retry consumed
             # All -> READY (resumable): none counted as failed.
             assert orch._stats.failed == 0
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_decomposing_with_live_generation_pid_needs_review(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: True)
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            ws = self._seed("d", WorkstreamStatus.DECOMPOSING).model_copy(
+                update={"generation_pid": 4242}
+            )
+            await db.create_workstream(ws)
+            await orch._recover_stranded_workstreams()
+            w = await db.get_workstream("d")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert orch._stats.failed == 1
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_decomposing_with_dead_generation_pid_recovers_ready(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            ws = self._seed("d", WorkstreamStatus.DECOMPOSING).model_copy(
+                update={"generation_pid": 4242}
+            )
+            await db.create_workstream(ws)
+            await orch._recover_stranded_workstreams()
+            assert (await db.get_workstream("d")).status == WorkstreamStatus.READY
         finally:
             await db.close()
 

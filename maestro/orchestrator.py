@@ -184,18 +184,22 @@ class Orchestrator:
         for state in _STRANDED_INFLIGHT:
             for w in await self._db.get_workstreams_by_status(state):
                 try:
-                    live_orphan = (
-                        state is WorkstreamStatus.RUNNING
-                        and w.process_pid is not None
-                        and _is_pid_alive(w.process_pid)
+                    orphan_pid = (
+                        w.process_pid
+                        if state is WorkstreamStatus.RUNNING
+                        else w.generation_pid
+                        if state is WorkstreamStatus.DECOMPOSING
+                        else None
                     )
+                    live_orphan = orphan_pid is not None and _is_pid_alive(orphan_pid)
                     if live_orphan:
                         self._logger.warning(
-                            "Workstream '%s' stranded in RUNNING with a live "
+                            "Workstream '%s' stranded in %s with a live "
                             "process (pid %s) after restart — sending to "
                             "NEEDS_REVIEW; verify and clean it up before resume",
                             w.id,
-                            w.process_pid,
+                            state.value,
+                            orphan_pid,
                         )
                         await self._db.update_workstream_status(
                             w.id, WorkstreamStatus.FAILED
@@ -438,9 +442,15 @@ class Orchestrator:
         try:
             await self._spawn_workstream(workstream_id)
         except asyncio.CancelledError:
+            # Clear generation_pid atomically in the same READY write: on the
+            # cancel path the `finally` clear can itself be interrupted by a
+            # re-raised CancelledError before its awaits complete, so cleanup
+            # must not depend on it here.
             with contextlib.suppress(Exception):
                 await self._db.update_workstream_status(
-                    workstream_id, WorkstreamStatus.READY
+                    workstream_id,
+                    WorkstreamStatus.READY,
+                    generation_pid=None,
                 )
             raise
         except Exception as e:
@@ -452,16 +462,29 @@ class Orchestrator:
             await self._handle_failure(workstream_id, str(e))
         finally:
             self._generating.pop(workstream_id, None)
+            # Clear the generation pid on every exit (success/cancel/failure);
+            # a stale pid only pollutes REST/dashboard, but keep it clean.
+            # Same-state write WITHOUT expected_status (update_workstream_status
+            # does not validate transitions — an expected_status here would
+            # wrongly block the reset after READY/FAILED).
+            with contextlib.suppress(Exception):
+                w = await self._db.get_workstream(workstream_id)
+                if w.generation_pid is not None:
+                    await self._db.update_workstream_status(
+                        workstream_id, w.status, generation_pid=None
+                    )
 
     async def _spawn_workstream(self, workstream_id: str) -> None:
         """Spawn a spec-runner process for a workstream."""
         workstream = await self._db.get_workstream(workstream_id)
 
-        # Transition to DECOMPOSING for spec generation
+        # Transition to DECOMPOSING for spec generation (clear any stale
+        # generation pid up front — closes the re-decompose stale window).
         await self._db.update_workstream_status(
             workstream_id,
             WorkstreamStatus.DECOMPOSING,
             expected_status=workstream.status,
+            generation_pid=None,
         )
 
         # Create workspace
@@ -490,7 +513,17 @@ class Orchestrator:
             depends_on=workstream.depends_on,
             priority=workstream.priority,
         )
-        await self._decomposer.generate_spec(workstream_config, workspace)
+
+        async def _on_gen_pid(pid: int) -> None:
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.DECOMPOSING,
+                generation_pid=pid,
+            )
+
+        await self._decomposer.generate_spec(
+            workstream_config, workspace, on_pid=_on_gen_pid
+        )
 
         # Setup spec-runner config
         executor_config = self._config.spec_runner.to_executor_config()

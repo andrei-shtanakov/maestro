@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from collections.abc import Awaitable, Callable
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -287,6 +288,8 @@ class ProjectDecomposer:
         workstream: WorkstreamConfig,
         workspace_path: Path,
         timeout_minutes: int = 30,
+        *,
+        on_pid: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
         """Generate spec files by delegating to `spec-runner plan --full`.
 
@@ -330,7 +333,9 @@ class ProjectDecomposer:
                 "Generating spec for workstream '%s' via spec-runner plan --full",
                 workstream.id,
             )
-            await self._run_spec_runner(cmd, workspace_path, timeout_minutes)
+            await self._run_spec_runner(
+                cmd, workspace_path, timeout_minutes, on_pid=on_pid
+            )
         finally:
             desc_path.unlink(missing_ok=True)  # noqa: ASYNC240
 
@@ -344,9 +349,15 @@ class ProjectDecomposer:
         self._logger.info("Spec generated for workstream '%s'", workstream.id)
 
     async def _run_spec_runner(
-        self, cmd: list[str], cwd: Path, timeout_minutes: int
+        self,
+        cmd: list[str],
+        cwd: Path,
+        timeout_minutes: int,
+        *,
+        on_pid: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
-        """Run a spec-runner subprocess; terminate it on cancel/timeout."""
+        """Run a spec-runner subprocess; report its pid via on_pid, and
+        terminate it on persist-failure/cancel/timeout."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -358,6 +369,17 @@ class ProjectDecomposer:
         except FileNotFoundError as e:
             msg = "spec-runner command not found — is spec-runner installed?"
             raise DecomposerError(msg) from e
+
+        if on_pid is not None:
+            # Persist the pid before awaiting the process.
+            try:
+                await on_pid(proc.pid)
+            except BaseException:
+                # Persist failed OR the task was cancelled mid-persist — we
+                # cannot track this process, so terminate it rather than leave
+                # an orphan, and propagate (re-raises CancelledError too).
+                await self._terminate(proc)
+                raise
 
         try:
             _out, err = await asyncio.wait_for(

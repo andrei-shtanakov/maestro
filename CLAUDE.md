@@ -98,7 +98,7 @@ uv add --dev <package>
 - **spec_runner.py**: Integration boundary between Maestro and the external spec-runner
 
 **Multi-process orchestration (new):**
-- **orchestrator.py**: Main async loop — decompose, spawn, monitor, PR creation. On resume it first reconciles workstreams stranded by a prior hard crash (DECOMPOSING/RUNNING/MERGING/PR_CREATED → READY; a live-orphan RUNNING → NEEDS_REVIEW; FAILED by the retry rule) so the main loop can advance them.
+- **orchestrator.py**: Main async loop — decompose, spawn, monitor, PR creation. On resume it first reconciles workstreams stranded by a prior hard crash (DECOMPOSING/RUNNING/MERGING/PR_CREATED → READY; a live-orphan RUNNING (process_pid) or DECOMPOSING (generation_pid) → NEEDS_REVIEW; FAILED by the retry rule) so the main loop can advance them.
 - **workspace.py**: Git worktree lifecycle (create, setup, cleanup)
 - **decomposer.py**: Project decomposition via Claude CLI into workstreams (`decompose`) + async spec generation delegated to `spec-runner plan --full` (`generate_spec` — spec-runner owns the tasks.md format; runs as a background task in the orchestrator, budget-capped via `SpecRunnerConfig.spec_gen_budget_usd`)
 - **pr_manager.py**: GitHub PR creation via `gh` CLI

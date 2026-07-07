@@ -1390,6 +1390,7 @@ class TestSchemaMigrationsJournal:
                 (2, "r03_arbiter_routing"),
                 (3, "r06b_rename_zadachi_to_workstreams"),
                 (4, "cost_from_log_reported_cost"),
+                (5, "decomposing_generation_pid"),
             ]
         finally:
             await db.close()
@@ -1413,7 +1414,7 @@ class TestSchemaMigrationsJournal:
             )
             row = await cursor.fetchone()
             assert row is not None
-            assert row["n"] == 4
+            assert row["n"] == 5
         finally:
             await db2.close()
 
@@ -1490,6 +1491,7 @@ class TestSchemaMigrationsJournal:
                 (2, "r03_arbiter_routing"),
                 (3, "r06b_rename_zadachi_to_workstreams"),
                 (4, "cost_from_log_reported_cost"),
+                (5, "decomposing_generation_pid"),
             ]
             # Sanity: the idempotent ALTERs must not have fired twice.
             cursor = await db._connection.execute("PRAGMA table_info(tasks)")
@@ -1949,3 +1951,49 @@ class TestMigrationRenameZadachiToWorkstreams:
             assert summary["total_cost_usd"] == pytest.approx(0.021)
         finally:
             await db.close()
+
+
+@pytest.mark.anyio
+async def test_generation_pid_round_trips(tmp_path) -> None:
+    from maestro.database import Database
+    from maestro.models import Workstream, WorkstreamStatus
+
+    db = Database(tmp_path / "g.db")
+    await db.connect()
+    try:
+        ws = Workstream(
+            id="a",
+            title="a",
+            description="d",
+            scope=["s"],
+            branch="feature/a",
+            status=WorkstreamStatus.DECOMPOSING,
+            generation_pid=4242,
+        )
+        await db.create_workstream(ws)
+        assert (await db.get_workstream("a")).generation_pid == 4242
+        await db.update_workstream_status(
+            "a", WorkstreamStatus.DECOMPOSING, generation_pid=None
+        )
+        assert (await db.get_workstream("a")).generation_pid is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
+async def test_generation_pid_migration_idempotent(tmp_path) -> None:
+    from maestro.database import Database
+
+    dbfile = tmp_path / "m.db"
+    db = Database(dbfile)
+    await db.connect()  # applies migrations incl. generation_pid
+    await db.close()
+    db2 = Database(dbfile)
+    await db2.connect()  # second connect must be a no-op, not raise
+    try:
+        assert db2._connection is not None
+        cur = await db2._connection.execute("PRAGMA table_info(workstreams)")
+        cols = {r["name"] for r in await cur.fetchall()}
+        assert "generation_pid" in cols
+    finally:
+        await db2.close()
