@@ -124,7 +124,9 @@
 
 - [x] **M1** (commits `e3feefd`, `4688633`, `279193e`): cross-process trace continuity. Vendored `obs.py` от spec-runner@`fa6b106`, contract в `_cowork_output/observability-contract/` (log-schema, propagation, 4 fixtures), CLI `init_logging("maestro")`, child_env() пропагация в orchestrator
 - [x] **M2** (commit `d474120`, 2026-04-25): scheduler instrumentation. `obs.span("scheduler.session")` + `obs.span("task.spawn")` (subprocess inheritance через TRACEPARENT), 4 структурированных emit'а (`task.completed`/`task.validation_failed`/`task.failed`/`task.timeout`), `spawn_env()` helper в `spawners/base.py` пропагирует трасу в claude_code/codex/aider/validator subprocesses. 3 теста в `test_scheduler_observability.py`
-- [ ] **M3** (pending): scheduler-tick instrumentation (per-poll-cycle metrics), arbiter routing decision span, observability dashboards
+- [x] **M3 (runtime-decision instrumentation)** (closed by feat/observability-m3): `scheduler.tick` emit-on-change per poll cycle + `task.route` span around the routing decision (covers static + arbiter, records latency/decision_id; failure → `task.route.failed`).
+- [ ] **M3 — observability dashboards** (pending): separate project (backend/viz over the OTel JSONL or the existing `maestro/dashboard/` UI).
+- [ ] **M3 — W3C traceparent into the MCP JSON-RPC envelope** (the R-06b arbiter-trace follow-up): cross-boundary contract; correlates `benchmark.report.*` / routing with arbiter-side rows by trace_id.
 
 ---
 

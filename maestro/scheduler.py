@@ -38,6 +38,7 @@ from maestro.models import (
     AgentType,
     ArbiterMode,
     RouteAction,
+    RouteDecision,
     Task,
     TaskConfig,
     TaskOutcome,
@@ -237,6 +238,7 @@ class Scheduler:
         self._abandon_outcome_after_s: int = 300
 
         self._running_tasks: dict[str, RunningTask] = {}
+        self._last_tick: tuple[int, int, int] | None = None
         self._retry_ready_times: dict[str, datetime] = {}
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
@@ -625,6 +627,20 @@ class Scheduler:
         finally:
             await self._cleanup()
 
+    def _emit_tick(self, ready: int, running: int, completed: int) -> None:
+        """Emit a per-poll-cycle queue snapshot, but only when it changed.
+
+        The first tick always emits; identical consecutive snapshots are
+        skipped so a long idle run does not flood with duplicate ticks.
+        """
+        snapshot = (ready, running, completed)
+        if snapshot == self._last_tick:
+            return
+        self._last_tick = snapshot
+        _obs_log.info(
+            "scheduler.tick", ready=ready, running=running, completed=completed
+        )
+
     async def _main_loop(self) -> None:
         """Main scheduler loop."""
         while not self._shutdown_requested:
@@ -643,6 +659,19 @@ class Scheduler:
 
             # Monitor running processes
             await self._monitor_running_tasks()
+
+            # M3: per-poll-cycle queue snapshot (emit-on-change). `ready` is the
+            # post-spawn residual — ready tasks that did NOT get a slot this
+            # cycle — so it stays coherent with `running` (a task spawned this
+            # cycle is not double-counted in both). Re-fetch completed AFTER
+            # monitoring so a task that finished this cycle is reflected
+            # (start-of-cycle completed_ids would undercount it and leave the
+            # snapshot incoherent with the post-monitor running count).
+            still_queued = sum(
+                1 for tid in ready_task_ids if tid not in self._running_tasks
+            )
+            completed_now = await self._get_completed_task_ids()
+            self._emit_tick(still_queued, len(self._running_tasks), len(completed_now))
 
             # R-03: re-deliver any outcomes that couldn't reach arbiter earlier
             await self._outcome_reattempt_pass()
@@ -704,6 +733,22 @@ class Scheduler:
                 if launched:
                     started += 1
 
+    async def _route_task(self, task: Task) -> RouteDecision:
+        """Consult the routing strategy inside a `task.route` span.
+
+        The span records the decision (action / chosen_agent / decision_id) on
+        its `.ended` record; a routing exception surfaces as `task.route.failed`
+        (obs.span re-raises, preserving the caller's error flow).
+        """
+        with obs.span("task.route", task_id=task.id) as route_span:
+            decision = await self._routing.route(task)
+            route_span.set_attrs(
+                action=decision.action.value,
+                chosen_agent=decision.chosen_agent,
+                decision_id=decision.decision_id,
+            )
+            return decision
+
     async def _spawn_task(self, task_id: str) -> bool:
         """Attempt to spawn a single task.
 
@@ -742,7 +787,8 @@ class Scheduler:
             return False
 
         # R-03: consult the routing strategy before picking a spawner.
-        decision = await self._routing.route(task)
+        # M3: wrapped in a task.route span (latency + decision outcome).
+        decision = await self._route_task(task)
 
         if decision.action is RouteAction.HOLD:
             if self._hold_throttle.should_log(task_id, decision.reason):
