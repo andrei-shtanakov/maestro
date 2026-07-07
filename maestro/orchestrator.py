@@ -794,37 +794,53 @@ class Orchestrator:
                     error_message=f"PR creation note: {e}",
                 )
 
-        # Mark as DONE
+        # Ensure the workstream is at PR_CREATED (both auto_pr paths converge
+        # here); auto_pr=False creates no PR, so pass MERGING -> PR_CREATED.
         current = await self._db.get_workstream(workstream_id)
-        if current.status == WorkstreamStatus.PR_CREATED:
-            await self._db.update_workstream_status(
-                workstream_id,
-                WorkstreamStatus.DONE,
-                expected_status=WorkstreamStatus.PR_CREATED,
-            )
-        elif current.status == WorkstreamStatus.MERGING:
-            # No PR created (auto_pr=False)
-            # MERGING -> can't go to DONE directly, so
-            # transition through PR_CREATED
+        if current.status == WorkstreamStatus.MERGING:
             await self._db.update_workstream_status(
                 workstream_id,
                 WorkstreamStatus.PR_CREATED,
             )
+
+        # Merge the feature branch into base BEFORE marking DONE, so DONE is
+        # gated on a successful merge. A conflict/failure routes to
+        # NEEDS_REVIEW (a human resolves it; re-running run --all cannot), and
+        # a crash mid-merge leaves the workstream pre-DONE for startup recovery.
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                self._merge_into_base,
+                workstream.branch,
+            )
+        except GitError as e:
+            self._logger.warning(
+                "Base merge failed for '%s'; routing to NEEDS_REVIEW: %s",
+                workstream_id,
+                e,
+            )
             await self._db.update_workstream_status(
                 workstream_id,
-                WorkstreamStatus.DONE,
+                WorkstreamStatus.FAILED,
                 expected_status=WorkstreamStatus.PR_CREATED,
+                error_message=f"Base merge failed: {e}",
             )
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=WorkstreamStatus.FAILED,
+            )
+            self._stats.failed += 1
+            # Leave the workspace intact so a human can resolve the conflict.
+            return
 
-        self._stats.completed += 1
-
-        # Auto-merge feature branch into base branch to avoid
-        # accumulating unmerged branches with diverging changes
-        await asyncio.get_running_loop().run_in_executor(
-            None,
-            self._merge_into_base,
-            workstream.branch,
+        # Merge succeeded -> DONE.
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.DONE,
+            expected_status=WorkstreamStatus.PR_CREATED,
         )
+        self._stats.completed += 1
 
         # Cleanup workspace
         self._workspace_mgr.cleanup_workspace(workstream_id)

@@ -1526,3 +1526,110 @@ class TestMergeIntoBase:
         )
         with pytest.raises(GitError):
             orch._merge_into_base("feature/whatever")
+
+
+class TestHandleSuccessMergeGating:
+    async def _orch_db(
+        self, tmp_path, auto_pr, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ):
+        from maestro.database import Database
+
+        db = Database(tmp_path / "o.db")
+        await db.connect()
+        cfg = OrchestratorConfig(
+            project="p",
+            repo_url="https://github.com/t/r",
+            repo_path="/tmp/r",
+            workspace_base="/tmp/ws",
+            auto_pr=auto_pr,
+            workstreams=[],
+        )
+        orch = Orchestrator(
+            db=db,
+            workspace_mgr=mock_workspace_mgr,
+            decomposer=mock_decomposer,
+            config=cfg,
+            pr_manager=mock_pr_manager,
+        )
+        return orch, db
+
+    def _seed(self, zid):
+        return Workstream(
+            id=zid,
+            title=zid,
+            description="d",
+            scope=["s"],
+            branch=f"feature/{zid}",
+            status=WorkstreamStatus.RUNNING,
+        )
+
+    @pytest.mark.anyio
+    async def test_success_marks_done_and_cleans_up(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+    ) -> None:
+        orch, db = await self._orch_db(
+            tmp_path, True, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(self._seed("a"))
+            orch._merge_into_base = MagicMock()  # success = no raise
+            await orch._handle_success("a", MagicMock())
+            assert (await db.get_workstream("a")).status == WorkstreamStatus.DONE
+            assert orch._stats.completed == 1
+            mock_workspace_mgr.cleanup_workspace.assert_called_once_with("a")
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_merge_conflict_routes_to_needs_review_no_cleanup(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+    ) -> None:
+        from maestro.git import MergeConflictError
+
+        orch, db = await self._orch_db(
+            tmp_path, True, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(self._seed("b"))
+
+            def boom(feature_branch: str) -> None:
+                raise MergeConflictError("CONFLICT in README.md")
+
+            orch._merge_into_base = boom
+            await orch._handle_success("b", MagicMock())
+            w = await db.get_workstream("b")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert w.error_message is not None
+            assert orch._stats.failed == 1
+            assert orch._stats.completed == 0
+            mock_workspace_mgr.cleanup_workspace.assert_not_called()
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_auto_pr_false_success_reaches_done(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+    ) -> None:
+        orch, db = await self._orch_db(
+            tmp_path, False, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(self._seed("c"))
+            orch._merge_into_base = MagicMock()
+            await orch._handle_success("c", MagicMock())
+            assert (await db.get_workstream("c")).status == WorkstreamStatus.DONE
+            mock_pr_manager.push_and_create_pr.assert_not_called()
+        finally:
+            await db.close()
