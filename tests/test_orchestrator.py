@@ -1634,6 +1634,39 @@ class TestStartupRecovery:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_failed_sentinel_generation_pid_parks_needs_review(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            ws = self._seed("f", WorkstreamStatus.FAILED).model_copy(
+                update={
+                    "generation_pid": orch_mod._SPAWNING_SENTINEL,
+                    "process_pid": None,
+                }
+            )
+            await db.create_workstream(ws)
+            await orch._recover_stranded_workstreams()
+            assert (
+                await db.get_workstream("f")
+            ).status == WorkstreamStatus.NEEDS_REVIEW
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_running_with_no_pid_recovers_to_ready(
         self,
         tmp_path,

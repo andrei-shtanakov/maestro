@@ -281,11 +281,15 @@ class Orchestrator:
         # FAILED have already reached their final state.
         for w in await self._db.get_workstreams_by_status(WorkstreamStatus.FAILED):
             try:
-                if _maybe_live_orphan(w.process_pid):
+                if _maybe_live_orphan(w.process_pid) or _maybe_live_orphan(
+                    w.generation_pid
+                ):
                     # A FAILED row can be an in-flight reset interrupted mid
                     # two-write (X->FAILED committed, target write lost). If its
-                    # recorded pid is alive OR the spawning sentinel, it may be a
-                    # live orphan — never reset to READY. Park for review.
+                    # recorded process_pid (RUNNING orphan) or generation_pid
+                    # (DECOMPOSING orphan) is alive OR the spawning sentinel, it
+                    # may be a live orphan — never reset to READY. Park for
+                    # review. The NEEDS_REVIEW write below clears both pids.
                     target = WorkstreamStatus.NEEDS_REVIEW
                 else:
                     target = (
