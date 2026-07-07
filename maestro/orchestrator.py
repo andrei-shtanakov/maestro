@@ -184,18 +184,22 @@ class Orchestrator:
         for state in _STRANDED_INFLIGHT:
             for w in await self._db.get_workstreams_by_status(state):
                 try:
-                    live_orphan = (
-                        state is WorkstreamStatus.RUNNING
-                        and w.process_pid is not None
-                        and _is_pid_alive(w.process_pid)
+                    orphan_pid = (
+                        w.process_pid
+                        if state is WorkstreamStatus.RUNNING
+                        else w.generation_pid
+                        if state is WorkstreamStatus.DECOMPOSING
+                        else None
                     )
+                    live_orphan = orphan_pid is not None and _is_pid_alive(orphan_pid)
                     if live_orphan:
                         self._logger.warning(
-                            "Workstream '%s' stranded in RUNNING with a live "
+                            "Workstream '%s' stranded in %s with a live "
                             "process (pid %s) after restart — sending to "
                             "NEEDS_REVIEW; verify and clean it up before resume",
                             w.id,
-                            w.process_pid,
+                            state.value,
+                            orphan_pid,
                         )
                         await self._db.update_workstream_status(
                             w.id, WorkstreamStatus.FAILED

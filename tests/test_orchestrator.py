@@ -1271,6 +1271,68 @@ class TestStartupRecovery:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_decomposing_with_live_generation_pid_needs_review(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: True)
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            ws = self._seed("d", WorkstreamStatus.DECOMPOSING).model_copy(
+                update={"generation_pid": 4242}
+            )
+            await db.create_workstream(ws)
+            await orch._recover_stranded_workstreams()
+            w = await db.get_workstream("d")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert orch._stats.failed == 1
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_decomposing_with_dead_generation_pid_recovers_ready(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            ws = self._seed("d", WorkstreamStatus.DECOMPOSING).model_copy(
+                update={"generation_pid": 4242}
+            )
+            await db.create_workstream(ws)
+            await orch._recover_stranded_workstreams()
+            assert (await db.get_workstream("d")).status == WorkstreamStatus.READY
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_running_with_live_pid_goes_to_needs_review(
         self,
         tmp_path,
