@@ -165,6 +165,44 @@ class TestClaudeCodeLogParsing:
         assert usage.input_tokens == 500
         assert usage.output_tokens == 200
 
+    def test_claude_log_extracts_total_cost_usd(self) -> None:
+        """Claude's ``total_cost_usd`` is extracted into cost_usd."""
+        content = json.dumps(
+            {
+                "usage": {"input_tokens": 100, "output_tokens": 50},
+                "total_cost_usd": 0.0123,
+            }
+        )
+        usage = parse_claude_code_log(content)
+        assert usage.input_tokens == 100
+        assert usage.output_tokens == 50
+        assert usage.cost_usd == pytest.approx(0.0123)
+
+    def test_claude_log_cost_usd_key_fallback(self) -> None:
+        """Falls back to ``cost_usd`` when ``total_cost_usd`` is absent."""
+        content = json.dumps({"input_tokens": 10, "output_tokens": 5, "cost_usd": 0.5})
+        usage = parse_claude_code_log(content)
+        assert usage.cost_usd == pytest.approx(0.5)
+
+    def test_claude_log_rejects_bad_cost_values(self) -> None:
+        """bool/NaN/Infinity/negative costs are rejected, tokens still parsed."""
+        for bad in ("true", "NaN", "Infinity", "-1.0"):
+            content = (
+                '{"usage": {"input_tokens": 10, "output_tokens": 5}, '
+                f'"total_cost_usd": {bad}}}'
+            )
+            usage = parse_claude_code_log(content)
+            assert usage.cost_usd is None, f"cost {bad} must be rejected"
+            assert usage.input_tokens == 10  # tokens still parsed
+
+    def test_claude_log_cost_only_survives_zero_tokens(self) -> None:
+        """A result with a cost but no token fields must not be dropped."""
+        content = json.dumps({"total_cost_usd": 0.02})
+        usage = parse_claude_code_log(content)
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
+        assert usage.cost_usd == pytest.approx(0.02)
+
 
 class TestOpencodeLogParsing:
     """Tests for opencode `run --format json` JSONL parsing."""
@@ -563,6 +601,14 @@ class TestParseAndCreateCost:
         assert cost is not None
         assert cost.reported_cost_usd == pytest.approx(0.02)
         assert cost.input_tokens == 0
+
+    def test_parse_and_create_cost_from_cost_only_log(self, tmp_path: Path) -> None:
+        """Claude cost-only log (no tokens) still produces a TaskCost row."""
+        log = tmp_path / "c.log"
+        log.write_text(json.dumps({"total_cost_usd": 0.02}))
+        tc = parse_and_create_cost("t1", AgentType.CLAUDE_CODE, log)
+        assert tc is not None
+        assert tc.reported_cost_usd == pytest.approx(0.02)
 
 
 # =============================================================================
