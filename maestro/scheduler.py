@@ -660,10 +660,14 @@ class Scheduler:
             # Monitor running processes
             await self._monitor_running_tasks()
 
-            # M3: per-poll-cycle queue snapshot (emit-on-change).
-            self._emit_tick(
-                len(ready_task_ids), len(self._running_tasks), len(completed_ids)
+            # M3: per-poll-cycle queue snapshot (emit-on-change). `ready` is the
+            # post-spawn residual — ready tasks that did NOT get a slot this
+            # cycle — so it stays coherent with `running` (a task spawned this
+            # cycle is not double-counted in both).
+            still_queued = sum(
+                1 for tid in ready_task_ids if tid not in self._running_tasks
             )
+            self._emit_tick(still_queued, len(self._running_tasks), len(completed_ids))
 
             # R-03: re-deliver any outcomes that couldn't reach arbiter earlier
             await self._outcome_reattempt_pass()

@@ -79,6 +79,15 @@ def test_emit_tick_first_and_on_change_only(tmp_path, monkeypatch) -> None:
     assert ticks[0]["Resource"]["service.name"] == "maestro"
 
 
+def test_emit_tick_oscillation_reemits(tmp_path, monkeypatch) -> None:
+    _obs, sched_mod = _reload_obs_and_scheduler(monkeypatch, tmp_path)
+    sched = _make_scheduler(sched_mod, tmp_path)
+    sched._emit_tick(1, 0, 0)  # A
+    sched._emit_tick(0, 1, 0)  # B
+    sched._emit_tick(1, 0, 0)  # A again → re-emits (compare is vs previous only)
+    assert len(_ticks(tmp_path)) == 3
+
+
 class _StubRouting:
     def __init__(self, decision=None, exc=None):
         self._decision = decision
