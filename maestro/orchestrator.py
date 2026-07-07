@@ -452,16 +452,29 @@ class Orchestrator:
             await self._handle_failure(workstream_id, str(e))
         finally:
             self._generating.pop(workstream_id, None)
+            # Clear the generation pid on every exit (success/cancel/failure);
+            # a stale pid only pollutes REST/dashboard, but keep it clean.
+            # Same-state write WITHOUT expected_status (update_workstream_status
+            # does not validate transitions — an expected_status here would
+            # wrongly block the reset after READY/FAILED).
+            with contextlib.suppress(Exception):
+                w = await self._db.get_workstream(workstream_id)
+                if w.generation_pid is not None:
+                    await self._db.update_workstream_status(
+                        workstream_id, w.status, generation_pid=None
+                    )
 
     async def _spawn_workstream(self, workstream_id: str) -> None:
         """Spawn a spec-runner process for a workstream."""
         workstream = await self._db.get_workstream(workstream_id)
 
-        # Transition to DECOMPOSING for spec generation
+        # Transition to DECOMPOSING for spec generation (clear any stale
+        # generation pid up front — closes the re-decompose stale window).
         await self._db.update_workstream_status(
             workstream_id,
             WorkstreamStatus.DECOMPOSING,
             expected_status=workstream.status,
+            generation_pid=None,
         )
 
         # Create workspace
@@ -490,7 +503,17 @@ class Orchestrator:
             depends_on=workstream.depends_on,
             priority=workstream.priority,
         )
-        await self._decomposer.generate_spec(workstream_config, workspace)
+
+        async def _on_gen_pid(pid: int) -> None:
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.DECOMPOSING,
+                generation_pid=pid,
+            )
+
+        await self._decomposer.generate_spec(
+            workstream_config, workspace, on_pid=_on_gen_pid
+        )
 
         # Setup spec-runner config
         executor_config = self._config.spec_runner.to_executor_config()
