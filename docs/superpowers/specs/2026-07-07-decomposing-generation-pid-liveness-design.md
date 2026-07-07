@@ -61,22 +61,58 @@ DB-agnostic):
   after `create_subprocess_exec` succeeds, `if on_pid is not None: await
   on_pid(proc.pid)` — with NO intervening `await`, so the window between spawn and
   persist is minimal (see Residual risk).
+- **`on_pid` failure must not leave an untracked orphan.** If the `on_pid` DB write
+  raises, the `plan --full` process is already spawned but its pid was never
+  recorded — recovery could never see it. So the call is wrapped: on any exception
+  from `on_pid`, `_terminate` the just-spawned process (we cannot track it, so we
+  must not orphan it) and re-raise:
+  ```python
+  proc = await asyncio.create_subprocess_exec(...)  # (FileNotFoundError handled)
+  if on_pid is not None:
+      try:
+          await on_pid(proc.pid)
+      except Exception:
+          await self._terminate(proc)  # untrackable — kill rather than orphan
+          raise
+  ```
+  The re-raise propagates as a `generate_spec` failure → `_generate_and_launch` →
+  `_handle_failure`.
 - `_spawn_workstream` passes
   `on_pid=lambda pid: self._db.update_workstream_status(workstream_id,
   WorkstreamStatus.DECOMPOSING, generation_pid=pid)`.
 
-### 3. Clear `generation_pid` on entry AND exit of DECOMPOSING
+### 3. Clear `generation_pid` on entry, and on EVERY exit of DECOMPOSING
 
-- **On entry:** the first `update_workstream_status(…, DECOMPOSING, …)` in
-  `_spawn_workstream` also sets `generation_pid=None`. This closes the re-decompose
-  stale window: a workstream can re-enter `DECOMPOSING` (recovery `RUNNING→READY` →
-  `_spawn_workstream` → `DECOMPOSING` again); clearing before the new `plan --full`
-  spawns guarantees `generation_pid` is `None` (recovery reads "no process" → READY,
-  safe) or the current plan pid — never a stale prior pid.
-- **On exit:** the `DECOMPOSING → READY` transition (after a successful
-  `generate_spec`, in `_spawn_workstream`) also sets `generation_pid=None`. The
-  `plan --full` process has already exited by then; clearing keeps the row clean so
-  REST/dashboard don't display a stale pid.
+- **On entry (correctness):** the first `update_workstream_status(…, DECOMPOSING, …)`
+  in `_spawn_workstream` also sets `generation_pid=None`. This closes the
+  re-decompose stale window: a workstream can re-enter `DECOMPOSING` (recovery
+  `RUNNING→READY` → `_spawn_workstream` → `DECOMPOSING` again); clearing before the
+  new `plan --full` spawns guarantees `generation_pid` is `None` (recovery reads "no
+  process" → READY, safe) or the current plan pid — never a stale prior pid.
+- **On every exit (cleanliness):** clear `generation_pid=None` in the `finally` of
+  `_generate_and_launch`, so it is cleared uniformly on success, cancel, AND failure
+  (the prior design cleared only on the successful `DECOMPOSING → READY` exit,
+  leaving a stale pid on the cancel path — `CancelledError → READY` — and the failure
+  path — `Exception → _handle_failure`). A stale pid on a non-DECOMPOSING row is
+  harmless to recovery (only DECOMPOSING rows are liveness-checked) but pollutes
+  REST/dashboard and manual diagnosis. The `finally` reads the current status and
+  rewrites it with `generation_pid=None` only when set:
+  ```python
+  finally:
+      self._generating.pop(workstream_id, None)
+      with contextlib.suppress(Exception):
+          w = await self._db.get_workstream(workstream_id)
+          if w.generation_pid is not None:
+              await self._db.update_workstream_status(
+                  workstream_id, w.status, generation_pid=None
+              )
+  ```
+  This is safe as a same-state write: `update_workstream_status` does NOT validate
+  transitions — it only optionally checks `expected_status` (omitted here) — so
+  `status → status` with just `generation_pid` cleared is accepted (the existing
+  same-state `workspace_path` update in `_spawn_workstream` relies on the same
+  property). The `if … is not None` guard makes it idempotent and a no-op for
+  workstreams that never generated.
 
 ### 4. Recovery: liveness-check DECOMPOSING (generalize the in-flight branch)
 
@@ -135,11 +171,19 @@ closed together rather than introducing an asymmetry now.
   `create_subprocess_exec`) and assert `on_pid` is invoked once with the spawned
   process's real pid. Assert generation proceeds unchanged when `on_pid=None`
   (back-compat).
+- **`on_pid` failure terminates the process** — with an `on_pid` that raises, assert
+  `_terminate` is called on the spawned process and the exception propagates (no
+  orphan left running). (Monkeypatch `create_subprocess_exec` to return a fake proc,
+  spy on `_terminate`.)
 - **`_spawn_workstream` pid lifecycle** — entry clears `generation_pid` to None
-  before generation; `on_pid` writes the plan pid during DECOMPOSING; the
-  `DECOMPOSING → READY` exit clears it back to None. (Use a mocked decomposer whose
-  `generate_spec` invokes the passed `on_pid` with a fake pid, and a real in-memory
-  DB; assert the persisted `generation_pid` at each phase.)
+  before generation; `on_pid` writes the plan pid during DECOMPOSING. (Use a mocked
+  decomposer whose `generate_spec` invokes the passed `on_pid` with a fake pid, and a
+  real in-memory DB; assert the persisted `generation_pid` at each phase.)
+- **`_generate_and_launch` finally clears `generation_pid` on every exit** — with a
+  `generation_pid` set mid-DECOMPOSING: (a) success → cleared; (b) `generate_spec`
+  raises → `_handle_failure` runs AND `generation_pid` is None afterward; (c)
+  `CancelledError` → workstream READY AND `generation_pid` None. Assert the persisted
+  value is None in all three.
 - **Recovery** — DECOMPOSING with a live `generation_pid` (monkeypatch
   `_is_pid_alive` True) → `NEEDS_REVIEW`, `stats.failed == 1`; DECOMPOSING with a
   dead pid (`_is_pid_alive` False) or `generation_pid=None` → `READY`; the RUNNING
