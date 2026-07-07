@@ -211,6 +211,11 @@ ls .github/workflows/
 - [ ] Responder `cost or None` (spawner_responder.py) collapses a genuine
       reported $0.00 into None ("confirmed free" reads as "unknown") — becomes
       real when free/local open models run under opencode.
+- [ ] Codex cost-from-log (research): `codex exec` writes plain text (no
+      `--output-format json`); `parse_log` routes CODEX through the Claude JSON
+      parser, which extracts nothing. Investigate whether codex can emit
+      structured usage/cost (tokens + cost) and, if so, add a dedicated codex
+      parser + `parse_log` route. (Deferred from the claude cost-from-log spec.)
 
 - [x] Orchestrator startup recovery: workstreams stranded in DECOMPOSING or
       RUNNING after a hard crash are not re-resolved on `--resume`
