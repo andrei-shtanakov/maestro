@@ -1449,6 +1449,101 @@ class TestStartupRecovery:
             assert w.status == WorkstreamStatus.NEEDS_REVIEW
             # Parked for review -> counted as failed (exit code + summary).
             assert orch._stats.failed == 1
+            assert w.process_pid is None  # parked-row cleanup
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_running_sentinel_pid_parks_needs_review_and_clears(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            await db.create_workstream(
+                self._seed(
+                    "r", WorkstreamStatus.RUNNING, pid=orch_mod._SPAWNING_SENTINEL
+                )
+            )
+            await orch._recover_stranded_workstreams()
+            w = await db.get_workstream("r")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert orch._stats.failed == 1
+            assert w.process_pid is None  # parked-row cleanup
+            assert w.generation_pid is None
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_decomposing_sentinel_gen_pid_parks_needs_review(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            ws = self._seed("d", WorkstreamStatus.DECOMPOSING).model_copy(
+                update={"generation_pid": orch_mod._SPAWNING_SENTINEL}
+            )
+            await db.create_workstream(ws)
+            await orch._recover_stranded_workstreams()
+            w = await db.get_workstream("d")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert w.generation_pid is None
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_failed_sentinel_pid_parks_needs_review(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            await db.create_workstream(
+                self._seed(
+                    "f", WorkstreamStatus.FAILED, pid=orch_mod._SPAWNING_SENTINEL
+                )
+            )
+            await orch._recover_stranded_workstreams()
+            assert (
+                await db.get_workstream("f")
+            ).status == WorkstreamStatus.NEEDS_REVIEW
         finally:
             await db.close()
 
