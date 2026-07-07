@@ -1264,14 +1264,17 @@ class TestStartupRecovery:
             await db.close()
 
     @pytest.mark.anyio
-    async def test_run_recovers_before_loop(
+    async def test_run_invokes_recovery_before_loop(
         self,
         tmp_path,
         mock_workspace_mgr,
         mock_decomposer,
         mock_pr_manager,
         orch_config,
+        monkeypatch,
     ) -> None:
+        """run() must reconcile stranded workstreams before the main loop —
+        guards the wiring line, not just the method."""
         orch, db = await self._orch_with_db(
             tmp_path,
             mock_workspace_mgr,
@@ -1283,12 +1286,18 @@ class TestStartupRecovery:
             await db.create_workstream(
                 self._seed("r", WorkstreamStatus.RUNNING, pid=None)
             )
-            # Recovery is the unit under test here; assert it flips the state.
-            # (Driving the full run() loop to completion is covered by the
-            # file's existing run() tests; keep this focused on the ordering:
-            # recovery must have run by the time the loop first resolves.)
-            recovered = await orch._recover_stranded_workstreams()
-            assert recovered == 1
+            # Stub the loop so run() returns immediately after recovery.
+            # Assert recovery already flipped the state by the time the loop runs.
+            observed: dict[str, WorkstreamStatus] = {}
+
+            async def fake_main_loop() -> None:
+                observed["r"] = (await db.get_workstream("r")).status
+
+            monkeypatch.setattr(orch, "_main_loop", fake_main_loop)
+            await orch.run()
+            # recovery ran BEFORE the loop:
+            assert observed["r"] == WorkstreamStatus.READY
+            # and persisted:
             assert (await db.get_workstream("r")).status == WorkstreamStatus.READY
         finally:
             await db.close()
