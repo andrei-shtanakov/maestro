@@ -220,6 +220,34 @@ async def test_reported_zero_cost_is_preserved(tmp_path) -> None:
 
 
 @pytest.mark.anyio
+async def test_reported_zero_cost_preserved_on_error_exit(tmp_path) -> None:
+    """A reported 0.0 must survive even on a non-zero exit — both return
+    sites share the same cost_wire, so the error path cannot re-collapse it."""
+    log_content = json.dumps(
+        {
+            "type": "step_finish",
+            "part": {"cost": 0.0, "tokens": {"input": 10, "output": 5}},
+        }
+    )
+    spawner = FakeSpawner(
+        agent_type_str="opencode",
+        process=FakeProcess(returncode=2),
+        log_content=log_content,
+    )
+    responder = SpawnerResponder(
+        spawner=spawner,
+        workdir=tmp_path,
+        log_dir=tmp_path,
+        timeout_seconds=5.0,
+    )
+
+    response = await responder.respond("free but failed")
+
+    assert response.cost_usd == 0.0  # reported 0.0 preserved on error path
+    assert response.error == "exit code 2"  # error is still reported
+
+
+@pytest.mark.anyio
 async def test_estimated_zero_cost_stays_unknown(tmp_path) -> None:
     """No parseable usage → no reported cost, zero tokens → estimate 0.0
     → collapses to None (an estimate of zero is not an observation)."""
