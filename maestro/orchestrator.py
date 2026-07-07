@@ -35,6 +35,29 @@ class OrchestratorError(Exception):
     """Base exception for orchestrator errors."""
 
 
+def _is_pid_alive(pid: int) -> bool:
+    """True if a process with this pid exists (signal 0 probes without killing).
+
+    ProcessLookupError means it is gone; PermissionError means it exists but
+    we may not signal it (still alive).
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+_STRANDED_INFLIGHT = (
+    WorkstreamStatus.DECOMPOSING,
+    WorkstreamStatus.RUNNING,
+    WorkstreamStatus.MERGING,
+    WorkstreamStatus.PR_CREATED,
+)
+
+
 @dataclass
 class RunningWorkstream:
     """Represents a currently running workstream process."""
@@ -129,6 +152,10 @@ class Orchestrator:
             # Step 1: Ensure workstreams exist
             await self._ensure_workstreams()
 
+            # Step 1b: Reconcile workstreams stranded by a prior hard crash
+            # (resume path) so the main loop can advance them.
+            await self._recover_stranded_workstreams()
+
             # Step 2: Main loop
             await self._main_loop()
         finally:
@@ -143,6 +170,98 @@ class Orchestrator:
                         merge_logs_dir(_log_dir)
 
         return self._stats
+
+    async def _recover_stranded_workstreams(self) -> int:
+        """Reconcile workstreams stranded by a hard crash so the resume loop
+        can advance them. In-flight strands reset to READY (no retry, no
+        error_message); a RUNNING workstream whose recorded process is still
+        alive goes to NEEDS_REVIEW instead (never re-run over a live orphan);
+        FAILED workstreams reconcile by the retry rule. Best-effort per
+        workstream; never raises."""
+        recovered = 0
+
+        for state in _STRANDED_INFLIGHT:
+            for w in await self._db.get_workstreams_by_status(state):
+                try:
+                    live_orphan = (
+                        state is WorkstreamStatus.RUNNING
+                        and w.process_pid is not None
+                        and _is_pid_alive(w.process_pid)
+                    )
+                    if live_orphan:
+                        self._logger.warning(
+                            "Workstream '%s' stranded in RUNNING with a live "
+                            "process (pid %s) after restart — sending to "
+                            "NEEDS_REVIEW; verify and clean it up before resume",
+                            w.id,
+                            w.process_pid,
+                        )
+                        await self._db.update_workstream_status(
+                            w.id, WorkstreamStatus.FAILED
+                        )
+                        await self._db.update_workstream_status(
+                            w.id,
+                            WorkstreamStatus.NEEDS_REVIEW,
+                            expected_status=WorkstreamStatus.FAILED,
+                        )
+                    elif state is WorkstreamStatus.DECOMPOSING:
+                        self._logger.info(
+                            "Recovering workstream '%s' from stranded "
+                            "DECOMPOSING -> READY",
+                            w.id,
+                        )
+                        await self._db.update_workstream_status(
+                            w.id, WorkstreamStatus.READY
+                        )
+                    else:
+                        # RUNNING (dead) / MERGING / PR_CREATED: cannot go
+                        # directly to READY, reset via FAILED.
+                        self._logger.info(
+                            "Recovering workstream '%s' from stranded %s -> READY",
+                            w.id,
+                            state.value,
+                        )
+                        await self._db.update_workstream_status(
+                            w.id, WorkstreamStatus.FAILED
+                        )
+                        await self._db.update_workstream_status(
+                            w.id,
+                            WorkstreamStatus.READY,
+                            expected_status=WorkstreamStatus.FAILED,
+                        )
+                    recovered += 1
+                except Exception as e:
+                    self._logger.error("Failed to recover workstream '%s': %s", w.id, e)
+
+        # FAILED reconciliation (genuine failures resting mid-_handle_failure).
+        # Runs after the in-flight loop, so in-flight resets that pass through
+        # FAILED have already reached their final state.
+        for w in await self._db.get_workstreams_by_status(WorkstreamStatus.FAILED):
+            try:
+                target = (
+                    WorkstreamStatus.READY
+                    if w.can_retry()
+                    else WorkstreamStatus.NEEDS_REVIEW
+                )
+                self._logger.info(
+                    "Reconciling FAILED workstream '%s' -> %s",
+                    w.id,
+                    target.value,
+                )
+                await self._db.update_workstream_status(
+                    w.id, target, expected_status=WorkstreamStatus.FAILED
+                )
+                recovered += 1
+            except Exception as e:
+                self._logger.error(
+                    "Failed to reconcile FAILED workstream '%s': %s", w.id, e
+                )
+
+        if recovered:
+            self._logger.info(
+                "Recovered %d stranded workstream(s) on startup", recovered
+            )
+        return recovered
 
     async def _ensure_workstreams(self) -> None:
         """Ensure workstreams are in the database.
