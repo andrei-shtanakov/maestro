@@ -121,6 +121,14 @@ fresh sentinel anyway).
   workspace setup) → SENTINEL with no orphan → `NEEDS_REVIEW`. This is the SAFE
   direction (a human verifies, finds no orphan, resets to READY) versus the old
   UNSAFE `READY`-over-a-live-orphan. Rare and acceptable.
+- Related accepted false-positive: if the spawn itself FAILS
+  (`create_subprocess_exec` raises), `_handle_failure` sets `FAILED` without
+  clearing the sentinel (it is a generic handler). The current run retries fine
+  (the loop doesn't read the pid), but if the orchestrator then crashes before
+  retrying, the next startup's FAILED-reconciliation sees the sentinel →
+  `NEEDS_REVIEW` even though the spawn provably failed and no orphan exists. Same
+  safe direction (human resets); not worth complicating the generic
+  `_handle_failure`. Noted, accepted.
 - MERGING / PR_CREATED are unaffected: they are reached only after the process
   has exited and the real pid was written, so they never carry the sentinel;
   their (dead) `process_pid` → `_maybe_live_orphan` False → `READY`.
