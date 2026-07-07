@@ -77,6 +77,15 @@ Update the `TokenUsage.cost_usd` docstring, which currently says "Only the
 opencode parser fills this today; claude/codex/aider logs are priced from
 PRICING downstream" — now claude fills it too.
 
+**Scope note — shared parser, not a per-agent flow.** This change extends the
+shared `parse_claude_code_log` JSON parser; it does NOT add a dedicated
+codex/aider cost flow. Because `parse_log` routes CODEX and AIDER through
+`parse_claude_code_log` too (`cost_tracker.py`), those agents will
+*opportunistically* pick up a `total_cost_usd` / `cost_usd` IF their log ever
+happens to be JSON carrying one — but no per-agent parsing is added here.
+Codex's current plain-text output matches nothing, so it gains nothing today
+(its dedicated path is the separate follow-up ticket).
+
 Effect: claude_code's reported cost flows into `TaskCost.reported_cost_usd` and
 wins over the estimate in `effective_cost` / `build_summary` (both already
 prefer `reported_cost_usd` when present).
