@@ -181,6 +181,22 @@ async def test_run_with_explicit_run_id_overrides_atp() -> None:
 
 
 @pytest.mark.anyio
+async def test_reported_zero_cost_reaches_total() -> None:
+    """A responder that reports a genuine 0.0 cost (a free model) must
+    have that zero survive into the run's aggregate — `_sum_or_none`
+    treats a reported 0.0 as an observation, not an absence of one."""
+    run = MockRun("run-003", [MockTask(0, "free task")])
+    client = MockATPClient(run)
+    agent = MockResponder("opencode", tokens=0, cost=0.0)
+    runner = BenchmarkRunner(client, agent)
+
+    result = await runner.run(benchmark_id="swe-mini")
+
+    assert result.per_task[0].cost_usd == 0.0
+    assert result.total_cost_usd == 0.0  # _sum_or_none keeps the reported zero
+
+
+@pytest.mark.anyio
 async def test_runner_propagates_task_type_when_present() -> None:
     """If BenchmarkTask exposes task_type, runner threads it into
     BenchmarkTaskResult."""

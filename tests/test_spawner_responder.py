@@ -7,6 +7,7 @@ writes scripted log content and returns a fake Popen-shaped object.
 
 from __future__ import annotations
 
+import json
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -192,6 +193,47 @@ async def test_reported_cost_preferred_over_pricing(tmp_path) -> None:
     assert response.error is None
     assert response.cost_usd == pytest.approx(0.02)
     assert response.tokens_used == 120
+
+
+@pytest.mark.anyio
+async def test_reported_zero_cost_is_preserved(tmp_path) -> None:
+    """A genuinely-reported 0.0 (e.g. a free model) must survive to the
+    wire format — it is an observation, not an absence of one."""
+    log_content = json.dumps(
+        {
+            "type": "step_finish",
+            "part": {"cost": 0.0, "tokens": {"input": 10, "output": 5}},
+        }
+    )
+    spawner = FakeSpawner(agent_type_str="opencode", log_content=log_content)
+    responder = SpawnerResponder(
+        spawner=spawner,
+        workdir=tmp_path,
+        log_dir=tmp_path,
+        timeout_seconds=5.0,
+    )
+
+    response = await responder.respond("free run")
+
+    assert response.error is None
+    assert response.cost_usd == 0.0  # reported 0.0, NOT collapsed to None
+
+
+@pytest.mark.anyio
+async def test_estimated_zero_cost_stays_unknown(tmp_path) -> None:
+    """No parseable usage → no reported cost, zero tokens → estimate 0.0
+    → collapses to None (an estimate of zero is not an observation)."""
+    spawner = FakeSpawner(agent_type_str="claude_code", log_content="{}")
+    responder = SpawnerResponder(
+        spawner=spawner,
+        workdir=tmp_path,
+        log_dir=tmp_path,
+        timeout_seconds=5.0,
+    )
+
+    response = await responder.respond("no usage")
+
+    assert response.cost_usd is None
 
 
 @pytest.mark.anyio
