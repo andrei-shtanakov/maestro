@@ -211,6 +211,21 @@ ls .github/workflows/
 - [ ] Responder `cost or None` (spawner_responder.py) collapses a genuine
       reported $0.00 into None ("confirmed free" reads as "unknown") — becomes
       real when free/local open models run under opencode.
+- [ ] Codex cost-from-log (research): `codex exec` writes plain text (no
+      `--output-format json`); `parse_log` routes CODEX through the Claude JSON
+      parser, which extracts nothing. Investigate whether codex can emit
+      structured usage/cost (tokens + cost) and, if so, add a dedicated codex
+      parser + `parse_log` route. (Deferred from the claude cost-from-log spec.)
+
+- [ ] opencode parser: guard `part.cost >= 0.0` (parity with the claude cost
+      guard). `parse_opencode_log` accepts a negative `part.cost`; a negative
+      sum then fails `TaskCost.reported_cost_usd`'s `ge=0.0` validator and
+      silently drops the whole row (tokens included) — the same silent-drop
+      failure mode the NaN guard already prevents. The claude guard added
+      `cost >= 0.0`; opencode's did not (so "guards mirror opencode exactly" is
+      not literally true for the negative case). Low-probability (opencode is
+      unlikely to emit a negative cost) but a real latent drop. (From the claude
+      cost-from-log final review.)
 
 - [x] Orchestrator startup recovery: workstreams stranded in DECOMPOSING or
       RUNNING after a hard crash are not re-resolved on `--resume`

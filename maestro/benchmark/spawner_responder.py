@@ -105,24 +105,26 @@ class SpawnerResponder:
         log_content = log_file.read_text() if log_file.exists() else ""
         usage = parse_log(log_content, agent_enum)
         total_tokens = usage.input_tokens + usage.output_tokens
-        # Agent-reported cost wins over the PRICING estimate; the trailing
-        # `cost or None` guards below keep 0.0 out of the wire format.
-        cost = (
-            usage.cost_usd
-            if usage.cost_usd is not None
-            else calculate_cost(usage, agent_enum)
-        )
+        # A reported cost (opencode's part.cost, claude's total_cost_usd) wins
+        # over the PRICING estimate and is preserved verbatim — including a
+        # genuine 0.0 (a free model). Only an *estimated* zero (no tokens / no
+        # pricing) collapses to None ("unknown"), since it is not an observation.
+        if usage.cost_usd is not None:
+            cost_wire = usage.cost_usd
+        else:
+            estimate = calculate_cost(usage, agent_enum)
+            cost_wire = estimate or None
 
         if process.returncode != 0:
             return AgentResponse(
                 text="",
                 tokens_used=total_tokens or None,
-                cost_usd=cost or None,
+                cost_usd=cost_wire,
                 error=f"exit code {process.returncode}",
             )
 
         return AgentResponse(
             text=log_content,
             tokens_used=total_tokens or None,
-            cost_usd=cost or None,
+            cost_usd=cost_wire,
         )

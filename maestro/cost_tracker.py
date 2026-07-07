@@ -75,11 +75,13 @@ class TokenUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float | None = None
-    """Agent-reported cost in USD (e.g. opencode's per-step ``part.cost``).
+    """Agent-reported cost in USD (e.g. opencode's per-step ``part.cost``,
+    Claude Code's result ``total_cost_usd``).
 
     None means the agent did not report a cost — never collapse to 0.0.
-    Only the opencode parser fills this today; claude/codex/aider logs are
-    priced from PRICING downstream.
+    The opencode and claude parsers fill this; codex/aider are priced from
+    PRICING downstream unless their log happens to be JSON carrying a cost
+    (they share ``parse_claude_code_log``).
     """
 
 
@@ -108,7 +110,11 @@ def parse_claude_code_log(log_content: str) -> TokenUsage:
     # Try parsing the entire content as JSON first
     for parser in (_parse_json_object, _parse_last_json_line):
         usage = parser(log_content)
-        if usage.input_tokens > 0 or usage.output_tokens > 0:
+        if (
+            usage.input_tokens > 0
+            or usage.output_tokens > 0
+            or usage.cost_usd is not None
+        ):
             return usage
 
     return TokenUsage()
@@ -139,32 +145,45 @@ def _parse_last_json_line(content: str) -> TokenUsage:
 
 
 def _extract_usage_from_dict(data: object) -> TokenUsage:
-    """Extract token usage from a parsed JSON dictionary.
+    """Extract token usage and reported cost from a parsed JSON dict.
 
-    Handles multiple formats:
+    Handles multiple token formats:
     - Top-level: {"input_tokens": N, "output_tokens": N}
     - Nested usage: {"usage": {"input_tokens": N, "output_tokens": N}}
     - Result format: {"result": ..., "usage": {...}}
+    Cost (Claude's ``total_cost_usd``, or ``cost_usd``) is read from the
+    top level of the object and attached regardless of the token format.
     """
     if not isinstance(data, dict):
         return TokenUsage()
 
-    # Check for direct fields
+    usage = TokenUsage()
+
     if "input_tokens" in data and "output_tokens" in data:
-        return TokenUsage(
-            input_tokens=int(data["input_tokens"]),
-            output_tokens=int(data["output_tokens"]),
-        )
+        usage.input_tokens = int(data["input_tokens"])
+        usage.output_tokens = int(data["output_tokens"])
+    else:
+        nested = data.get("usage")
+        if isinstance(nested, dict):
+            usage.input_tokens = int(nested.get("input_tokens", 0))
+            usage.output_tokens = int(nested.get("output_tokens", 0))
 
-    # Check nested "usage" key
-    usage = data.get("usage")
-    if isinstance(usage, dict):
-        return TokenUsage(
-            input_tokens=int(usage.get("input_tokens", 0)),
-            output_tokens=int(usage.get("output_tokens", 0)),
-        )
+    # Claude's result JSON carries the cost at the top level.
+    cost = data.get("total_cost_usd")
+    if cost is None:
+        cost = data.get("cost_usd")
+    # bool is an int subclass (JSON true must not read as $1.00); NaN/Infinity
+    # and negatives must not leak (NaN fails TaskCost's ge=0.0 check and would
+    # silently drop the whole row).
+    if (
+        isinstance(cost, (int, float))
+        and not isinstance(cost, bool)
+        and math.isfinite(cost)
+        and cost >= 0.0
+    ):
+        usage.cost_usd = float(cost)
 
-    return TokenUsage()
+    return usage
 
 
 def parse_opencode_log(log_content: str) -> TokenUsage:
