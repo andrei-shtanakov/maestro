@@ -957,11 +957,16 @@ class TestBackgroundGeneration:
         fake_process.wait = AsyncMock(return_value=0)
 
         # Suspend on the RUNNING+pid update (fired right after registration),
-        # signalling `reached` so the test can proceed to shutdown.
+        # signalling `reached` so the test can proceed to shutdown. The
+        # READY->RUNNING transition also carries a `process_pid` now (the
+        # spawning sentinel, Task 3), but that write happens BEFORE the
+        # process is spawned/registered -- target the real pid specifically
+        # so the hang lands where the comment says: right after
+        # registration in `_running`.
         reached = asyncio.Event()
 
         async def hang_on_pid(*args, **kwargs):
-            if kwargs.get("process_pid") is not None:
+            if kwargs.get("process_pid") == fake_process.pid:
                 reached.set()
                 await asyncio.sleep(3600)  # hang here until cancelled
             return None
@@ -1093,6 +1098,8 @@ class TestGenerationPidLifecycle:
     async def test_success_records_and_clears_generation_pid(
         self, tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
     ) -> None:
+        from maestro import orchestrator as orch_mod
+
         orch, db = await self._orch_db(
             tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
         )
@@ -1114,9 +1121,10 @@ class TestGenerationPidLifecycle:
             ):
                 await orch._generate_and_launch("a")
 
-            # entry clear: the first DECOMPOSING transition wipes the
-            # stale pid up front.
-            assert pid_calls[0] is None
+            # entry write: the first DECOMPOSING transition overwrites the
+            # stale pid up front with the spawning sentinel (Task 3), not
+            # None -- it also marks a spawn-in-progress for recovery.
+            assert pid_calls[0] == orch_mod._SPAWNING_SENTINEL
             # on_pid write: the plan --full pid is recorded mid-flight.
             assert 7777 in pid_calls
             # finally clear: cleared again on exit.
@@ -1209,6 +1217,84 @@ class TestGenerationPidLifecycle:
             w = await db.get_workstream("c")
             assert w.generation_pid is None
             assert w.status == WorkstreamStatus.READY
+        finally:
+            await db.close()
+
+
+class TestSpawnWritesSentinel:
+    """`_spawn_workstream` writes `_SPAWNING_SENTINEL` on the DECOMPOSING
+    entry (generation_pid) and the READY->RUNNING transition (process_pid)
+    up front, before the real pid is known -- closing the window where a
+    crash between the DB write and the real pid landing would leave
+    recovery unable to distinguish "about to spawn" from "never spawned"
+    (see Tasks 1-2)."""
+
+    @pytest.mark.anyio
+    async def test_decomposing_entry_and_running_transition_write_sentinel(
+        self, tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+        from maestro.database import Database
+
+        db = Database(tmp_path / "o.db")
+        await db.connect()
+        calls: list[dict] = []
+        original = db.update_workstream_status
+
+        async def spy(zid, status, *args, **kwargs):
+            calls.append({"status": status, **kwargs})
+            return await original(zid, status, *args, **kwargs)
+
+        db.update_workstream_status = spy  # type: ignore[method-assign]
+
+        decomposer = MagicMock()
+
+        async def gen(workstream, workspace_path, *, on_pid=None):
+            if on_pid is not None:
+                await on_pid(7777)
+
+        decomposer.generate_spec = gen
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        orch = Orchestrator(
+            db=db,
+            workspace_mgr=mock_workspace_mgr,
+            decomposer=decomposer,
+            config=orch_config,
+            pr_manager=mock_pr_manager,
+            log_dir=log_dir,
+        )
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="a",
+                    title="a",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/a",
+                    status=WorkstreamStatus.READY,
+                )
+            )
+            # Stub the downstream steps that would otherwise touch the real
+            # filesystem/subprocess, as TestGenerationPidLifecycle does, so
+            # the flow reaches the RUNNING spawn.
+            orch._commit_spec_in_workspace = MagicMock()
+            fake_process = MagicMock(pid=12345)
+            with patch(
+                "maestro.orchestrator.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=fake_process),
+            ):
+                await orch._generate_and_launch("a")
+
+            dec = [c for c in calls if c["status"] == WorkstreamStatus.DECOMPOSING]
+            assert dec and dec[0].get("generation_pid") == orch_mod._SPAWNING_SENTINEL
+
+            run_writes = [c for c in calls if c["status"] == WorkstreamStatus.RUNNING]
+            assert any(
+                c.get("process_pid") == orch_mod._SPAWNING_SENTINEL for c in run_writes
+            )
+            # And the post-spawn write still overwrites it with the real pid.
+            assert any(c.get("process_pid") == 12345 for c in run_writes)
         finally:
             await db.close()
 

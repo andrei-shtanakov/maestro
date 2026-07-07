@@ -519,13 +519,14 @@ class Orchestrator:
         """Spawn a spec-runner process for a workstream."""
         workstream = await self._db.get_workstream(workstream_id)
 
-        # Transition to DECOMPOSING for spec generation (clear any stale
-        # generation pid up front — closes the re-decompose stale window).
+        # Transition to DECOMPOSING; write the spawning sentinel up front — it
+        # marks a spawn-in-progress AND overwrites any stale prior generation
+        # pid (re-decompose).
         await self._db.update_workstream_status(
             workstream_id,
             WorkstreamStatus.DECOMPOSING,
             expected_status=workstream.status,
-            generation_pid=None,
+            generation_pid=_SPAWNING_SENTINEL,
         )
 
         # Create workspace
@@ -588,6 +589,7 @@ class Orchestrator:
             workstream_id,
             WorkstreamStatus.RUNNING,
             expected_status=WorkstreamStatus.READY,
+            process_pid=_SPAWNING_SENTINEL,
         )
 
         # Spawn spec-runner
