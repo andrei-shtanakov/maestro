@@ -34,7 +34,12 @@ Two related gaps in cost reporting through the benchmark path:
 
 In `_extract_usage_from_dict`, after populating tokens, also read the top-level
 cost (`total_cost_usd`, falling back to `cost_usd`) into `usage.cost_usd`,
-mirroring the opencode parser's guards exactly:
+reusing the opencode parser's guards (type / not-bool / `isfinite`) and adding a
+`>= 0.0` floor. NOTE: `parse_opencode_log` does NOT currently apply that floor —
+so this is not literally "identical" to opencode; the floor here is the safer
+version, and bringing opencode to parity is a recorded follow-up (a negative
+`part.cost` there would fail `TaskCost.reported_cost_usd`'s `ge=0.0` and silently
+drop the row):
 
 ```python
     cost = data.get("total_cost_usd")

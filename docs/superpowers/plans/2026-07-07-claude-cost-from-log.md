@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - `uv` only; `uv run pytest` / `uv run pyrefly check` / `uv run ruff format .` + `uv run ruff check .`; line length 88; async tests `@pytest.mark.anyio`; run pytest in the FOREGROUND.
-- Cost-extraction guards (mirror the opencode parser exactly): accept only `isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0.0`; otherwise leave `cost_usd = None`. (`bool` is an int subclass; NaN/Infinity/negative must not leak.)
+- Cost-extraction guards (reuse the opencode parser's type/not-bool/isfinite checks, plus a `>= 0.0` floor opencode's parser does NOT currently apply): accept only `isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0.0`; otherwise leave `cost_usd = None`. (`bool` is an int subclass; NaN/Infinity/negative must not leak. The floor here is the safer version; opencode parity is a follow-up ticket.)
 - Read `total_cost_usd` first, fall back to `cost_usd`.
 - `parse_claude_code_log` must return a usage carrying a reported cost even when tokens are 0 (`... or usage.cost_usd is not None`). `parse_and_create_cost` is ALREADY cost-aware — do not change it.
 - Responder: a REPORTED cost (`usage.cost_usd is not None`) is preserved verbatim, including `0.0`. Only an ESTIMATED cost collapses `0.0 → None`. Leave `tokens_used = total_tokens or None` unchanged.
