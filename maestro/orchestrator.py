@@ -442,9 +442,15 @@ class Orchestrator:
         try:
             await self._spawn_workstream(workstream_id)
         except asyncio.CancelledError:
+            # Clear generation_pid atomically in the same READY write: on the
+            # cancel path the `finally` clear can itself be interrupted by a
+            # re-raised CancelledError before its awaits complete, so cleanup
+            # must not depend on it here.
             with contextlib.suppress(Exception):
                 await self._db.update_workstream_status(
-                    workstream_id, WorkstreamStatus.READY
+                    workstream_id,
+                    WorkstreamStatus.READY,
+                    generation_pid=None,
                 )
             raise
         except Exception as e:

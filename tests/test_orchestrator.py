@@ -1159,6 +1159,59 @@ class TestGenerationPidLifecycle:
         finally:
             await db.close()
 
+    @pytest.mark.anyio
+    async def test_cancel_clears_generation_pid_in_ready_write(
+        self, tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+    ) -> None:
+        """On cancel, the READY write must itself carry generation_pid=None —
+        so cleanup does not depend on the (interruptible) finally clear."""
+        import asyncio
+
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+        )
+        try:
+            await db.create_workstream(self._seed("c"))
+
+            # Record (new_status, generation_pid) for every status write.
+            # Use a sentinel so "explicitly passed None" (the clear) is
+            # distinguishable from "not passed at all" — otherwise a READY
+            # write that omits generation_pid would falsely look cleared.
+            _absent = object()
+            writes: list[tuple[WorkstreamStatus, object]] = []
+            original = db.update_workstream_status
+
+            async def spy(workstream_id, new_status, *args, **kwargs):
+                writes.append((new_status, kwargs.get("generation_pid", _absent)))
+                return await original(workstream_id, new_status, *args, **kwargs)
+
+            db.update_workstream_status = spy
+
+            async def gen_then_cancel(
+                workstream, workspace_path, timeout_minutes=30, *, on_pid=None
+            ) -> None:
+                if on_pid is not None:
+                    await on_pid(9999)  # stale pid recorded mid-DECOMPOSING
+                raise asyncio.CancelledError
+
+            orch._decomposer.generate_spec = gen_then_cancel
+
+            with pytest.raises(asyncio.CancelledError):
+                await orch._generate_and_launch("c")
+
+            # The cancel handler's READY write directly carried the clear —
+            # not merely the (interruptible) finally.
+            ready_writes = [
+                pid for status, pid in writes if status == WorkstreamStatus.READY
+            ]
+            assert ready_writes == [None]
+            # And the end state is clean.
+            w = await db.get_workstream("c")
+            assert w.generation_pid is None
+            assert w.status == WorkstreamStatus.READY
+        finally:
+            await db.close()
+
 
 # =============================================================================
 # Startup Recovery Tests
