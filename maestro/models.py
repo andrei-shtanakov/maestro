@@ -1058,6 +1058,10 @@ class Workstream(BaseModel):
     process_pid: int | None = Field(
         default=None, description="PID of spec-runner process"
     )
+    generation_pid: int | None = Field(
+        default=None,
+        description="PID of spec-runner plan --full (DECOMPOSING)",
+    )
     subtask_progress: str | None = Field(
         default=None, description="Progress string e.g. '3/7 done'"
     )
