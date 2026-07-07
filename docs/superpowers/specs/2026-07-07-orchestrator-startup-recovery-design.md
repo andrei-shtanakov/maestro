@@ -43,7 +43,7 @@ retry rule.
 | Stranded state | Recovery path | Rationale |
 |---|---|---|
 | `DECOMPOSING` | → `READY` | Direct valid transition. Never spawned `run --all`; the spec regenerates on the next tick. Matches C4's cancel handler. |
-| `RUNNING` | → `FAILED` → `READY` | The `run --all` process died with the orchestrator. `RUNNING → READY` is not a valid transition, so reset via `FAILED` (mirrors `recovery.py`). Re-spawns and re-runs. |
+| `RUNNING` | → `FAILED` → `READY` **iff the spec-runner process is gone**, else → `FAILED` → `NEEDS_REVIEW` | See "Orphan liveness check" below — `run --all` is NOT started in its own session and has no death signal (macOS has no `PR_SET_PDEATHSIG`), so after a hard crash the child can outlive the parent. Blindly re-running would put a second `run --all` over a live first (race + worktree corruption). |
 | `MERGING` | → `FAILED` → `READY` | `run --all` succeeded but finalization was interrupted. Re-running re-enters `_handle_success` cleanly. **No half-merged-git risk**: `_merge_into_base` is the LAST step of `_handle_success`, AFTER the `DONE` transition — a `MERGING` strand has not started the base merge. Recovering to `DONE` instead would SKIP the base merge (work stranded on the feature branch); re-run does it idempotently. |
 | `PR_CREATED` | → `FAILED` → `READY` | Same finalization window. Re-run's `_handle_success`: PR creation is idempotent-tolerant (an existing PR raises `PRManagerError`, already handled as "PR may exist" — no duplicate), and `_merge_into_base` is a no-op if already merged. Recovering to `DONE` would skip the base merge. |
 
@@ -61,6 +61,36 @@ correctly in BOTH `auto_pr` modes with no branching and no base-merge gap.
 The only cost: re-running an `auto_pr=True` `PR_CREATED` workstream re-runs
 `run --all` (fast — tasks already done) and loses the recorded `pr_url` on
 the re-created row (the PR itself is not duplicated). Acceptable.
+
+### Orphan liveness check (RUNNING)
+
+A hard crash (SIGKILL / power loss) never runs `_cleanup`, so the child
+`spec-runner run --all` — spawned without `start_new_session`/process-group
+isolation and with no OS death signal — can survive as an orphan. Resetting
+`RUNNING → READY` blindly would spawn a SECOND `run --all` over the same
+worktree while the first is still writing → a genuine race and worktree
+corruption, not a resume. So the RUNNING recovery branches on process
+liveness, using the recorded `Workstream.process_pid`:
+
+- `process_pid is None` → no process was spawned (a crash can leave RUNNING
+  set before the pid write — RUNNING is written at orchestrator.py:378, the
+  pid at :427) → safe: `RUNNING → FAILED → READY`.
+- `process_pid` set, `os.kill(pid, 0)` raises `ProcessLookupError` → the
+  process is gone → safe: `RUNNING → FAILED → READY`.
+- `process_pid` set and the process is ALIVE (`os.kill` returns, or raises
+  `PermissionError` — it exists) → ambiguous and dangerous: it may be our
+  live orphan, OR (after a reboot) a PID-reuse false positive. Do NOT blindly
+  re-run (double-run race) and do NOT blindly kill (could signal an unrelated
+  process). Send to `NEEDS_REVIEW` with a message naming the PID so a human
+  verifies and cleans up before resuming.
+
+`_is_pid_alive(pid: int) -> bool`: `os.kill(pid, 0)` → True; `ProcessLookupError`
+→ False; `PermissionError` → True (the process exists). A tiny, testable helper
+(monkeypatch `os.kill` in tests).
+
+This liveness check applies only to RUNNING. MERGING/PR_CREATED reach
+`_handle_success` only AFTER `run --all` has EXITED, so their recorded pid is
+already dead — no live-orphan case; they reset to READY unconditionally.
 
 ### Implementation shape
 
@@ -125,6 +155,14 @@ two-write resets crash-safe (a partial reset is finished by the next startup).
   is a pre-existing property of the READY re-spawn path (the C4 cancel
   handler has the same behavior), NOT introduced here. Worktree cleanup /
   reset on recovery is a separate ticket if it proves to matter in practice.
+- **DECOMPOSING orphan is not liveness-checked.** The `spec-runner plan
+  --full` generation subprocess (a C4 background task) can also outlive a hard
+  crash, but its PID is not recorded (`process_pid` holds only the `run --all`
+  pid). So a DECOMPOSING → READY re-run could race an orphaned `plan --full`
+  writing `spec/`. Lower impact than the RUNNING case: `spec/` is regenerated
+  and the post-condition check (tasks.md exists) plus spec-runner's own parse
+  catch gross corruption. Recording a generation pid for a full liveness check
+  is a possible follow-up; deferred.
 - **A crash DURING `_merge_into_base` lands the workstream in `DONE`, not a
   recoverable state.** `_merge_into_base` runs after the `DONE` transition, so
   if the base merge is interrupted the workstream already shows `DONE` while
@@ -142,9 +180,15 @@ two-write resets crash-safe (a partial reset is finished by the next startup).
 
 - Unit (real in-memory DB or the orchestrator test fixtures): seed one
   workstream in each stranded state, run `_recover_stranded_workstreams`,
-  assert the resulting status: DECOMPOSING→READY, RUNNING→READY,
-  MERGING→READY, PR_CREATED→READY, FAILED(retries left)→READY,
-  FAILED(exhausted)→NEEDS_REVIEW.
+  assert the resulting status: DECOMPOSING→READY, MERGING→READY,
+  PR_CREATED→READY, FAILED(retries left)→READY, FAILED(exhausted)→NEEDS_REVIEW.
+- RUNNING liveness (monkeypatch `os.kill` / `_is_pid_alive`):
+  - `process_pid=None` → RUNNING→READY.
+  - pid set, `os.kill` raises `ProcessLookupError` (dead) → RUNNING→READY.
+  - pid set, `os.kill` returns (alive) → RUNNING→NEEDS_REVIEW, message names
+    the pid.
+  - `_is_pid_alive`: returns True on no-raise, False on ProcessLookupError,
+    True on PermissionError.
 - No spurious error_message: a recovered-to-READY workstream has
   `error_message` None (the cause is logged, not persisted).
 - No retry consumed for in-flight strands: a RUNNING→READY (and MERGING,
