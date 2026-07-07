@@ -1399,3 +1399,130 @@ class TestStartupRecovery:
             assert (await db.get_workstream("r")).status == WorkstreamStatus.READY
         finally:
             await db.close()
+
+
+# =============================================================================
+# _merge_into_base Tests
+# =============================================================================
+
+
+class TestMergeIntoBase:
+    """Tests for verify-before-merge and abort-then-raise hardening."""
+
+    def _run(self, repo: Path, *args: str) -> str:
+        import subprocess
+
+        return subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    def _orch(
+        self,
+        repo: Path,
+        base: str,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+    ) -> Orchestrator:
+        cfg = OrchestratorConfig(
+            project="p",
+            repo_url="https://github.com/t/r",
+            repo_path=str(repo),
+            workspace_base="/tmp/ws",
+            base_branch=base,
+            workstreams=[],
+        )
+        return Orchestrator(
+            db=MagicMock(),
+            workspace_mgr=mock_workspace_mgr,
+            decomposer=mock_decomposer,
+            config=cfg,
+            pr_manager=mock_pr_manager,
+        )
+
+    def test_merge_success(
+        self,
+        git_repo: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+    ) -> None:
+        base = self._run(git_repo, "rev-parse", "--abbrev-ref", "HEAD")
+        # feature branch with a non-conflicting new file
+        self._run(git_repo, "checkout", "-b", "feature/x")
+        (git_repo / "new.txt").write_text("hi\n")
+        self._run(git_repo, "add", ".")
+        self._run(git_repo, "commit", "-m", "feat")
+        self._run(git_repo, "checkout", base)
+        orch = self._orch(
+            git_repo, base, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        orch._merge_into_base("feature/x")  # no raise
+        assert (git_repo / "new.txt").exists()  # landed on base
+
+    def test_merge_conflict_raises_and_aborts(
+        self,
+        git_repo: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+    ) -> None:
+        from maestro.git import MergeConflictError
+
+        base = self._run(git_repo, "rev-parse", "--abbrev-ref", "HEAD")
+        # feature edits README
+        self._run(git_repo, "checkout", "-b", "feature/c")
+        (git_repo / "README.md").write_text("feature side\n")
+        self._run(git_repo, "add", ".")
+        self._run(git_repo, "commit", "-m", "feat edit")
+        # base edits README differently -> conflict
+        self._run(git_repo, "checkout", base)
+        (git_repo / "README.md").write_text("base side\n")
+        self._run(git_repo, "add", ".")
+        self._run(git_repo, "commit", "-m", "base edit")
+        orch = self._orch(
+            git_repo, base, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        with pytest.raises(MergeConflictError):
+            orch._merge_into_base("feature/c")
+        # abort ran -> repo not mid-merge (no MERGE_HEAD)
+        assert not (git_repo / ".git" / "MERGE_HEAD").exists()
+
+    def test_wrong_branch_raises_without_merging(
+        self,
+        git_repo: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+    ) -> None:
+        from maestro.git import GitError
+
+        base = self._run(git_repo, "rev-parse", "--abbrev-ref", "HEAD")
+        self._run(git_repo, "checkout", "-b", "feature/w")
+        (git_repo / "w.txt").write_text("w\n")
+        self._run(git_repo, "add", ".")
+        self._run(git_repo, "commit", "-m", "w")
+        # stay on feature/w (NOT base); base_branch=base in config
+        orch = self._orch(
+            git_repo, base, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        with pytest.raises(GitError):
+            orch._merge_into_base("feature/w")
+
+    def test_detached_head_raises(
+        self,
+        git_repo: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+    ) -> None:
+        from maestro.git import GitError
+
+        base = self._run(git_repo, "rev-parse", "--abbrev-ref", "HEAD")
+        sha = self._run(git_repo, "rev-parse", "HEAD")
+        self._run(git_repo, "checkout", sha)  # detached HEAD
+        orch = self._orch(
+            git_repo, base, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        with pytest.raises(GitError):
+            orch._merge_into_base("feature/whatever")

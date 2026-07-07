@@ -19,6 +19,7 @@ from pathlib import Path
 from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
+from maestro.git import GitError, MergeConflictError
 from maestro.merge_logs import merge_logs_dir
 from maestro.models import (
     OrchestratorConfig,
@@ -599,36 +600,80 @@ class Orchestrator:
     def _merge_into_base(self, feature_branch: str) -> None:
         """Merge feature branch into base branch in the main repo.
 
-        Prevents accumulation of unmerged branches that diverge
-        and cause conflicts. Each workstream is merged immediately
-        after completion so the next workstream sees all prior work.
+        Prevents accumulation of unmerged branches that diverge and cause
+        conflicts. Each workstream is merged immediately after completion so
+        the next workstream sees all prior work.
+
+        Verifies the main repo is on ``base_branch`` before merging (the
+        Mode-2 worktree topology keeps it there); a wrong or detached branch
+        raises rather than silently merging into the wrong place. On a merge
+        failure the partial merge is aborted and the error raised so the
+        caller can route the workstream to review instead of DONE.
+
+        Raises:
+            GitError: If the repo is not on ``base_branch``, or the merge
+                fails for a non-conflict reason.
+            MergeConflictError: If the merge has conflicts.
         """
         repo = Path(self._config.repo_path).expanduser()
         base = self._config.base_branch
+        merge_env = {**os.environ, **child_env()}
 
         with span("task.execute", task_id=feature_branch):
+            head = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=repo,
+                env=merge_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            current_branch = head.stdout.strip()
+            if head.returncode != 0 or current_branch != base:
+                msg = (
+                    f"Refusing to merge '{feature_branch}': main repo is on "
+                    f"'{current_branch or '(unknown)'}', not base '{base}'. "
+                    "The main repo must be checked out on the base branch."
+                )
+                raise GitError(msg)
+
             result = subprocess.run(
                 ["git", "merge", feature_branch, "--no-edit"],
                 cwd=repo,
-                env={**os.environ, **child_env()},
+                env=merge_env,
                 capture_output=True,
                 text=True,
                 check=False,
             )
 
         if result.returncode == 0:
-            self._logger.info(
-                "Merged '%s' into '%s'",
-                feature_branch,
-                base,
-            )
-        else:
-            self._logger.warning(
-                "Failed to merge '%s' into '%s': %s",
-                feature_branch,
-                base,
-                result.stderr.strip(),
-            )
+            self._logger.info("Merged '%s' into '%s'", feature_branch, base)
+            return
+
+        # Abort the partial/conflicted merge so the base repo is left clean,
+        # then raise so the caller routes the workstream to review, not DONE.
+        subprocess.run(
+            ["git", "merge", "--abort"],
+            cwd=repo,
+            env=merge_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        # git writes "CONFLICT (...)" to stdout, not stderr; combine both so
+        # the conflict marker is detected regardless of which stream git
+        # chooses, and so the log and the raised error carry the same detail.
+        detail = "\n".join(part for part in (stderr, stdout) if part)
+        self._logger.warning(
+            "Failed to merge '%s' into '%s': %s", feature_branch, base, detail
+        )
+        if "conflict" in detail.lower():
+            msg = f"Merge conflicts merging '{feature_branch}' into '{base}':\n{detail}"
+            raise MergeConflictError(msg)
+        msg = f"Failed to merge '{feature_branch}' into '{base}':\n{detail}"
+        raise GitError(msg)
 
     async def _monitor_running(self) -> None:
         """Monitor running spec-runner processes."""
