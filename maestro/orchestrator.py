@@ -36,12 +36,24 @@ class OrchestratorError(Exception):
     """Base exception for orchestrator errors."""
 
 
+_SPAWNING_SENTINEL = -1
+"""Placeholder pid written into ``process_pid`` / ``generation_pid`` BEFORE a
+subprocess spawn and overwritten with the real pid after. A recovery that finds
+it treats the workstream as a possible live orphan (a spawn was in progress at
+the crash). Never passed to ``os.kill`` — see ``_maybe_live_orphan`` and the
+``pid <= 0`` guard in ``_is_pid_alive``."""
+
+
 def _is_pid_alive(pid: int) -> bool:
     """True if a process with this pid exists (signal 0 probes without killing).
 
     ProcessLookupError means it is gone; PermissionError means it exists but
     we may not signal it (still alive).
     """
+    if pid <= 0:
+        # Never signal a non-positive pid: os.kill(0/-1, …) would hit the
+        # caller's process group / every process. A real pid is always > 0.
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -49,6 +61,17 @@ def _is_pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _maybe_live_orphan(pid: int | None) -> bool:
+    """True if the recorded pid indicates a possibly-live orphan: the spawning
+    sentinel (a spawn was in progress at the crash) or a still-alive real pid.
+
+    Checks the sentinel FIRST so it is never passed to os.kill.
+    """
+    if pid == _SPAWNING_SENTINEL:
+        return True
+    return pid is not None and _is_pid_alive(pid)
 
 
 _STRANDED_INFLIGHT = (

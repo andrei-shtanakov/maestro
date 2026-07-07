@@ -1249,6 +1249,40 @@ class TestStartupRecovery:
         monkeypatch.setattr(orch_mod.os, "kill", denied)
         assert orch_mod._is_pid_alive(4242) is True
 
+    def test_is_pid_alive_rejects_nonpositive_without_signalling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+
+        def boom(pid, sig):
+            raise AssertionError(f"os.kill must not be called (pid={pid})")
+
+        monkeypatch.setattr(orch_mod.os, "kill", boom)
+        assert orch_mod._is_pid_alive(-1) is False
+        assert orch_mod._is_pid_alive(0) is False
+
+    def test_maybe_live_orphan_sentinel_is_true_without_signalling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+
+        def boom(pid, sig):
+            raise AssertionError("os.kill must not be called for the sentinel")
+
+        monkeypatch.setattr(orch_mod.os, "kill", boom)
+        assert orch_mod._maybe_live_orphan(orch_mod._SPAWNING_SENTINEL) is True
+
+    def test_maybe_live_orphan_none_and_real_pids(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from maestro import orchestrator as orch_mod
+
+        assert orch_mod._maybe_live_orphan(None) is False
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: True)
+        assert orch_mod._maybe_live_orphan(4242) is True
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+        assert orch_mod._maybe_live_orphan(4242) is False
+
     async def _orch_with_db(
         self,
         tmp_path,
