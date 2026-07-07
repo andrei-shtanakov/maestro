@@ -151,6 +151,10 @@ reordering recoverable:
     `GitError` and performs NO merge (assert the base branch is unchanged / the
     feature commit did not land anywhere) — proves the invariant is enforced, not
     assumed.
+  - **Detached HEAD:** the main repo in detached-HEAD state (`git checkout
+    <commit-sha>`) → `git rev-parse --abbrev-ref HEAD` returns `"HEAD"` ≠
+    `base_branch` → raises `GitError`, no merge. (Explicit case — the invariant is
+    easy to lose in implementation; this pins the detached path.)
 - **`_handle_success` (orchestrator fixtures; real in-memory DB for status
   assertions, monkeypatch `self._merge_into_base`):**
   - Merge succeeds → status `DONE`, `stats.completed == 1`, `cleanup_workspace`
