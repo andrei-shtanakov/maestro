@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 
 from maestro.models import OrchestratorConfig
-from maestro.scaffold import generate_project_yaml
+from maestro.scaffold import _portable_repo_path, generate_project_yaml
 
 
 def make_git_repo(tmp_path: Path, *, remote: str | None) -> Path:
@@ -75,3 +75,55 @@ class TestGenerateProjectYaml:
         config = load_generated(content)
         # no origin/HEAD in a fresh repo -> falls back to current branch
         assert config.base_branch == "main"
+
+
+class TestPortableRepoPath:
+    def test_under_home_is_tilde_relative(self, tmp_path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        repo = home / "labs" / "myrepo"
+        repo.mkdir(parents=True)
+        assert _portable_repo_path(repo) == "~/labs/myrepo"
+
+    def test_home_itself_is_bare_tilde(self, tmp_path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        assert _portable_repo_path(home) == "~"
+
+    def test_outside_home_stays_absolute(self, tmp_path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        other = tmp_path / "srv" / "repo"
+        other.mkdir(parents=True)
+        assert _portable_repo_path(other) == str(other.resolve())
+
+    def test_symlink_under_home_resolves_to_tilde(self, tmp_path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        (home / "real").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        link = tmp_path / "link"
+        link.symlink_to(home / "real")  # points under home
+        assert _portable_repo_path(link) == "~/real"
+
+
+class TestGenerateProjectYamlPortablePath:
+    def test_repo_path_home_relative_under_home(self, tmp_path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        repo = home / "labs" / "myrepo"
+        repo.mkdir(parents=True)
+        config = OrchestratorConfig(**yaml.safe_load(generate_project_yaml(repo)))
+        assert config.repo_path == "~/labs/myrepo"
+
+    def test_repo_path_outside_home_stays_absolute(self, tmp_path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        other = tmp_path / "srv" / "repo"
+        other.mkdir(parents=True)
+        config = OrchestratorConfig(**yaml.safe_load(generate_project_yaml(other)))
+        assert config.repo_path == str(other.resolve())

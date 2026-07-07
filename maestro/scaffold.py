@@ -104,6 +104,24 @@ def _git_query(args: list[str], cwd: Path) -> str | None:
     return result.stdout.strip() or None
 
 
+def _portable_repo_path(cwd: Path) -> str:
+    """Render repo_path portably: home-relative ``~/…`` when cwd is under
+    ``$HOME`` (no baked-in username, portable across machines/CI), else the
+    resolved absolute path. The loader ``expanduser()``s ``repo_path``, so a
+    ``~`` path resolves correctly at run time.
+
+    Both cwd and home are resolved so symlinks (e.g. macOS ``/tmp`` ->
+    ``/private/tmp``) compare consistently.
+    """
+    resolved = cwd.resolve()
+    home = Path.home().resolve()
+    if resolved == home:
+        return "~"
+    if resolved.is_relative_to(home):
+        return f"~/{resolved.relative_to(home).as_posix()}"
+    return str(resolved)
+
+
 def _detect_base_branch(cwd: Path) -> str:
     """origin default branch -> current branch -> 'main'."""
     ref = _git_query(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd)
@@ -135,7 +153,7 @@ def generate_project_yaml(cwd: Path, project: str | None = None) -> str:
         repo_url_comment=(
             "" if repo_url else "  # TODO: no origin remote found — fill in"
         ),
-        repo_path=str(cwd.resolve()),
+        repo_path=_portable_repo_path(cwd),
         workspace_base=f"/tmp/maestro-ws/{name}",
         base_branch=_detect_base_branch(cwd),
     )

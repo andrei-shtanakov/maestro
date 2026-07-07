@@ -229,7 +229,7 @@ ls .github/workflows/
       unlikely to emit a negative cost) but a real latent drop. (From the claude
       cost-from-log final review.)
 
-- [ ] scaffolder emits portable repo_path: `maestro init` / `scaffold.py` sets
+- [x] scaffolder emits portable repo_path (commit `2e20051`): `maestro init` / `scaffold.py` sets
       `repo_path=str(cwd.resolve())` — an absolute path baking in the username,
       so every generated config is born non-portable (see PR #53, which fixed
       the proctor configs by hand). The loader already `expanduser()`s, so the
