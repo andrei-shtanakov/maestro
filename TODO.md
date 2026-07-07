@@ -232,4 +232,7 @@ ls .github/workflows/
       races the orphan. Close both windows symmetrically (e.g. a "spawning"
       sentinel pid recovery treats as "assume live → NEEDS_REVIEW"), including
       the already-merged RUNNING path. (From the gen-pid liveness spec's
-      residual-risk section.)
+      residual-risk section.) Fold in the parked-row cleanup: the recovery
+      live-orphan branch leaves the stale pid (process_pid / generation_pid) on
+      the NEEDS_REVIEW row — clear it for BOTH states together (harmless to
+      recovery, but cleaner for REST/dashboard).
