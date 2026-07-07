@@ -227,13 +227,16 @@ def parse_opencode_log(log_content: str) -> TokenUsage:
         saw_step_finish = True
         cost = part.get("cost")
         # bool is an int subclass: JSON true must not leak in as $1.00.
-        # Infinity/NaN must not leak in either: Infinity poisons summaries,
-        # NaN fails the TaskCost.reported_cost_usd ge=0.0 check downstream
-        # and silently drops the whole row (including tokens).
+        # Infinity/NaN/negative must not leak in either: Infinity poisons
+        # summaries, and NaN or a negative sum fails the
+        # TaskCost.reported_cost_usd ge=0.0 check downstream and silently
+        # drops the whole row (including tokens). Matches the claude parser's
+        # guard.
         if (
             isinstance(cost, (int, float))
             and not isinstance(cost, bool)
             and math.isfinite(cost)
+            and cost >= 0.0
         ):
             saw_cost = True
             cost_total += float(cost)

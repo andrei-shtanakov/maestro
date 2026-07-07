@@ -337,6 +337,28 @@ class TestOpencodeLogParsing:
         )
         assert parse_opencode_log(log).cost_usd is None
 
+    def test_negative_cost_ignored_tokens_kept(self) -> None:
+        """A negative part.cost is rejected (a negative sum would fail
+        TaskCost's ge=0.0 and silently drop the whole row); tokens are kept."""
+        log = (
+            '{"type": "step_finish", "part": {"cost": -0.5, "tokens": '
+            '{"input": 10, "output": 5}}}\n'
+        )
+        usage = parse_opencode_log(log)
+        assert usage.cost_usd is None
+        assert usage.input_tokens == 10
+        assert usage.output_tokens == 5
+
+    def test_negative_cost_skipped_positive_summed(self) -> None:
+        """Negative per-step cost is skipped; only non-negative steps sum."""
+        log = (
+            '{"type": "step_finish", "part": {"cost": -1.0, "tokens": '
+            '{"input": 1, "output": 1}}}\n'
+            '{"type": "step_finish", "part": {"cost": 0.02, "tokens": '
+            '{"input": 2, "output": 2}}}\n'
+        )
+        assert parse_opencode_log(log).cost_usd == pytest.approx(0.02)
+
     def test_partial_cost_sums_available_steps(self) -> None:
         """One step with cost, one without → total is the one reported value."""
         log = (

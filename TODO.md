@@ -217,8 +217,8 @@ ls .github/workflows/
       structured usage/cost (tokens + cost) and, if so, add a dedicated codex
       parser + `parse_log` route. (Deferred from the claude cost-from-log spec.)
 
-- [ ] opencode parser: guard `part.cost >= 0.0` (parity with the claude cost
-      guard). `parse_opencode_log` accepts a negative `part.cost`; a negative
+- [x] opencode parser: guard `part.cost >= 0.0` (parity with the claude cost
+      guard) (commit `a7b361f`). `parse_opencode_log` accepts a negative `part.cost`; a negative
       sum then fails `TaskCost.reported_cost_usd`'s `ge=0.0` validator and
       silently drops the whole row (tokens included) — the same silent-drop
       failure mode the NaN guard already prevents. The claude guard added
