@@ -71,6 +71,12 @@ def _maybe_live_orphan(pid: int | None) -> bool:
 
 - In-flight loop: `live_orphan = _maybe_live_orphan(orphan_pid)` (replaces the
   inline `orphan_pid is not None and _is_pid_alive(orphan_pid)`).
+- **The warning log must distinguish the two cases** so the operator does not
+  read a sentinel parking as a confirmed orphan: for a real live pid, keep
+  "stranded in %s with a live process (pid %s) — verify and clean it up"; for
+  the sentinel (`orphan_pid == _SPAWNING_SENTINEL`), log instead that a spawn was
+  in progress at the crash and the state is UNCERTAIN — a subprocess may or may
+  not be running; verify before resuming. (Do NOT print `pid -1`.)
 - FAILED-reconciliation: the liveness check (currently
   `w.process_pid is not None and _is_pid_alive(w.process_pid)`) becomes
   `_maybe_live_orphan(w.process_pid)` — it reads `process_pid` too, so a
@@ -142,10 +148,26 @@ fresh sentinel anyway).
 - Regression: existing recovery tests (dead/None → READY, live real pid →
   NEEDS_REVIEW, FAILED reconciliation by retry rule) stay green.
 
+## NEEDS_REVIEW semantics (operator-facing)
+
+After this change, a recovery-produced `NEEDS_REVIEW` carries TWO possible
+meanings, and docs/logs must not imply only the first:
+
+1. **Confirmed live orphan** — a recorded real pid is still alive; a subprocess
+   from the previous run is definitely still running. Kill it before resuming.
+2. **Spawn-in-progress, state uncertain** (the sentinel) — the crash landed in
+   the spawn→persist window; a subprocess MAY or may not have been started, and
+   its pid was never recorded. Verify whether anything is running before
+   resuming; if not, the workstream can simply be reset to READY.
+
+Both are parked to `NEEDS_REVIEW` because both are unsafe to auto-`READY`-and-
+re-run. The warning log distinguishes them (see §3).
+
 ## Documentation
 
 - CLAUDE.md orchestrator note: the spawn→persist window is now closed via a
-  spawning sentinel (RUNNING + DECOMPOSING).
+  spawning sentinel (RUNNING + DECOMPOSING); note that recovery `NEEDS_REVIEW`
+  can mean "live orphan" OR "spawn-in-progress, uncertain".
 - TODO.md: tick the "uniform spawn→persist window closure" follow-up (and its
   folded-in parked-row cleanup).
 - Update the residual-risk sections of the #48/#50 specs? No — those are
