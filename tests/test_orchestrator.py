@@ -1580,6 +1580,8 @@ class TestHandleSuccessMergeGating:
             await orch._handle_success("a", MagicMock())
             assert (await db.get_workstream("a")).status == WorkstreamStatus.DONE
             assert orch._stats.completed == 1
+            # Merge is actually invoked on the happy path (not skipped).
+            orch._merge_into_base.assert_called_once_with("feature/a")
             mock_workspace_mgr.cleanup_workspace.assert_called_once_with("a")
         finally:
             await db.close()
@@ -1630,6 +1632,37 @@ class TestHandleSuccessMergeGating:
             orch._merge_into_base = MagicMock()
             await orch._handle_success("c", MagicMock())
             assert (await db.get_workstream("c")).status == WorkstreamStatus.DONE
+            # Merge is actually invoked even when no PR is created.
+            orch._merge_into_base.assert_called_once_with("feature/c")
             mock_pr_manager.push_and_create_pr.assert_not_called()
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_merge_runs_before_done(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+    ) -> None:
+        orch, db = await self._orch_db(
+            tmp_path, True, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(self._seed("a"))
+            captured = {}
+
+            def record(_branch):
+                # merge runs before the completion accounting / DONE write
+                captured["completed_at_merge"] = orch._stats.completed
+
+            orch._merge_into_base = MagicMock(side_effect=record)
+            await orch._handle_success("a", MagicMock())
+            # merge ran before completed++
+            assert captured["completed_at_merge"] == 0
+            # ...which happens after
+            assert orch._stats.completed == 1
+            assert (await db.get_workstream("a")).status == WorkstreamStatus.DONE
         finally:
             await db.close()
