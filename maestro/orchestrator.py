@@ -204,6 +204,9 @@ class Orchestrator:
                             WorkstreamStatus.NEEDS_REVIEW,
                             expected_status=WorkstreamStatus.FAILED,
                         )
+                        # Parked for review — signal via exit code + summary,
+                        # matching _handle_failure's NEEDS_REVIEW accounting.
+                        self._stats.failed += 1
                     elif state is WorkstreamStatus.DECOMPOSING:
                         self._logger.info(
                             "Recovering workstream '%s' from stranded "
@@ -251,6 +254,10 @@ class Orchestrator:
                 await self._db.update_workstream_status(
                     w.id, target, expected_status=WorkstreamStatus.FAILED
                 )
+                if target is WorkstreamStatus.NEEDS_REVIEW:
+                    # Parked for review (retries exhausted) — signal via exit
+                    # code + summary, matching _handle_failure's accounting.
+                    self._stats.failed += 1
                 recovered += 1
             except Exception as e:
                 self._logger.error(

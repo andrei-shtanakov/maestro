@@ -216,3 +216,10 @@ ls .github/workflows/
       RUNNING after a hard crash are not re-resolved on `--resume`
       (`_resolve_ready` only picks PENDING/READY). Pre-existing; surfaced during
       C4 final review (Minor #4). Add crash-recovery re-resolution. (closed by feat/orchestrator-startup-recovery)
+- [ ] Orchestrator recovery follow-ups (from startup-recovery final review):
+      (a) DECOMPOSING orphan liveness — record the `plan --full` generation pid
+      so a stranded DECOMPOSING can be liveness-checked like RUNNING (today it
+      re-decomposes blindly, could race an orphaned generation writing spec/).
+      (b) Move `_merge_into_base` BEFORE the DONE transition (or add a
+      merged-into-base check) so a crash during the base merge doesn't leave a
+      workstream showing DONE with an unmerged feature branch.

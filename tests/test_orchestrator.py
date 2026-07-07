@@ -1130,6 +1130,8 @@ class TestStartupRecovery:
                 assert w.status == WorkstreamStatus.READY
                 assert w.error_message is None  # no spurious error text
                 assert w.retry_count == 0  # no retry consumed
+            # All -> READY (resumable): none counted as failed.
+            assert orch._stats.failed == 0
         finally:
             await db.close()
 
@@ -1161,6 +1163,8 @@ class TestStartupRecovery:
             assert count == 1
             w = await db.get_workstream("r")
             assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            # Parked for review -> counted as failed (exit code + summary).
+            assert orch._stats.failed == 1
         finally:
             await db.close()
 
@@ -1222,6 +1226,9 @@ class TestStartupRecovery:
             assert (
                 await db.get_workstream("done")
             ).status == WorkstreamStatus.NEEDS_REVIEW
+            # Only the exhausted -> NEEDS_REVIEW counts; the retryable -> READY
+            # does not.
+            assert orch._stats.failed == 1
         finally:
             await db.close()
 
