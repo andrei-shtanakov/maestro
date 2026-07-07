@@ -38,6 +38,7 @@ from maestro.models import (
     AgentType,
     ArbiterMode,
     RouteAction,
+    RouteDecision,
     Task,
     TaskConfig,
     TaskOutcome,
@@ -724,6 +725,22 @@ class Scheduler:
                 if launched:
                     started += 1
 
+    async def _route_task(self, task: Task) -> RouteDecision:
+        """Consult the routing strategy inside a `task.route` span.
+
+        The span records the decision (action / chosen_agent / decision_id) on
+        its `.ended` record; a routing exception surfaces as `task.route.failed`
+        (obs.span re-raises, preserving the caller's error flow).
+        """
+        with obs.span("task.route", task_id=task.id) as route_span:
+            decision = await self._routing.route(task)
+            route_span.set_attrs(
+                action=decision.action.value,
+                chosen_agent=decision.chosen_agent,
+                decision_id=decision.decision_id,
+            )
+            return decision
+
     async def _spawn_task(self, task_id: str) -> bool:
         """Attempt to spawn a single task.
 
@@ -762,7 +779,8 @@ class Scheduler:
             return False
 
         # R-03: consult the routing strategy before picking a spawner.
-        decision = await self._routing.route(task)
+        # M3: wrapped in a task.route span (latency + decision outcome).
+        decision = await self._route_task(task)
 
         if decision.action is RouteAction.HOLD:
             if self._hold_throttle.should_log(task_id, decision.reason):
