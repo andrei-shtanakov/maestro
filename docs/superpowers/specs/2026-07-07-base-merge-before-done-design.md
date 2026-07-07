@@ -90,8 +90,9 @@ git subprocess). Change only the failure handling:
 - On `returncode == 0`: log success, return (unchanged).
 - On `returncode != 0`: run `git merge --abort` (`check=False`, best-effort — it
   cleans a conflicted / partial-merge state so the base repo is left clean) and
-  then raise — `MergeConflictError` if the stderr indicates a conflict
-  (`"conflict" in stderr.lower()`), else `GitError`. Reuse these error types from
+  then raise — `MergeConflictError` if the merge output indicates a conflict
+  (`"conflict"` in the combined stdout+stderr — git writes the `CONFLICT (…)`
+  marker to stdout, not stderr), else `GitError`. Reuse these error types from
   `maestro.git` so the exception taxonomy is shared (`MergeConflictError` and
   `BranchNotFoundError` are both subclasses of `GitError`, so `_handle_success`
   catches `GitError`).
