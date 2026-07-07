@@ -1,8 +1,8 @@
 project: proctor-a-scheduler
 description: "Add SchedulerTrigger to proctor-a"
 repo_url: https://github.com/andrei-shtanakov/proctor
-repo_path: /Users/Andrei_Shtanakov/labs/all_ai_orchestrators/proctor
-workspace_base: /tmp/maestro-ws/proctor
+repo_path: ~/labs/all_ai_orchestrators/proctor
+workspace_base: /tmp/maestro-ws/proctor-scheduler
 max_concurrent: 1
 base_branch: master
 branch_prefix: "feature/"

@@ -227,6 +227,14 @@ ls .github/workflows/
       unlikely to emit a negative cost) but a real latent drop. (From the claude
       cost-from-log final review.)
 
+- [ ] scaffolder emits portable repo_path: `maestro init` / `scaffold.py` sets
+      `repo_path=str(cwd.resolve())` — an absolute path baking in the username,
+      so every generated config is born non-portable (see PR #53, which fixed
+      the proctor configs by hand). The loader already `expanduser()`s, so the
+      scaffolder should emit a home-relative `~/...` path when cwd is under
+      `$HOME` (else keep absolute). Small; needs a design call on the exact
+      rule + a scaffold test. (From PR #52/#53 Copilot review.)
+
 - [x] Orchestrator startup recovery: workstreams stranded in DECOMPOSING or
       RUNNING after a hard crash are not re-resolved on `--resume`
       (`_resolve_ready` only picks PENDING/READY). Pre-existing; surfaced during
