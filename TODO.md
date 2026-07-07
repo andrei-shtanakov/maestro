@@ -220,7 +220,16 @@ ls .github/workflows/
       (a) DECOMPOSING orphan liveness — record the `plan --full` generation pid
       so a stranded DECOMPOSING can be liveness-checked like RUNNING (today it
       re-decomposes blindly, could race an orphaned generation writing spec/).
+      (closed by feat/decomposing-generation-pid-liveness)
       (b) Move `_merge_into_base` BEFORE the DONE transition (or add a
       merged-into-base check) so a crash during the base merge doesn't leave a
       workstream showing DONE with an unmerged feature branch.
       (closed by feat/base-merge-before-done)
+
+- [ ] Uniform spawn→persist window closure (RUNNING + DECOMPOSING): a hard crash
+      between spawning the subprocess and persisting its pid leaves status set
+      with pid=NULL and a live orphan → recovery reads None → READY → re-run
+      races the orphan. Close both windows symmetrically (e.g. a "spawning"
+      sentinel pid recovery treats as "assume live → NEEDS_REVIEW"), including
+      the already-merged RUNNING path. (From the gen-pid liveness spec's
+      residual-risk section.)
