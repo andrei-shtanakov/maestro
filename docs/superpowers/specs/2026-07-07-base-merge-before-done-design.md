@@ -85,6 +85,8 @@ Keep the existing signature, the `span("task.execute", …)` and `child_env()` o
 wrapping, and the raw-subprocess mechanics (preserves trace propagation into the
 git subprocess). Change only the failure handling:
 
+- Before merging, verify the main repo is on `base_branch` (see "Verify the
+  base-branch invariant" below); raise `GitError` if not.
 - On `returncode == 0`: log success, return (unchanged).
 - On `returncode != 0`: run `git merge --abort` (`check=False`, best-effort — it
   cleans a conflicted / partial-merge state so the base repo is left clean) and
@@ -94,11 +96,22 @@ git subprocess). Change only the failure handling:
   `BranchNotFoundError` are both subclasses of `GitError`, so `_handle_success`
   catches `GitError`).
 
-**Not adding `checkout base`.** In the Mode-2 worktree topology the main repo
-(`repo_path`) stays on `base_branch` throughout — workstreams run in separate
-worktrees on feature branches — so `git merge feature` in `repo_path` already
-merges into base. Adding a `checkout` would introduce a new failure surface (dirty
-main-repo tree) for no benefit here. Assumption documented; not reusing
+**Verify the base-branch invariant before merging (do not `checkout`).** In the
+Mode-2 worktree topology the main repo (`repo_path`) stays on `base_branch`
+throughout — workstreams run in separate worktrees on feature branches — so
+`git merge feature` in `repo_path` merges into base. But this invariant is
+currently unchecked: if the main repo is on the wrong branch (or detached), the
+raw merge would silently land the feature branch into the wrong place — and on the
+crash-recovery re-run path that looks like a *successful* recovery while the work
+goes to the wrong branch. So before merging, `_merge_into_base` READS the current
+branch (`git rev-parse --abbrev-ref HEAD`) and, if it is not `base_branch` (this
+also catches a detached HEAD, which returns `"HEAD"`), raises `GitError` without
+attempting the merge → routed to `NEEDS_REVIEW`. This converts a silent
+wrong-branch merge into a loud, safe failure.
+
+A read-only *verify* is chosen over an active `checkout base`: verify adds no new
+failure surface (it never touches the working tree) and refuses loudly rather than
+silently "correcting" a state the operator may have set deliberately. Not reusing
 `GitManager.merge_branch` (which checks out target and would need a
 verify-repo-at-init `GitManager` instance injected onto the hot completion path) —
 hardening in place keeps the obs wrapping and the change surgical.
@@ -134,6 +147,10 @@ reordering recoverable:
     `git status` not mid-merge) — proves the abort ran.
   - A non-conflict git failure (e.g. nonexistent branch) → raises `GitError` (not
     `MergeConflictError`).
+  - **Base-branch guard:** the main repo checked out on a NON-base branch → raises
+    `GitError` and performs NO merge (assert the base branch is unchanged / the
+    feature commit did not land anywhere) — proves the invariant is enforced, not
+    assumed.
 - **`_handle_success` (orchestrator fixtures; real in-memory DB for status
   assertions, monkeypatch `self._merge_into_base`):**
   - Merge succeeds → status `DONE`, `stats.completed == 1`, `cleanup_workspace`
@@ -162,5 +179,5 @@ reordering recoverable:
 - Automated conflict resolution / rebase-before-merge — a conflict goes to a human.
 - Reusing `GitManager.merge_branch` / injecting a `GitManager` — rejected above;
   hardening in place preserves obs and minimizes surface.
-- Adding `checkout base` to `_merge_into_base` — topology makes it unnecessary; a
-  new failure surface not taken on here.
+- Adding `checkout base` to `_merge_into_base` — the read-only base-branch *verify*
+  (above) closes the invariant risk without the active-checkout failure surface.
