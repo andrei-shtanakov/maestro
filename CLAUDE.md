@@ -165,7 +165,7 @@ PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
    d. Commit spec in feature branch
    e. Spawn `spec-runner run --all` subprocess
 4. Monitor processes (poll returncode + callbacks)
-5. On success: auto-merge feature branch into base, create PR (if auto_pr), cleanup worktree
+5. On success: create PR (if auto_pr), then merge feature branch into base BEFORE marking DONE (DONE is gated on the merge — a conflict routes the workstream to NEEDS_REVIEW with the worktree left intact; a crash mid-merge is recoverable via startup recovery), then cleanup worktree
 6. On failure: retry or mark NEEDS_REVIEW
 ```
 
