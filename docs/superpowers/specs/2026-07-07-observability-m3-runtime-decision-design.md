@@ -56,10 +56,18 @@ freshest running count for the tick). It emits via the module `_obs_log`:
   nothing. Scheduler liveness between changes is already covered by M2's
   `scheduler.session` span and the task-lifecycle emits.
 - Call site in `_main_loop`: after `_monitor_running_tasks()`, before the
-  poll-interval wait —
-  `self._emit_tick(len(ready_task_ids), len(self._running_tasks), len(completed_ids))`.
-  (`completed_ids` and `ready_task_ids` are already computed in the loop body;
-  `self._running_tasks` is current after monitoring.)
+  poll-interval wait. The snapshot must be internally coherent with the
+  post-spawn/post-monitor state, so the counts are derived, not the raw
+  start-of-cycle variables:
+  - `ready` = the **post-spawn residual** — ready tasks that did NOT get a slot
+    this cycle: `sum(1 for tid in ready_task_ids if tid not in self._running_tasks)`.
+    (Passing raw `len(ready_task_ids)` would double-count a task spawned this
+    cycle, which is also in `running`.)
+  - `running` = `len(self._running_tasks)` (current after monitoring).
+  - `completed` = a **fresh** `len(await self._get_completed_task_ids())` fetched
+    right before the emit. (The start-of-cycle `completed_ids` predates
+    `_monitor_running_tasks`, so a task that finished this cycle would be gone
+    from `running` but not yet in `completed` — incoherent for one tick.)
 - The emit auto-carries `trace_id` / `span_id` from the surrounding
   `scheduler.session` span via obs contextvars — no extra correlation work.
 
