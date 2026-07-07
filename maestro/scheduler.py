@@ -237,6 +237,7 @@ class Scheduler:
         self._abandon_outcome_after_s: int = 300
 
         self._running_tasks: dict[str, RunningTask] = {}
+        self._last_tick: tuple[int, int, int] | None = None
         self._retry_ready_times: dict[str, datetime] = {}
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
@@ -625,6 +626,20 @@ class Scheduler:
         finally:
             await self._cleanup()
 
+    def _emit_tick(self, ready: int, running: int, completed: int) -> None:
+        """Emit a per-poll-cycle queue snapshot, but only when it changed.
+
+        The first tick always emits; identical consecutive snapshots are
+        skipped so a long idle run does not flood with duplicate ticks.
+        """
+        snapshot = (ready, running, completed)
+        if snapshot == self._last_tick:
+            return
+        self._last_tick = snapshot
+        _obs_log.info(
+            "scheduler.tick", ready=ready, running=running, completed=completed
+        )
+
     async def _main_loop(self) -> None:
         """Main scheduler loop."""
         while not self._shutdown_requested:
@@ -643,6 +658,11 @@ class Scheduler:
 
             # Monitor running processes
             await self._monitor_running_tasks()
+
+            # M3: per-poll-cycle queue snapshot (emit-on-change).
+            self._emit_tick(
+                len(ready_task_ids), len(self._running_tasks), len(completed_ids)
+            )
 
             # R-03: re-deliver any outcomes that couldn't reach arbiter earlier
             await self._outcome_reattempt_pass()
