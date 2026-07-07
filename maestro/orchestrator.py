@@ -241,11 +241,21 @@ class Orchestrator:
         # FAILED have already reached their final state.
         for w in await self._db.get_workstreams_by_status(WorkstreamStatus.FAILED):
             try:
-                target = (
-                    WorkstreamStatus.READY
-                    if w.can_retry()
-                    else WorkstreamStatus.NEEDS_REVIEW
-                )
+                if w.process_pid is not None and _is_pid_alive(w.process_pid):
+                    # A FAILED row can be an in-flight reset interrupted
+                    # mid-two-write (X->FAILED committed, target write lost).
+                    # If its recorded process is still alive it may be a live
+                    # orphan — never reset to READY (would spawn a second run
+                    # over it). Park for review, same as the live-orphan
+                    # RUNNING path. (A genuine _handle_failure FAILED has an
+                    # already-exited run --all, so this is False for it.)
+                    target = WorkstreamStatus.NEEDS_REVIEW
+                else:
+                    target = (
+                        WorkstreamStatus.READY
+                        if w.can_retry()
+                        else WorkstreamStatus.NEEDS_REVIEW
+                    )
                 self._logger.info(
                     "Reconciling FAILED workstream '%s' -> %s",
                     w.id,

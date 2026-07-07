@@ -137,6 +137,14 @@ else → `NEEDS_REVIEW`. This is the ONLY path where recovery produces
 TOTAL over every non-terminal, non-actionable state and makes the in-flight
 two-write resets crash-safe (a partial reset is finished by the next startup).
 
+The FAILED pass also applies the same liveness gate as the RUNNING branch
+before consulting the retry rule: a two-write in-flight reset interrupted
+between its `X→FAILED` and `FAILED→target` writes rests in `FAILED` without
+its `process_pid` being cleared, so a live-orphan RUNNING strand can surface
+here too. If that pid is still alive, the row goes to `NEEDS_REVIEW`
+regardless of retries left — never blindly to `READY`, which would spawn a
+second `run --all` over the still-running orphan.
+
 ## Error handling
 
 - Each workstream's recovery is independent; a DB error on one is logged and
@@ -213,4 +221,6 @@ two-write resets crash-safe (a partial reset is finished by the next startup).
 
 - Scheduler mode (already has `StateRecovery`).
 - Worktree/git cleanup on re-run (pre-existing behavior; separate ticket).
-- Automated salvage of MERGING/PR_CREATED (conservative NEEDS_REVIEW instead).
+- Automated salvage of MERGING/PR_CREATED (detect a completed merge / adopt an
+  existing PR). These reset to READY and re-run `_handle_success` idempotently
+  instead; smarter salvage is a possible follow-up.

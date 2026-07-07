@@ -1233,6 +1233,97 @@ class TestStartupRecovery:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_failed_with_live_pid_goes_to_needs_review_not_ready(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        """A FAILED row can be a live orphan whose two-write reset (X->FAILED,
+        FAILED->target) was interrupted after the first write. If its
+        recorded process is still alive, the retry rule must NOT send it to
+        READY — that would spawn a second `run --all` over the still-running
+        orphan. This is the regression guard for the orphan double-run hole.
+        """
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: True)
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            await db.create_workstream(
+                self._seed(
+                    "orphan",
+                    WorkstreamStatus.FAILED,
+                    retry_count=0,
+                    max_retries=3,
+                    pid=4242,
+                )
+            )
+            await orch._recover_stranded_workstreams()
+            w = await db.get_workstream("orphan")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert orch._stats.failed == 1
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_failed_with_dead_pid_still_follows_retry_rule(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        """A genuine failure (dead/absent process) is unaffected by the
+        liveness gate — retries left still go to READY."""
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            await db.create_workstream(
+                self._seed(
+                    "genuine",
+                    WorkstreamStatus.FAILED,
+                    retry_count=0,
+                    max_retries=3,
+                    pid=4242,
+                )
+            )
+            await db.create_workstream(
+                self._seed(
+                    "no-pid",
+                    WorkstreamStatus.FAILED,
+                    retry_count=0,
+                    max_retries=3,
+                    pid=None,
+                )
+            )
+            await orch._recover_stranded_workstreams()
+            assert (await db.get_workstream("genuine")).status == WorkstreamStatus.READY
+            assert (await db.get_workstream("no-pid")).status == WorkstreamStatus.READY
+            assert orch._stats.failed == 0
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_clean_states_untouched_and_count_zero(
         self,
         tmp_path,
