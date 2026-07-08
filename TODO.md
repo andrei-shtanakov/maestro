@@ -118,7 +118,7 @@
 - [x] **LABS-87** (2026-05-07): validation-failure path теперь репортит outcome в arbiter с retry-gating. `_handle_validation_failure` отзеркалил `_handle_task_failure`: build outcome (status FAILURE) → `_try_report_outcome` → ADVISORY/AUTHORITATIVE-aware reset. Both paths (retry-available + exhausted-NEEDS_REVIEW) шлют outcome. +4 теста в `test_scheduler_arbiter_integration.py` (advisory+retry, exhausted, advisory+arbiter-down, authoritative+arbiter-down). Routing API не расширен — `validation_passed` остаётся out-of-scope
 - [x] **LABS-88** (Low): CI guard для unreferenced public modules (commit `c002f46`) — `tests/test_no_unreferenced_modules.py`, grimp import-graph, allowlist `maestro.schemas.generate` (python -m)
 - [ ] **LABS-89** (Medium): release automation (version-vs-tag guard + release-drafter)
-- [ ] **LABS-90** (Medium): per-example YAML smoke test в CI
+- [x] **LABS-90** (Medium): per-example YAML smoke test в CI (commit `e9cbb1c`) — `tests/test_examples_smoke.py`, parametrized `examples/*.yaml` (Mode-1 `load_config`; Mode-2 `load_orchestrator_config`+`validate_project(check_fs=False)`) + `observed-models.json`; dummy `${VAR}` env; caught+fixed drifted `maestro-builds-maestro.yaml` (`repo: .`)
 
 ### Observability (cross-project) — M1 closed, M2 closed 2026-04-25
 

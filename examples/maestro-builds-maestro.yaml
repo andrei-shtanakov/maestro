@@ -15,7 +15,7 @@
 # =============================================================================
 
 project: maestro-dogfood
-repo: .                      # Relative to where you run the command
+repo: ~/labs/all_ai_orchestrators/Maestro   # Absolute or ~ path to the maestro clone
 max_concurrent: 2
 
 git:
