@@ -36,12 +36,24 @@ class OrchestratorError(Exception):
     """Base exception for orchestrator errors."""
 
 
+_SPAWNING_SENTINEL = -1
+"""Placeholder pid written into ``process_pid`` / ``generation_pid`` BEFORE a
+subprocess spawn and overwritten with the real pid after. A recovery that finds
+it treats the workstream as a possible live orphan (a spawn was in progress at
+the crash). Never passed to ``os.kill`` — see ``_maybe_live_orphan`` and the
+``pid <= 0`` guard in ``_is_pid_alive``."""
+
+
 def _is_pid_alive(pid: int) -> bool:
     """True if a process with this pid exists (signal 0 probes without killing).
 
     ProcessLookupError means it is gone; PermissionError means it exists but
     we may not signal it (still alive).
     """
+    if pid <= 0:
+        # Never signal a non-positive pid: os.kill(0/-1, …) would hit the
+        # caller's process group / every process. A real pid is always > 0.
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -49,6 +61,17 @@ def _is_pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _maybe_live_orphan(pid: int | None) -> bool:
+    """True if the recorded pid indicates a possibly-live orphan: the spawning
+    sentinel (a spawn was in progress at the crash) or a still-alive real pid.
+
+    Checks the sentinel FIRST so it is never passed to os.kill.
+    """
+    if pid == _SPAWNING_SENTINEL:
+        return True
+    return pid is not None and _is_pid_alive(pid)
 
 
 _STRANDED_INFLIGHT = (
@@ -191,16 +214,26 @@ class Orchestrator:
                         if state is WorkstreamStatus.DECOMPOSING
                         else None
                     )
-                    live_orphan = orphan_pid is not None and _is_pid_alive(orphan_pid)
+                    live_orphan = _maybe_live_orphan(orphan_pid)
                     if live_orphan:
-                        self._logger.warning(
-                            "Workstream '%s' stranded in %s with a live "
-                            "process (pid %s) after restart — sending to "
-                            "NEEDS_REVIEW; verify and clean it up before resume",
-                            w.id,
-                            state.value,
-                            orphan_pid,
-                        )
+                        if orphan_pid == _SPAWNING_SENTINEL:
+                            self._logger.warning(
+                                "Workstream '%s' stranded in %s with a spawn in "
+                                "progress at the crash — state uncertain (a "
+                                "subprocess may or may not be running); sending "
+                                "to NEEDS_REVIEW, verify before resuming",
+                                w.id,
+                                state.value,
+                            )
+                        else:
+                            self._logger.warning(
+                                "Workstream '%s' stranded in %s with a live "
+                                "process (pid %s) after restart — sending to "
+                                "NEEDS_REVIEW; verify and clean it up before resume",
+                                w.id,
+                                state.value,
+                                orphan_pid,
+                            )
                         await self._db.update_workstream_status(
                             w.id, WorkstreamStatus.FAILED
                         )
@@ -208,6 +241,8 @@ class Orchestrator:
                             w.id,
                             WorkstreamStatus.NEEDS_REVIEW,
                             expected_status=WorkstreamStatus.FAILED,
+                            process_pid=None,
+                            generation_pid=None,
                         )
                         # Parked for review — signal via exit code + summary,
                         # matching _handle_failure's NEEDS_REVIEW accounting.
@@ -246,14 +281,15 @@ class Orchestrator:
         # FAILED have already reached their final state.
         for w in await self._db.get_workstreams_by_status(WorkstreamStatus.FAILED):
             try:
-                if w.process_pid is not None and _is_pid_alive(w.process_pid):
-                    # A FAILED row can be an in-flight reset interrupted
-                    # mid-two-write (X->FAILED committed, target write lost).
-                    # If its recorded process is still alive it may be a live
-                    # orphan — never reset to READY (would spawn a second run
-                    # over it). Park for review, same as the live-orphan
-                    # RUNNING path. (A genuine _handle_failure FAILED has an
-                    # already-exited run --all, so this is False for it.)
+                if _maybe_live_orphan(w.process_pid) or _maybe_live_orphan(
+                    w.generation_pid
+                ):
+                    # A FAILED row can be an in-flight reset interrupted mid
+                    # two-write (X->FAILED committed, target write lost). If its
+                    # recorded process_pid (RUNNING orphan) or generation_pid
+                    # (DECOMPOSING orphan) is alive OR the spawning sentinel, it
+                    # may be a live orphan — never reset to READY. Park for
+                    # review. The NEEDS_REVIEW write below clears both pids.
                     target = WorkstreamStatus.NEEDS_REVIEW
                 else:
                     target = (
@@ -266,13 +302,22 @@ class Orchestrator:
                     w.id,
                     target.value,
                 )
-                await self._db.update_workstream_status(
-                    w.id, target, expected_status=WorkstreamStatus.FAILED
-                )
                 if target is WorkstreamStatus.NEEDS_REVIEW:
-                    # Parked for review (retries exhausted) — signal via exit
-                    # code + summary, matching _handle_failure's accounting.
+                    await self._db.update_workstream_status(
+                        w.id,
+                        WorkstreamStatus.NEEDS_REVIEW,
+                        expected_status=WorkstreamStatus.FAILED,
+                        process_pid=None,
+                        generation_pid=None,
+                    )
+                    # Parked for review — signal via exit code + summary.
                     self._stats.failed += 1
+                else:
+                    await self._db.update_workstream_status(
+                        w.id,
+                        WorkstreamStatus.READY,
+                        expected_status=WorkstreamStatus.FAILED,
+                    )
                 recovered += 1
             except Exception as e:
                 self._logger.error(
@@ -478,13 +523,14 @@ class Orchestrator:
         """Spawn a spec-runner process for a workstream."""
         workstream = await self._db.get_workstream(workstream_id)
 
-        # Transition to DECOMPOSING for spec generation (clear any stale
-        # generation pid up front — closes the re-decompose stale window).
+        # Transition to DECOMPOSING; write the spawning sentinel up front — it
+        # marks a spawn-in-progress AND overwrites any stale prior generation
+        # pid (re-decompose).
         await self._db.update_workstream_status(
             workstream_id,
             WorkstreamStatus.DECOMPOSING,
             expected_status=workstream.status,
-            generation_pid=None,
+            generation_pid=_SPAWNING_SENTINEL,
         )
 
         # Create workspace
@@ -547,6 +593,7 @@ class Orchestrator:
             workstream_id,
             WorkstreamStatus.RUNNING,
             expected_status=WorkstreamStatus.READY,
+            process_pid=_SPAWNING_SENTINEL,
         )
 
         # Spawn spec-runner

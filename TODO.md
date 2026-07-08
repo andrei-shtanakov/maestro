@@ -251,7 +251,7 @@ ls .github/workflows/
       workstream showing DONE with an unmerged feature branch.
       (closed by feat/base-merge-before-done)
 
-- [ ] Uniform spawn→persist window closure (RUNNING + DECOMPOSING): a hard crash
+- [x] Uniform spawn→persist window closure (RUNNING + DECOMPOSING) (closed by feat/spawn-persist-window-closure): a hard crash
       between spawning the subprocess and persisting its pid leaves status set
       with pid=NULL and a live orphan → recovery reads None → READY → re-run
       races the orphan. Close both windows symmetrically (e.g. a "spawning"
