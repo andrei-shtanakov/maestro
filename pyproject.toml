@@ -71,6 +71,7 @@ project-includes = [
 [dependency-groups]
 dev = [
     "anyio>=4.12.1",
+    "grimp>=3.15",
     "jsonschema>=4.26.0",
     "pyrefly>=0.51.0",
     "pytest>=9.0.3",
