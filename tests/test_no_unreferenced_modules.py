@@ -54,7 +54,10 @@ def _find_unreferenced(
 def _roots_from_pyproject() -> set[str]:
     """Entry-point / console-script modules — referenced at runtime, not by an
     import statement. `maestro.cli` is always a root (the `maestro` script)."""
-    data = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
+    # tomllib.load reads bytes and decodes UTF-8 (the TOML spec encoding),
+    # so this stays portable regardless of the platform's default locale.
+    with (_REPO_ROOT / "pyproject.toml").open("rb") as fh:
+        data = tomllib.load(fh)
     project = data.get("project", {})
     roots = {"maestro.cli"}
     for target in (project.get("scripts", {}) or {}).values():
