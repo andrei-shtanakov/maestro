@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pytest
 import yaml
-from pydantic import ValidationError
 
 from maestro.catalog_discovery import parse_observed_manifest
 from maestro.config import (
@@ -65,7 +64,8 @@ def test_example_yaml_loads_and_validates(
             f"{[i.message for i in report.errors]}"
         )
     else:
-        load_config(path)  # raises ConfigError / ValidationError on schema drift
+        # load_config wraps pydantic validation failures into ConfigError.
+        load_config(path)  # raises ConfigError on schema drift
 
 
 def test_observed_models_json_parses() -> None:
@@ -75,8 +75,8 @@ def test_observed_models_json_parses() -> None:
 
 def test_smoke_rejects_a_broken_config() -> None:
     # Discrimination: an invalid config must be rejected, so the per-example
-    # smoke genuinely catches drift rather than passing vacuously. A ProjectConfig
-    # requires `tasks`; a mapping without it must fail.
-    expected: tuple[type[Exception], ...] = (ConfigError, ValidationError)
-    with pytest.raises(expected):
+    # smoke genuinely catches drift rather than passing vacuously. ProjectConfig
+    # requires `repo` (and `project`); a mapping missing `repo` must fail.
+    # load_config_from_string wraps the pydantic error into ConfigError.
+    with pytest.raises(ConfigError):
         load_config_from_string("project: broken\n")

@@ -13,10 +13,10 @@
 - `uv` only; `uv run pytest` / `uv run pyrefly check` / `uv run ruff format .` + `uv run ruff check .`; line length 88; run pytest in the FOREGROUND.
 - The smoke validates STRUCTURE/SCHEMA with dummy `${VAR}` env placeholders and `check_fs=False` — it does NOT run the examples or check that env vars resolve to real paths. Scope: catch schema/graph drift.
 - Mode discriminator: a top-level `repo_url` OR `workstreams` key ⇒ Mode-2 (`OrchestratorConfig`); else Mode-1 (`ProjectConfig`). `repo_url`/`workstreams` are Mode-2-only (ProjectConfig has neither).
-- Mode-2 pass = `load_orchestrator_config` returns AND `validate_project(config, check_fs=False).ok` (no `error`-severity issues; warnings allowed). Mode-1 pass = `load_config` returns (raises `ConfigError`/`ValidationError` on drift).
+- Mode-2 pass = `load_orchestrator_config` returns AND `validate_project(config, check_fs=False).ok` (no `error`-severity issues; warnings allowed). Mode-1 pass = `load_config` returns (raises `ConfigError` on drift — it wraps pydantic `ValidationError` into `ConfigError`).
 - `resolve_env_vars` is strict: an unset `${VAR}` raises `ConfigError`. The smoke `monkeypatch.setenv`s each `${VAR}` found in the example text to `"x"` before loading.
 - Guard against a vacuous pass: assert `examples/*.yaml` is non-empty (an empty/moved dir must fail loudly, not silently collect zero cases).
-- Signatures (verbatim): `load_config(path: Path | str) -> ProjectConfig`; `load_orchestrator_config(path) -> OrchestratorConfig`; `load_config_from_string(content, path=None) -> ProjectConfig`; `validate_project(config, *, check_fs=True) -> ValidationReport` with `.ok` / `.errors`; `parse_observed_manifest(data: object) -> dict[str, list[str]]`; `ConfigError` in `maestro.config`; `ValidationError` from `pydantic`.
+- Signatures (verbatim): `load_config(path: Path | str) -> ProjectConfig`; `load_orchestrator_config(path) -> OrchestratorConfig`; `load_config_from_string(content, path=None) -> ProjectConfig`; `validate_project(config, *, check_fs=True) -> ValidationReport` with `.ok` / `.errors`; `parse_observed_manifest(data: object) -> dict[str, list[str]]`; `ConfigError` in `maestro.config` (load_config surfaces this, wrapping pydantic `ValidationError`).
 - Branch: `feat/labs-90-example-smoke` (create it). Full suite green at every commit.
 
 ---
