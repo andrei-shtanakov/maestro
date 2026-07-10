@@ -30,7 +30,7 @@ Recommended mechanism (chosen at arbiter-side implementation):
 - Option A: `git submodule` of Maestro pinned at SHA matching
   `ARBITER_PINNED_SHA` round-trip in Maestro CI.
 - Option B: HTTP fetch in `build.rs` from
-  `https://raw.githubusercontent.com/andrei-shtanakov/maestro/<SHA>/_cowork_output/benchmark-contract/report_benchmark-v1.schema.json`.
+  `https://raw.githubusercontent.com/andrei-shtanakov/maestro/<SHA>/contracts/benchmark/report_benchmark-v1.schema.json`.
 - Option C: Copy-on-bump (manual sync, CI grep guards against drift).
 
 Arbiter side decides; Maestro side guarantees the file does not

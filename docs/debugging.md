@@ -5,7 +5,7 @@ Model JSONL to `$ORCHESTRA_LOG_DIR/<service>-<pid>.jsonl`. After the run,
 `maestro merge-logs <pipeline_id>` sorts all per-pid files by nanosecond
 `Timestamp` into `merged.jsonl`. From there `jq` is the main debugger.
 
-Contract: `Maestro/_cowork_output/observability-contract/log-schema.json`.
+Contract: `Maestro/contracts/observability/log-schema.json`.
 Services in v1: `maestro`, `spec-runner`, `arbiter`, `atp`.
 
 All recipes below assume you have run `maestro merge-logs <pipeline_id>` and

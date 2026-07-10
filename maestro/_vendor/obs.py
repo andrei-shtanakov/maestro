@@ -5,7 +5,7 @@
 Source of truth for `obs.py` (vendored into other Python projects).
 Produces OpenTelemetry Logs Data Model JSONL, one file per PID.
 
-Contract: see _cowork_output/observability-contract/log-schema.json
+Contract: see Maestro/contracts/observability/log-schema.json
 """
 
 from __future__ import annotations
