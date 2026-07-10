@@ -1,6 +1,6 @@
 """R-06b M4 contract tests — JSONSchema validation on Maestro side.
 
-Schema lives at Maestro/_cowork_output/benchmark-contract/report_benchmark-v1.schema.json.
+Schema lives at Maestro/contracts/benchmark/report_benchmark-v1.schema.json.
 Both Maestro (this file) and arbiter (Rust tests/contract_test.rs)
 validate against it. Schema is the single source of truth.
 """
@@ -19,8 +19,8 @@ from maestro.benchmark.models import BenchmarkResult, BenchmarkTaskResult
 
 SCHEMA_PATH = (
     Path(__file__).parents[1]
-    / "_cowork_output"
-    / "benchmark-contract"
+    / "contracts"
+    / "benchmark"
     / "report_benchmark-v1.schema.json"
 )
 
