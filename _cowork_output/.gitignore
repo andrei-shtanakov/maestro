@@ -1,0 +1,5 @@
+# _cowork_output is dev-scratch (repo rule: not shipped, does not travel between machines).
+# Historical content graduated 2026-07-10: contracts -> contracts/
+# dated docs -> prograph-vault/authored/notes/archive/maestro-cowork/.
+*
+!.gitignore
