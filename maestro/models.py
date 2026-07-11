@@ -209,13 +209,19 @@ class RouteDecision(BaseModel):
 
 
 class TaskOutcomeStatus(StrEnum):
-    """Terminal status reported back to arbiter via report_outcome."""
+    """Terminal status reported back to arbiter via report_outcome.
+
+    This is the WIRE vocabulary and must mirror arbiter's report_outcome
+    enum exactly (success|failure|timeout|cancelled) — arbiter rejects
+    anything else (#65). Maestro-internal lifecycle nuance (e.g. a run
+    interrupted mid-RUNNING) is projected onto this enum at the client
+    boundary and preserved in `error_code`, never sent as a status.
+    """
 
     SUCCESS = "success"
     FAILURE = "failure"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
-    INTERRUPTED = "interrupted"
 
 
 class TaskOutcome(BaseModel):

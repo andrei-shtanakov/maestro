@@ -2,7 +2,10 @@
 
 import pytest
 
-from maestro.coordination.routing import task_status_to_outcome_status
+from maestro.coordination.routing import (
+    interrupted_error_code,
+    task_status_to_outcome_status,
+)
 from maestro.models import TaskOutcomeStatus, TaskStatus
 
 
@@ -30,17 +33,31 @@ class TestMapping:
             is TaskOutcomeStatus.CANCELLED
         )
 
-    def test_running_maps_to_interrupted(self) -> None:
+    def test_running_maps_to_cancelled_with_interrupted_marker(self) -> None:
+        """Interrupted runs go on the wire as CANCELLED (#65) + error_code."""
         assert (
             task_status_to_outcome_status(TaskStatus.RUNNING)
-            is TaskOutcomeStatus.INTERRUPTED
+            is TaskOutcomeStatus.CANCELLED
         )
+        assert interrupted_error_code(TaskStatus.RUNNING) == "interrupted"
 
-    def test_validating_maps_to_interrupted(self) -> None:
+    def test_validating_maps_to_cancelled_with_interrupted_marker(self) -> None:
         assert (
             task_status_to_outcome_status(TaskStatus.VALIDATING)
-            is TaskOutcomeStatus.INTERRUPTED
+            is TaskOutcomeStatus.CANCELLED
         )
+        assert interrupted_error_code(TaskStatus.VALIDATING) == "interrupted"
+
+    def test_terminal_states_carry_no_interrupted_marker(self) -> None:
+        for status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.ABANDONED):
+            assert interrupted_error_code(status) is None
+
+    def test_every_mapped_status_is_in_arbiter_enum(self) -> None:
+        """No lifecycle state may project outside the contract enum (#65)."""
+        wire = {"success", "failure", "timeout", "cancelled"}
+        for status in TaskStatus:
+            mapped = task_status_to_outcome_status(status)
+            assert mapped is None or mapped.value in wire
 
     @pytest.mark.parametrize(
         "invariant_state",

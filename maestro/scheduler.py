@@ -28,6 +28,7 @@ from maestro.coordination.routing import (
     STATIC_ROUTING_REASON,
     RoutingStrategy,
     StaticRouting,
+    interrupted_error_code,
     task_status_to_outcome_status,
 )
 from maestro.cost_tracker import effective_cost, parse_and_create_cost
@@ -496,7 +497,11 @@ class Scheduler:
                 else task.retry_count + 1
             )
             outcome = await self._build_outcome(task, exit_code=0, attempt=attempt)
-            outcome = outcome.model_copy(update={"status": outcome_status})
+            update: dict[str, object] = {"status": outcome_status}
+            marker = interrupted_error_code(task.status)
+            if marker is not None and outcome.error_code is None:
+                update["error_code"] = marker
+            outcome = outcome.model_copy(update=update)
             try:
                 await self._routing.report_outcome(task, outcome)
             except ArbiterUnavailable:

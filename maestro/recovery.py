@@ -11,7 +11,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
-from maestro.coordination.routing import RoutingStrategy, task_status_to_outcome_status
+from maestro.coordination.routing import (
+    RoutingStrategy,
+    interrupted_error_code,
+    task_status_to_outcome_status,
+)
 from maestro.database import Database
 from maestro.event_log import Event, EventType, get_event_logger
 from maestro.models import Task, TaskOutcome, TaskOutcomeStatus, TaskStatus
@@ -208,8 +212,8 @@ def _reconstruct_outcome(task: Task, status: TaskOutcomeStatus) -> TaskOutcome:
     if task.started_at and task.completed_at:
         duration_min = (task.completed_at - task.started_at).total_seconds() / 60.0
 
-    error_code: str | None = None
-    if task.error_message:
+    error_code = interrupted_error_code(task.status)
+    if error_code is None and task.error_message:
         lines = task.error_message.splitlines()
         first = lines[0] if lines else task.error_message
         error_code = first[:200]

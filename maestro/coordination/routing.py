@@ -94,13 +94,28 @@ _STATUS_MAP: dict[TaskStatus, TaskOutcomeStatus | None] = {
     TaskStatus.FAILED: TaskOutcomeStatus.FAILURE,
     TaskStatus.NEEDS_REVIEW: TaskOutcomeStatus.FAILURE,
     TaskStatus.ABANDONED: TaskOutcomeStatus.CANCELLED,
-    TaskStatus.RUNNING: TaskOutcomeStatus.INTERRUPTED,
-    TaskStatus.VALIDATING: TaskOutcomeStatus.INTERRUPTED,
+    # An externally interrupted run (crash/stop mid-flight) is not the
+    # agent's failure: project to CANCELLED so agent stats stay fair —
+    # arbiter's enum has no "interrupted" (#65). The nuance is preserved
+    # in error_code via `interrupted_error_code`.
+    TaskStatus.RUNNING: TaskOutcomeStatus.CANCELLED,
+    TaskStatus.VALIDATING: TaskOutcomeStatus.CANCELLED,
     # Invariant-violation states: decision_id should never be set here.
     TaskStatus.PENDING: None,
     TaskStatus.READY: None,
     TaskStatus.AWAITING_APPROVAL: None,
 }
+
+_INTERRUPTED_STATES = frozenset({TaskStatus.RUNNING, TaskStatus.VALIDATING})
+
+
+def interrupted_error_code(status: TaskStatus) -> str | None:
+    """Audit marker for outcomes projected from an interrupted run.
+
+    The wire status says CANCELLED (contract enum, #65); this keeps the
+    "interrupted mid-flight" signal in error_code for the learning loop.
+    """
+    return "interrupted" if status in _INTERRUPTED_STATES else None
 
 
 def task_status_to_outcome_status(
