@@ -432,12 +432,12 @@ async def test_reattempt_pass_delivers_bounded_five_per_tick(tmp_path) -> None:
 
 
 @pytest.mark.anyio
-async def test_reattempt_interrupted_marker_wins_over_error_message(
+async def test_reattempt_skips_still_running_tasks(
     tmp_path,
 ) -> None:
-    """#65 follow-up: for RUNNING/VALIDATING the interrupted marker must
-    override any error_message-derived error_code — same precedence as
-    recovery, so both delivery paths report identically."""
+    """#69: an in-flight RUNNING task with a decision is NOT a dangling
+    outcome — the re-attempt pass must skip it (phantom cancelled
+    poisoned agent stats; interrupted-projection stays recovery-only)."""
     fake = FakeArbiterClient()
     fake.outcome_handler = lambda **_kw: {"recorded": True}
     await fake.start()
@@ -475,9 +475,10 @@ async def test_reattempt_interrupted_marker_wins_over_error_message(
         await scheduler._outcome_reattempt_pass()
 
         outcome_calls = [c for c in fake.calls if c.method == "report_outcome"]
-        assert len(outcome_calls) == 1
-        assert outcome_calls[0].arguments["status"] == "cancelled"
-        assert outcome_calls[0].arguments["error_code"] == "interrupted"
+        assert outcome_calls == []
+
+        pending = await db.get_tasks_with_pending_outcome()
+        assert [t.id for t in pending] == ["t-int"]  # still pending, not lost
     finally:
         await db.close()
 

@@ -108,6 +108,19 @@ _STATUS_MAP: dict[TaskStatus, TaskOutcomeStatus | None] = {
 
 _INTERRUPTED_STATES = frozenset({TaskStatus.RUNNING, TaskStatus.VALIDATING})
 
+#: Statuses the in-process re-attempt pass may report (#69). RUNNING and
+#: VALIDATING map in _STATUS_MAP for CRASH RECOVERY only, where the dead
+#: process makes "interrupted" true; in a live scheduler they mean the
+#: task is genuinely still running and must not be reported yet.
+TERMINAL_OUTCOME_STATUSES = frozenset(
+    {
+        TaskStatus.DONE,
+        TaskStatus.FAILED,
+        TaskStatus.NEEDS_REVIEW,
+        TaskStatus.ABANDONED,
+    }
+)
+
 
 def interrupted_error_code(status: TaskStatus) -> str | None:
     """Audit marker for outcomes projected from an interrupted run.

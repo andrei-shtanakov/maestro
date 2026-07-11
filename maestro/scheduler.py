@@ -26,6 +26,7 @@ from maestro.catalog import CatalogError, HarnessModelUnresolved
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.coordination.routing import (
     STATIC_ROUTING_REASON,
+    TERMINAL_OUTCOME_STATUSES,
     RoutingStrategy,
     StaticRouting,
     interrupted_error_code,
@@ -476,6 +477,14 @@ class Scheduler:
         for task in pending:
             if delivered_count >= MAX_REATTEMPTS_PER_TICK:
                 break
+
+            # #69: an in-flight task (RUNNING/VALIDATING) is not a dangling
+            # outcome — reporting it here poisoned agent stats with phantom
+            # cancellations (masked pre-#65 by arbiter rejecting the then-
+            # "interrupted" status). Those states stay reportable only via
+            # crash recovery, where the process is known dead.
+            if task.status not in TERMINAL_OUTCOME_STATUSES:
+                continue
 
             outcome_status = task_status_to_outcome_status(task.status)
             if outcome_status is None:
