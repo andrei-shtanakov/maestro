@@ -200,7 +200,7 @@ def test_evidence_builders_produce_schema_valid_refs() -> None:
 )
 def test_evidence_kind_requirements_enforced(kind: str, kwargs: dict) -> None:
     with pytest.raises(ValidationError, match="requires"):
-        EvidenceRef(kind=kind, **kwargs)
+        EvidenceRef.model_validate({"kind": kind, **kwargs})
     # and the schema agrees
     payload = {"kind": kind, **kwargs}
     errors = list(jsonschema.Draft7Validator(_EVIDENCE_SCHEMA).iter_errors(payload))
