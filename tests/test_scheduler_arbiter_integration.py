@@ -432,6 +432,57 @@ async def test_reattempt_pass_delivers_bounded_five_per_tick(tmp_path) -> None:
 
 
 @pytest.mark.anyio
+async def test_reattempt_interrupted_marker_wins_over_error_message(
+    tmp_path,
+) -> None:
+    """#65 follow-up: for RUNNING/VALIDATING the interrupted marker must
+    override any error_message-derived error_code — same precedence as
+    recovery, so both delivery paths report identically."""
+    fake = FakeArbiterClient()
+    fake.outcome_handler = lambda **_kw: {"recorded": True}
+    await fake.start()
+    routing = ArbiterRouting(
+        client=fake,
+        cfg=ArbiterConfig(
+            enabled=True,
+            binary_path="/fake",
+            config_dir="/fake",
+            tree_path="/fake",
+        ),
+    )
+
+    db = Database(tmp_path / "r.db")
+    await db.connect()
+    try:
+        t = Task(
+            id="t-int",
+            title="T",
+            prompt="P",
+            workdir=str(tmp_path),
+            status=TaskStatus.RUNNING,
+            arbiter_decision_id="dec-int",
+            error_message="stale error from a previous attempt",
+        )
+        await db.create_task(t)
+
+        scheduler = Scheduler(
+            db=db,
+            dag=DAG([]),
+            spawners={},
+            routing=routing,
+            arbiter_mode=ArbiterMode.ADVISORY,
+        )
+        await scheduler._outcome_reattempt_pass()
+
+        outcome_calls = [c for c in fake.calls if c.method == "report_outcome"]
+        assert len(outcome_calls) == 1
+        assert outcome_calls[0].arguments["status"] == "cancelled"
+        assert outcome_calls[0].arguments["error_code"] == "interrupted"
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
 async def test_authoritative_abandon_after_timeout(tmp_path) -> None:
     """Authoritative + arbiter down + completed_at older than abandon window
     → task force-unblocked, ABANDONED event emitted, FAILED → READY, audit
