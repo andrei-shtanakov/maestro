@@ -498,8 +498,10 @@ class Scheduler:
             )
             outcome = await self._build_outcome(task, exit_code=0, attempt=attempt)
             update: dict[str, object] = {"status": outcome_status}
+            # Same precedence as recovery: the interrupted marker wins over
+            # any stale error_message-derived code.
             marker = interrupted_error_code(task.status)
-            if marker is not None and outcome.error_code is None:
+            if marker is not None:
                 update["error_code"] = marker
             outcome = outcome.model_copy(update=update)
             try:
