@@ -1,7 +1,7 @@
 # TODO — Maestro (план от 2026-04-16, snapshot 2026-04-25)
 
-> Стратегический контекст: `../_cowork_output/roadmap/ecosystem-roadmap.md`
-> Последние недельные отчёты: `../_cowork_output/status/2026-04-24-status.md`, `2026-04-18-status.md`, `2026-04-10-status.md`
+> Стратегический контекст: `../prograph-vault/authored/notes/ecosystem-roadmap.md`
+> Последние недельные отчёты: `../prograph-vault/authored/notes/status/2026-04-24-status.md`, `../prograph-vault/authored/notes/status/2026-04-18-status.md`, `../prograph-vault/authored/notes/status/2026-04-10-status.md`
 > Критический путь: ✅ закрыт (R-01..R-04 shipped в v0.2.0, observability M1+M2 закрыты, arbiter#9 фикс 2026-04-25)
 
 ## Правила ведения
@@ -92,7 +92,7 @@
 
 ### R-06b — Agent benchmarking via ATP
 
-> Дизайн: `../_cowork_output/decisions/2026-04-25-r06b-design.md`
+> Дизайн: `../prograph-vault/authored/decisions/2026-04-25-r06b-design.md`
 > M0 (design) approved by virtue of M1 landing.
 
 - [x] **R-06b M1 thin slice** (2026-05-07): новый `maestro/benchmark/` модуль — `BenchmarkRunner` + Protocols (`ATPClientLike`, `BenchmarkRun`, `AgentResponder`), Pydantic-модели (`BenchmarkResult`, `BenchmarkTaskResult`, `AgentResponse`). Async API (Maestro async-first; M2 spawner и M3 ATP HTTP-клиент будут async). Mock-only тесты в `tests/test_benchmark_runner.py` — 2 кейса: happy path с агрегацией tokens/cost и agent-error path (None ≠ 0 для отсутствия измерений). Цель M1 достигнута: API shape залочен, M2..M5 могут идти параллельно
