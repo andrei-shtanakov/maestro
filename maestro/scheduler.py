@@ -25,6 +25,7 @@ from maestro._vendor import obs
 from maestro.catalog import CatalogError, HarnessModelUnresolved
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.coordination.routing import (
+    IN_FLIGHT_STATUSES,
     STATIC_ROUTING_REASON,
     RoutingStrategy,
     StaticRouting,
@@ -476,6 +477,15 @@ class Scheduler:
         for task in pending:
             if delivered_count >= MAX_REATTEMPTS_PER_TICK:
                 break
+
+            # #69: an in-flight task (RUNNING/VALIDATING) is not a dangling
+            # outcome — reporting it here poisoned agent stats with phantom
+            # cancellations (masked pre-#65 by arbiter rejecting the then-
+            # "interrupted" status). In-flight stays reportable only via
+            # crash recovery; any other unexpected status still falls
+            # through to the invariant-violation logging below.
+            if task.status in IN_FLIGHT_STATUSES:
+                continue
 
             outcome_status = task_status_to_outcome_status(task.status)
             if outcome_status is None:

@@ -106,7 +106,10 @@ _STATUS_MAP: dict[TaskStatus, TaskOutcomeStatus | None] = {
     TaskStatus.AWAITING_APPROVAL: None,
 }
 
-_INTERRUPTED_STATES = frozenset({TaskStatus.RUNNING, TaskStatus.VALIDATING})
+#: In-flight statuses (#69): they map in _STATUS_MAP for CRASH RECOVERY
+#: only, where the dead process makes "interrupted" true. A live
+#: scheduler must never report them — the task is genuinely running.
+IN_FLIGHT_STATUSES = frozenset({TaskStatus.RUNNING, TaskStatus.VALIDATING})
 
 
 def interrupted_error_code(status: TaskStatus) -> str | None:
@@ -115,7 +118,7 @@ def interrupted_error_code(status: TaskStatus) -> str | None:
     The wire status says CANCELLED (contract enum, #65); this keeps the
     "interrupted mid-flight" signal in error_code for the learning loop.
     """
-    return "interrupted" if status in _INTERRUPTED_STATES else None
+    return "interrupted" if status in IN_FLIGHT_STATUSES else None
 
 
 def task_status_to_outcome_status(
