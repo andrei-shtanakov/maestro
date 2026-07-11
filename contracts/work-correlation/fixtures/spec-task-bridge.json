@@ -1,0 +1,13 @@
+{
+  "schema_version": "1",
+  "work_item_id": "auth-refactor/TASK-042",
+  "parent_work_item_id": "auth-refactor",
+  "status": "done",
+  "source_project": "spec-runner",
+  "source_local_id": "TASK-042",
+  "source_status": "success",
+  "source_locator": "workstreams/auth-refactor/spec",
+  "pipeline_id": null,
+  "trace_id": null,
+  "ts": "2026-07-11T12:00:00+00:00"
+}
