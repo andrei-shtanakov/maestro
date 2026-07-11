@@ -55,12 +55,18 @@ class TestRouteDecision:
 
 
 class TestTaskOutcomeStatus:
-    def test_values(self) -> None:
-        assert TaskOutcomeStatus.SUCCESS.value == "success"
-        assert TaskOutcomeStatus.FAILURE.value == "failure"
-        assert TaskOutcomeStatus.TIMEOUT.value == "timeout"
-        assert TaskOutcomeStatus.CANCELLED.value == "cancelled"
-        assert TaskOutcomeStatus.INTERRUPTED.value == "interrupted"
+    def test_values_pin_arbiter_contract_enum(self) -> None:
+        """Wire vocabulary must equal arbiter's report_outcome enum (#65).
+
+        arbiter rejects anything outside success|failure|timeout|cancelled;
+        adding a Maestro-internal value here reintroduces the bug.
+        """
+        assert {s.value for s in TaskOutcomeStatus} == {
+            "success",
+            "failure",
+            "timeout",
+            "cancelled",
+        }
 
 
 class TestTaskOutcome:

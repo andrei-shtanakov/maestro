@@ -21,7 +21,9 @@ def _cfg() -> ArbiterConfig:
 
 
 @pytest.mark.anyio
-async def test_running_task_with_decision_gets_interrupted_outcome(tmp_path) -> None:
+async def test_running_task_with_decision_reports_cancelled_interrupted(
+    tmp_path,
+) -> None:
     fake = FakeArbiterClient()
     await fake.start()
     routing = ArbiterRouting(client=fake, cfg=_cfg())
@@ -46,7 +48,10 @@ async def test_running_task_with_decision_gets_interrupted_outcome(tmp_path) -> 
         assert refetched.arbiter_outcome_reported_at is not None
 
         outcome_calls = [c for c in fake.calls if c.method == "report_outcome"]
-        assert outcome_calls[0].arguments["status"] == "interrupted"
+        # #65: the wire status must stay inside arbiter's enum; the
+        # interrupted nuance travels in error_code instead.
+        assert outcome_calls[0].arguments["status"] == "cancelled"
+        assert outcome_calls[0].arguments["error_code"] == "interrupted"
     finally:
         await db.close()
 
