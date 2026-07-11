@@ -46,3 +46,6 @@ spec/.executor-*
 
 # Git worktrees
 .worktrees/
+
+# Dev-scratch (repo-local _cowork_output, not shipped — matches arbiter/spec-runner)
+_cowork_output/
