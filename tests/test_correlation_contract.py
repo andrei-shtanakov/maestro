@@ -8,12 +8,14 @@ from pathlib import Path
 
 import jsonschema
 import pytest
+from pydantic import ValidationError
 
 from maestro.correlation import (
     PROJECTIONS,
     TERMINAL,
     UNIVERSAL_EXITS,
     CommonStatus,
+    WorkCorrelation,
     for_arbiter_outcome,
     for_maestro_task,
     for_spec_task,
@@ -132,6 +134,20 @@ def test_happy_path() -> None:
     ]
     for current, new in itertools.pairwise(path):
         assert is_valid_transition(current, new)
+
+
+# ------------------------------------------------------------ strictness
+
+
+def test_model_is_as_strict_as_schema() -> None:
+    """A record that passes the model must also pass schema.json."""
+    valid = for_maestro_task("t-1", TaskStatus.DONE).model_dump()
+    with pytest.raises(ValidationError):  # extra fields forbidden
+        WorkCorrelation.model_validate({**valid, "surprise": 1})
+    with pytest.raises(ValidationError):  # version pinned to "1"
+        WorkCorrelation.model_validate({**valid, "schema_version": "2"})
+    with pytest.raises(ValidationError):  # trace_id pattern enforced
+        WorkCorrelation.model_validate({**valid, "trace_id": "not-hex"})
 
 
 # --------------------------------------------------------------- builders

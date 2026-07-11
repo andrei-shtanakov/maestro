@@ -28,6 +28,7 @@
       "description": "Hierarchy link (e.g. spec-runner task -> owning Maestro workstream)."
     },
     "status": {
+      "type": "string",
       "enum": ["pending", "running", "needs_review", "done", "failed", "cancelled"],
       "description": "Minimal common enum. Universal exits: failed, cancelled. Recovery: pending. Surjective projection only — never a claim of semantic equivalence."
     },

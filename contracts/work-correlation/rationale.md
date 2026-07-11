@@ -1,8 +1,11 @@
 # WorkCorrelation v1 — rationale
 
-Contracts-roadmap phase 1 (RD-001). Canon narrative:
-`prograph-vault/authored/notes/2026-07-11-ai-dark-factory-consolidated-roadmap.md`;
-key audit: `.../2026-07-11-phase05-correlation-recon.md`.
+Contracts-roadmap phase 1 (RD-001). Background lives in the ecosystem
+knowledge base (the `prograph-vault` sibling repo of the polyrepo
+workspace — not part of this repository): notes
+`2026-07-11-ai-dark-factory-consolidated-roadmap.md` (canon narrative)
+and `2026-07-11-phase05-correlation-recon.md` (key audit). This document
+is self-contained; those references are optional deep background.
 
 ## What this is
 

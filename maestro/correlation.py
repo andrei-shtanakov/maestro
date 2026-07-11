@@ -10,8 +10,9 @@ minimal common enum, with `source_status` kept verbatim. arbiter's
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from maestro.models import ExecutorTaskStatus, TaskStatus, WorkstreamStatus
 
@@ -87,9 +88,16 @@ PROJECTIONS: dict[str, dict[str, CommonStatus]] = {
 
 
 class WorkCorrelation(BaseModel):
-    """One correlation record (see contract schema for field semantics)."""
+    """One correlation record (see contract schema for field semantics).
 
-    schema_version: str = SCHEMA_VERSION
+    Mirrors the JSON schema strictly (extra fields forbidden, version
+    pinned, trace_id pattern enforced) so a record that validates here
+    also validates against `schema.json`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
     work_item_id: str = Field(..., min_length=1)
     parent_work_item_id: str | None = None
     status: CommonStatus
@@ -98,7 +106,7 @@ class WorkCorrelation(BaseModel):
     source_status: str = Field(..., min_length=1)
     source_locator: str | None = None
     pipeline_id: str | None = None
-    trace_id: str | None = None
+    trace_id: str | None = Field(None, pattern=r"^[0-9a-f]{32}$")
     ts: str | None = None
 
 
