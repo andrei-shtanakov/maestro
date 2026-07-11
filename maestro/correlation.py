@@ -12,7 +12,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from maestro.models import ExecutorTaskStatus, TaskStatus, WorkstreamStatus
 
@@ -87,6 +87,72 @@ PROJECTIONS: dict[str, dict[str, CommonStatus]] = {
 }
 
 
+#: Which keys each EvidenceRef kind requires (mirrors the schema allOf).
+_EVIDENCE_REQUIRED: dict[str, tuple[str, ...]] = {
+    "trace": ("trace_id",),
+    "log": ("pipeline_id",),
+    "benchmark": ("run_id",),
+    "decision": ("decision_id",),
+    "artifact": ("project", "path"),
+}
+
+
+class EvidenceRef(BaseModel):
+    """Typed pointer to one piece of evidence (EvidenceRef v1).
+
+    Contract: `contracts/observability/evidence-ref.schema.json` (+ .md).
+    Kind-conditional requirements are enforced here exactly as in the
+    schema's allOf, so a ref valid here is valid against the schema.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["trace", "log", "benchmark", "decision", "artifact"]
+    trace_id: str | None = Field(None, pattern=r"^[0-9a-f]{32}$")
+    span_id: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
+    pipeline_id: str | None = None
+    run_id: str | None = None
+    decision_id: int | None = Field(None, ge=1)
+    project: str | None = None
+    path: str | None = None
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _kind_requirements(self) -> EvidenceRef:
+        missing = [
+            key for key in _EVIDENCE_REQUIRED[self.kind] if getattr(self, key) is None
+        ]
+        if missing:
+            msg = f"kind={self.kind!r} requires {missing}"
+            raise ValueError(msg)
+        return self
+
+
+def trace_evidence(trace_id: str, span_id: str | None = None) -> EvidenceRef:
+    """Pointer to a W3C trace (optionally narrowed to one span)."""
+    return EvidenceRef(kind="trace", trace_id=trace_id, span_id=span_id)
+
+
+def log_evidence(pipeline_id: str) -> EvidenceRef:
+    """Pointer to a Maestro session log directory (logs/<ULID>/)."""
+    return EvidenceRef(kind="log", pipeline_id=pipeline_id)
+
+
+def benchmark_evidence(run_id: str) -> EvidenceRef:
+    """Pointer to an arbiter benchmark_runs row."""
+    return EvidenceRef(kind="benchmark", run_id=run_id)
+
+
+def decision_evidence(decision_id: int) -> EvidenceRef:
+    """Pointer to an arbiter routing decision (PolicyDecisionRef id)."""
+    return EvidenceRef(kind="decision", decision_id=decision_id)
+
+
+def artifact_evidence(project: str, path: str, note: str | None = None) -> EvidenceRef:
+    """Pointer to a project-relative file in the owning repo."""
+    return EvidenceRef(kind="artifact", project=project, path=path, note=note)
+
+
 class WorkCorrelation(BaseModel):
     """One correlation record (see contract schema for field semantics).
 
@@ -108,6 +174,7 @@ class WorkCorrelation(BaseModel):
     pipeline_id: str | None = None
     trace_id: str | None = Field(None, pattern=r"^[0-9a-f]{32}$")
     ts: str | None = None
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list)
 
 
 def project_status(vocabulary: str, source_status: str) -> CommonStatus:

@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/andrei-shtanakov/Maestro/contracts/work-correlation/schema.json",
   "title": "WorkCorrelation v1",
-  "description": "Thin cross-project correlation record. Maestro mints work_item_id (its own task/workstream id, inherited by consumers verbatim); status is a lossy surjective projection of the source vocabulary onto a minimal common enum, with source_status kept verbatim for auditability. See rationale.md. evidence_refs is deliberately absent from v1 (contracts roadmap phase 3).",
+  "description": "Thin cross-project correlation record. Maestro mints work_item_id (its own task/workstream id, inherited by consumers verbatim); status is a lossy surjective projection of the source vocabulary onto a minimal common enum, with source_status kept verbatim for auditability. See rationale.md. evidence_refs[] carries typed evidence pointers (EvidenceRef v1, roadmap phase 3).",
   "type": "object",
   "required": [
     "schema_version",
@@ -24,12 +24,22 @@
       "description": "Cross-project join key. Minted by Maestro (= task.id / workstream.id). Derived deterministically for children: '<parent_work_item_id>/<source_local_id>'."
     },
     "parent_work_item_id": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "Hierarchy link (e.g. spec-runner task -> owning Maestro workstream)."
     },
     "status": {
       "type": "string",
-      "enum": ["pending", "running", "needs_review", "done", "failed", "cancelled"],
+      "enum": [
+        "pending",
+        "running",
+        "needs_review",
+        "done",
+        "failed",
+        "cancelled"
+      ],
       "description": "Minimal common enum. Universal exits: failed, cancelled. Recovery: pending. Surjective projection only — never a claim of semantic equivalence."
     },
     "source_project": {
@@ -48,21 +58,199 @@
       "description": "Local status VERBATIM. Without it the projection loses auditability."
     },
     "source_locator": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "Disambiguates local ids that are not globally unique (e.g. spec_dir for spec-runner TASK-nnn)."
     },
     "pipeline_id": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "Run context: Maestro session ULID (= logs/<ULID>/ directory name)."
     },
     "trace_id": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "pattern": "^[0-9a-f]{32}$",
       "description": "W3C trace id from the observability contract."
     },
     "ts": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "ISO 8601 timestamp of the source record."
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/evidence_ref"
+      },
+      "description": "Typed pointers to evidence about this work item (added in roadmap phase 3, additive pre-adoption). Canonical shape: contracts/observability/evidence-ref.schema.json; the inline definition below is kept byte-equal by a sync test."
+    }
+  },
+  "definitions": {
+    "evidence_ref": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "trace",
+            "log",
+            "benchmark",
+            "decision",
+            "artifact"
+          ],
+          "description": "What the pointer refers to; drives which keys are required (see evidence-ref.md)."
+        },
+        "trace_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{32}$",
+          "description": "W3C trace id (kind=trace: required)."
+        },
+        "span_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{16}$",
+          "description": "W3C span id (kind=trace: optional narrowing)."
+        },
+        "pipeline_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Maestro session ULID = logs/<ULID>/ directory (kind=log: required)."
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "benchmark_runs primary key (kind=benchmark: required)."
+        },
+        "decision_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "PolicyDecisionRef decision id (kind=decision: required)."
+        },
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Owning project for kind=artifact paths."
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Project-relative path (kind=artifact: required; never absolute)."
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional free-text hint for humans; never machine-parsed."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "trace"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "kind",
+              "trace_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "log"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "kind",
+              "pipeline_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "benchmark"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "kind",
+              "run_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "decision"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "kind",
+              "decision_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "artifact"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "kind",
+              "project",
+              "path"
+            ]
+          }
+        }
+      ]
     }
   }
 }

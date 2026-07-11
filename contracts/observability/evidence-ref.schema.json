@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/andrei-shtanakov/Maestro/contracts/observability/evidence-ref.schema.json",
+  "title": "EvidenceRef v1",
+  "description": "Typed pointer to one piece of evidence about a work item (contracts roadmap phase 3, RD-003). Built on top of the keys the graduated observability contract already mints — trace_id/span_id (W3C), pipeline_id (Maestro session ULID), run_id (report_benchmark), decision_id (PolicyDecisionRef). See evidence-ref.md for kind semantics and required-key matrix.",
+  "type": "object",
+  "required": ["kind"],
+  "additionalProperties": false,
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": ["trace", "log", "benchmark", "decision", "artifact"],
+      "description": "What the pointer refers to; drives which keys are required (see evidence-ref.md)."
+    },
+    "trace_id": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "W3C trace id (kind=trace: required)."
+    },
+    "span_id": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{16}$",
+      "description": "W3C span id (kind=trace: optional narrowing)."
+    },
+    "pipeline_id": {
+      "type": ["string", "null"],
+      "description": "Maestro session ULID = logs/<ULID>/ directory (kind=log: required)."
+    },
+    "run_id": {
+      "type": ["string", "null"],
+      "description": "benchmark_runs primary key (kind=benchmark: required)."
+    },
+    "decision_id": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "PolicyDecisionRef decision id (kind=decision: required)."
+    },
+    "project": {
+      "type": ["string", "null"],
+      "description": "Owning project for kind=artifact paths."
+    },
+    "path": {
+      "type": ["string", "null"],
+      "description": "Project-relative path (kind=artifact: required; never absolute)."
+    },
+    "note": {
+      "type": ["string", "null"],
+      "description": "Optional free-text hint for humans; never machine-parsed."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "trace" } } },
+      "then": { "required": ["kind", "trace_id"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "log" } } },
+      "then": { "required": ["kind", "pipeline_id"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "benchmark" } } },
+      "then": { "required": ["kind", "run_id"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "decision" } } },
+      "then": { "required": ["kind", "decision_id"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "artifact" } } },
+      "then": { "required": ["kind", "project", "path"] }
+    }
+  ]
+}

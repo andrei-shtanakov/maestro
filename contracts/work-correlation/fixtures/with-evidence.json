@@ -1,0 +1,20 @@
+{
+  "schema_version": "1",
+  "work_item_id": "tui-roadmap-tab",
+  "status": "done",
+  "source_project": "maestro",
+  "source_local_id": "tui-roadmap-tab",
+  "source_status": "done",
+  "pipeline_id": "01KX8VDTBHBFP1RY3R9DVJK9FC",
+  "ts": "2026-07-11T16:54:07+00:00",
+  "evidence_refs": [
+    { "kind": "decision", "decision_id": 23 },
+    { "kind": "log", "pipeline_id": "01KX8VDTBHBFP1RY3R9DVJK9FC" },
+    {
+      "kind": "artifact",
+      "project": "dispatcher",
+      "path": "dispatcher/tui/app.py",
+      "note": "L2 experiment change"
+    }
+  ]
+}
