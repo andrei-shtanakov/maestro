@@ -86,10 +86,19 @@ needs to surface.
 policy-decision vocabulary, not a work-item lifecycle — it belongs to
 `PolicyDecisionRef v1` (roadmap phase 2).
 
+## Evidence pointers (added in phase 3)
+
+`evidence_refs[]` was deliberately absent from the phase-1 cut (it would
+have pointed into a vacuum) and arrived with `EvidenceRef v1`
+(`contracts/observability/evidence-ref.md`). The field is optional; the
+inline `definitions/evidence_ref` is a structurally identical copy of
+the canonical schema (parsed-JSON equality, top-level metadata excluded),
+guarded by a sync test. Adding the optional field pre-adoption is
+additive (no consumer had vendored the phase-1 file); post-adoption the
+same change would have required a version bump.
+
 ## Deliberately absent from v1
 
-- `evidence_refs[]` — arrives in phase 3 on top of the graduated
-  observability contract; adding it now would point into a vacuum.
 - Any transport/emitter mandate. v1 is the record shape plus the projection;
   consumers may compute records read-side (as dispatcher `/api/work-items`
   already does) without any project emitting anything new.
