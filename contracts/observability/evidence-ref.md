@@ -29,7 +29,8 @@ The conditional requirements are enforced in the schema (`allOf`/`if`).
 this phase; it was deliberately absent from the phase-1 cut so it would not
 point into a vacuum before this contract existed). The inline
 `evidence_ref` definition in `contracts/work-correlation/schema.json` is a
-byte-equal copy of this schema's object shape — a sync test in
+structurally identical copy of this schema's object shape (parsed-JSON
+equality, top-level metadata keys excluded) — a sync test in
 `tests/test_correlation_contract.py` keeps the two from drifting.
 
 Adding an optional field pre-adoption is treated as additive: no consumer

@@ -207,6 +207,16 @@ def test_evidence_kind_requirements_enforced(kind: str, kwargs: dict) -> None:
     assert errors, f"schema must also reject {payload}"
 
 
+@pytest.mark.parametrize("bad_path", ["/etc/passwd", "../secret", "a/../b"])
+def test_artifact_path_safety_enforced(bad_path: str) -> None:
+    """Absolute and ..-escaping artifact paths fail in model AND schema."""
+    with pytest.raises(ValidationError, match="project-relative"):
+        artifact_evidence("dispatcher", bad_path)
+    payload = {"kind": "artifact", "project": "dispatcher", "path": bad_path}
+    errors = list(jsonschema.Draft7Validator(_EVIDENCE_SCHEMA).iter_errors(payload))
+    assert errors, f"schema must also reject {bad_path}"
+
+
 def test_work_correlation_carries_evidence_refs() -> None:
     record = for_maestro_task("tui-roadmap-tab", TaskStatus.DONE)
     record = record.model_copy(update={"evidence_refs": [decision_evidence(23)]})

@@ -91,7 +91,7 @@
       "items": {
         "$ref": "#/definitions/evidence_ref"
       },
-      "description": "Typed pointers to evidence about this work item (added in roadmap phase 3, additive pre-adoption). Canonical shape: contracts/observability/evidence-ref.schema.json; the inline definition below is kept byte-equal by a sync test."
+      "description": "Typed pointers to evidence about this work item (added in roadmap phase 3, additive pre-adoption). Canonical shape: contracts/observability/evidence-ref.schema.json; the inline definition below is kept structurally identical (parsed-JSON equality, top-level metadata excluded) by a sync test."
     }
   },
   "definitions": {
@@ -163,7 +163,8 @@
             "string",
             "null"
           ],
-          "description": "Project-relative path (kind=artifact: required; never absolute)."
+          "pattern": "^(?!/)(?!\\.\\.(/|$))(?!.*/\\.\\.(/|$)).+$",
+          "description": "Project-relative path (kind=artifact: required). Absolute paths and `..` segments are rejected by the pattern — dereferencers must never be steered outside the owning repo."
         },
         "note": {
           "type": [

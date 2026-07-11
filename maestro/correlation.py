@@ -125,6 +125,11 @@ class EvidenceRef(BaseModel):
         if missing:
             msg = f"kind={self.kind!r} requires {missing}"
             raise ValueError(msg)
+        if self.path is not None:
+            parts = self.path.split("/")
+            if self.path.startswith("/") or ".." in parts:
+                msg = f"path must be project-relative without '..': {self.path!r}"
+                raise ValueError(msg)
         return self
 
 
