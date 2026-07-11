@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/andrei-shtanakov/Maestro/contracts/work-correlation/schema.json",
+  "title": "WorkCorrelation v1",
+  "description": "Thin cross-project correlation record. Maestro mints work_item_id (its own task/workstream id, inherited by consumers verbatim); status is a lossy surjective projection of the source vocabulary onto a minimal common enum, with source_status kept verbatim for auditability. See rationale.md. evidence_refs is deliberately absent from v1 (contracts roadmap phase 3).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "work_item_id",
+    "status",
+    "source_project",
+    "source_local_id",
+    "source_status"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1",
+      "description": "WorkCorrelation contract version."
+    },
+    "work_item_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Cross-project join key. Minted by Maestro (= task.id / workstream.id). Derived deterministically for children: '<parent_work_item_id>/<source_local_id>'."
+    },
+    "parent_work_item_id": {
+      "type": ["string", "null"],
+      "description": "Hierarchy link (e.g. spec-runner task -> owning Maestro workstream)."
+    },
+    "status": {
+      "enum": ["pending", "running", "needs_review", "done", "failed", "cancelled"],
+      "description": "Minimal common enum. Universal exits: failed, cancelled. Recovery: pending. Surjective projection only — never a claim of semantic equivalence."
+    },
+    "source_project": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Project owning the local record (e.g. maestro, spec-runner, arbiter)."
+    },
+    "source_local_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Local id verbatim (e.g. Maestro task.id, spec-runner TASK-nnn)."
+    },
+    "source_status": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Local status VERBATIM. Without it the projection loses auditability."
+    },
+    "source_locator": {
+      "type": ["string", "null"],
+      "description": "Disambiguates local ids that are not globally unique (e.g. spec_dir for spec-runner TASK-nnn)."
+    },
+    "pipeline_id": {
+      "type": ["string", "null"],
+      "description": "Run context: Maestro session ULID (= logs/<ULID>/ directory name)."
+    },
+    "trace_id": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "W3C trace id from the observability contract."
+    },
+    "ts": {
+      "type": ["string", "null"],
+      "description": "ISO 8601 timestamp of the source record."
+    }
+  }
+}

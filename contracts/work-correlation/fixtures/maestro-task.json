@@ -1,0 +1,13 @@
+{
+  "schema_version": "1",
+  "work_item_id": "corr-demo-note-2",
+  "parent_work_item_id": null,
+  "status": "done",
+  "source_project": "maestro",
+  "source_local_id": "corr-demo-note-2",
+  "source_status": "done",
+  "source_locator": null,
+  "pipeline_id": "01KX8V7Z9DHBKYWGSN2KTWM8AB",
+  "trace_id": "b11462b5fa030af9b11462b5fa030af9",
+  "ts": "2026-07-11T15:02:46+00:00"
+}

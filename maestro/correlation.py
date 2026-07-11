@@ -1,0 +1,210 @@
+"""WorkCorrelation v1 — reference implementation of the contract.
+
+Contract: `contracts/work-correlation/schema.json` (+ rationale.md).
+Maestro mints `work_item_id` (its own task/workstream id); `status` is a
+surjective, deliberately lossy projection of each source vocabulary onto a
+minimal common enum, with `source_status` kept verbatim. arbiter's
+`decisions.action` vocabulary is out of scope (PolicyDecisionRef, phase 2).
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+
+from pydantic import BaseModel, Field
+
+from maestro.models import ExecutorTaskStatus, TaskStatus, WorkstreamStatus
+
+
+SCHEMA_VERSION = "1"
+
+
+class CommonStatus(StrEnum):
+    """Minimal common status enum of the WorkCorrelation contract."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    NEEDS_REVIEW = "needs_review"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+#: Reachable from any non-terminal state.
+UNIVERSAL_EXITS = frozenset({CommonStatus.FAILED, CommonStatus.CANCELLED})
+#: Where recovery (retry) re-enters.
+RECOVERY = CommonStatus.PENDING
+#: No transitions out.
+TERMINAL = frozenset({CommonStatus.DONE, CommonStatus.CANCELLED})
+
+_TRANSITIONS: dict[CommonStatus, frozenset[CommonStatus]] = {
+    CommonStatus.PENDING: frozenset({CommonStatus.RUNNING, CommonStatus.NEEDS_REVIEW}),
+    CommonStatus.RUNNING: frozenset({CommonStatus.DONE, CommonStatus.NEEDS_REVIEW}),
+    CommonStatus.NEEDS_REVIEW: frozenset({RECOVERY}),
+    CommonStatus.FAILED: frozenset({RECOVERY}),
+    CommonStatus.DONE: frozenset(),
+    CommonStatus.CANCELLED: frozenset(),
+}
+
+PROJECTIONS: dict[str, dict[str, CommonStatus]] = {
+    "maestro.task": {
+        TaskStatus.PENDING: CommonStatus.PENDING,
+        TaskStatus.READY: CommonStatus.PENDING,
+        TaskStatus.AWAITING_APPROVAL: CommonStatus.NEEDS_REVIEW,
+        TaskStatus.RUNNING: CommonStatus.RUNNING,
+        TaskStatus.VALIDATING: CommonStatus.RUNNING,
+        TaskStatus.DONE: CommonStatus.DONE,
+        TaskStatus.FAILED: CommonStatus.FAILED,
+        TaskStatus.NEEDS_REVIEW: CommonStatus.NEEDS_REVIEW,
+        TaskStatus.ABANDONED: CommonStatus.CANCELLED,
+    },
+    "maestro.workstream": {
+        WorkstreamStatus.PENDING: CommonStatus.PENDING,
+        WorkstreamStatus.READY: CommonStatus.PENDING,
+        WorkstreamStatus.DECOMPOSING: CommonStatus.RUNNING,
+        WorkstreamStatus.RUNNING: CommonStatus.RUNNING,
+        WorkstreamStatus.MERGING: CommonStatus.RUNNING,
+        WorkstreamStatus.PR_CREATED: CommonStatus.NEEDS_REVIEW,
+        WorkstreamStatus.DONE: CommonStatus.DONE,
+        WorkstreamStatus.FAILED: CommonStatus.FAILED,
+        WorkstreamStatus.NEEDS_REVIEW: CommonStatus.NEEDS_REVIEW,
+        WorkstreamStatus.ABANDONED: CommonStatus.CANCELLED,
+    },
+    "spec-runner.task": {
+        ExecutorTaskStatus.PENDING: CommonStatus.PENDING,
+        ExecutorTaskStatus.RUNNING: CommonStatus.RUNNING,
+        ExecutorTaskStatus.SUCCESS: CommonStatus.DONE,
+        ExecutorTaskStatus.FAILED: CommonStatus.FAILED,
+        ExecutorTaskStatus.SKIPPED: CommonStatus.CANCELLED,
+    },
+    "arbiter.outcome": {
+        "success": CommonStatus.DONE,
+        "failure": CommonStatus.FAILED,
+        "timeout": CommonStatus.FAILED,
+        "cancelled": CommonStatus.CANCELLED,
+    },
+}
+
+
+class WorkCorrelation(BaseModel):
+    """One correlation record (see contract schema for field semantics)."""
+
+    schema_version: str = SCHEMA_VERSION
+    work_item_id: str = Field(..., min_length=1)
+    parent_work_item_id: str | None = None
+    status: CommonStatus
+    source_project: str = Field(..., min_length=1)
+    source_local_id: str = Field(..., min_length=1)
+    source_status: str = Field(..., min_length=1)
+    source_locator: str | None = None
+    pipeline_id: str | None = None
+    trace_id: str | None = None
+    ts: str | None = None
+
+
+def project_status(vocabulary: str, source_status: str) -> CommonStatus:
+    """Project a source-local status onto the common enum.
+
+    Raises ValueError for an unknown vocabulary or status — vocabulary
+    drift must fail loudly (cf. Maestro #65), not silently mis-project.
+    """
+    table = PROJECTIONS.get(vocabulary)
+    if table is None:
+        raise ValueError(f"unknown status vocabulary: {vocabulary!r}")
+    common = table.get(source_status)
+    if common is None:
+        raise ValueError(f"unknown {vocabulary} status: {source_status!r}")
+    return common
+
+
+def is_valid_transition(current: CommonStatus, new: CommonStatus) -> bool:
+    """Check the common-enum transition table (with universal exits)."""
+    if current in TERMINAL:
+        return False
+    if new in UNIVERSAL_EXITS:
+        return True
+    return new in _TRANSITIONS[current]
+
+
+def for_maestro_task(
+    task_id: str,
+    status: TaskStatus | str,
+    *,
+    pipeline_id: str | None = None,
+    trace_id: str | None = None,
+    ts: str | None = None,
+) -> WorkCorrelation:
+    """Correlation record for a Maestro task (work_item_id = task.id)."""
+    return WorkCorrelation(
+        work_item_id=task_id,
+        status=project_status("maestro.task", str(status)),
+        source_project="maestro",
+        source_local_id=task_id,
+        source_status=str(status),
+        pipeline_id=pipeline_id,
+        trace_id=trace_id,
+        ts=ts,
+    )
+
+
+def for_workstream(
+    workstream_id: str,
+    status: WorkstreamStatus | str,
+    *,
+    pipeline_id: str | None = None,
+    ts: str | None = None,
+) -> WorkCorrelation:
+    """Correlation record for a Maestro workstream."""
+    return WorkCorrelation(
+        work_item_id=workstream_id,
+        status=project_status("maestro.workstream", str(status)),
+        source_project="maestro",
+        source_local_id=workstream_id,
+        source_status=str(status),
+        pipeline_id=pipeline_id,
+        ts=ts,
+    )
+
+
+def for_spec_task(
+    parent_work_item_id: str,
+    spec_dir: str,
+    task_id: str,
+    status: ExecutorTaskStatus | str,
+    *,
+    ts: str | None = None,
+) -> WorkCorrelation:
+    """Spec↔DAG bridge: spec-runner TASK-nnn under its owning workstream.
+
+    spec-runner ids are only unique per spec dir, so the child key is
+    derived deterministically from the parent and the locator is kept.
+    """
+    return WorkCorrelation(
+        work_item_id=f"{parent_work_item_id}/{task_id}",
+        parent_work_item_id=parent_work_item_id,
+        status=project_status("spec-runner.task", str(status)),
+        source_project="spec-runner",
+        source_local_id=task_id,
+        source_status=str(status),
+        source_locator=spec_dir,
+        ts=ts,
+    )
+
+
+def for_arbiter_outcome(
+    task_id: str,
+    status: str,
+    *,
+    pipeline_id: str | None = None,
+    ts: str | None = None,
+) -> WorkCorrelation:
+    """Correlation record for an arbiter outcome (same join key)."""
+    return WorkCorrelation(
+        work_item_id=task_id,
+        status=project_status("arbiter.outcome", status),
+        source_project="arbiter",
+        source_local_id=task_id,
+        source_status=status,
+        pipeline_id=pipeline_id,
+        ts=ts,
+    )
