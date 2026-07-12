@@ -18,6 +18,12 @@
   `GatesConfig`, preflight checks `gates-steward-missing` /
   `gates-risk-model-missing`, and a legal READY→NEEDS_REVIEW workstream
   transition. No behavior change when `gates:` is absent.
+- **EvidenceRef `kind: gate-verdict` (WS-006 handoff M-4):** typed pointer to
+  one gate verdict-record in `logs/<ULID>/gate_verdicts.jsonl`, addressed by
+  `pipeline_id` + `gate_id` + full 40-hex `sha` (verdicts are SHA-bound).
+  Pre-adoption additive change to `contracts/observability/evidence-ref.schema.json`
+  with the WorkCorrelation inline copy kept in sync; new builder
+  `gate_verdict_evidence()` in `maestro/correlation.py`.
 - **`maestro validate <project.yaml>` (preflight, Mode 2):** static and
   filesystem checks over an orchestrator config before a run — dependency
   cycles (`dag-cycle`, error) via the shared `dag.find_cycle`, scope overlap

@@ -19,9 +19,20 @@ dereferencing stays with the owner of the underlying store.
 | `benchmark` | `run_id` | `benchmark_runs` row | arbiter (`report_benchmark`) |
 | `decision` | `decision_id` | decisions row / PolicyDecisionRef | arbiter (`contracts/policy-decision-ref/`) |
 | `artifact` | `project` + `path` | file in the owning repo (project-relative, never absolute) | that project |
+| `gate-verdict` | `pipeline_id` + `gate_id` + `sha` | one verdict-record in `logs/<ULID>/gate_verdicts.jsonl` | Maestro (gates runtime, WS-006) |
 
 The conditional requirements are enforced in the schema (`allOf`/`if`).
 `note` is a human hint and must never be machine-parsed.
+
+`gate-verdict` was added 2026-07-12 (steward WS-006 handoff, item M-4): a
+precise pointer to one gate evaluation instead of the whole run directory
+the `log` kind offers. Verdicts are SHA-bound (a new commit invalidates
+them), hence the required full 40-hex `sha`. The addition is treated as
+pre-adoption additive — at the time of the change no consumer had vendored
+this schema (checked across the ecosystem; dispatcher computes correlation
+read-side and does not validate refs) — the same rule applied when
+`evidence_refs[]` itself was added to WorkCorrelation. Post-adoption, a new
+kind would require a version bump.
 
 ## Relation to WorkCorrelation
 
