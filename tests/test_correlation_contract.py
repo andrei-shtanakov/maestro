@@ -266,7 +266,7 @@ def test_gate_verdict_requires_pipeline_gate_and_sha() -> None:
         {"kind": "gate-verdict", "pipeline_id": _ULID, "gate_id": "g"},  # no sha
     ):
         with pytest.raises(ValidationError):
-            EvidenceRef(**payload)
+            EvidenceRef.model_validate(payload)
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate(payload, _EVIDENCE_SCHEMA)
 
