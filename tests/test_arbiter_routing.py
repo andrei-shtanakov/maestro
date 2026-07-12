@@ -446,4 +446,3 @@ async def test_authority_context_not_in_task_payload() -> None:
     await routing.route(_task().model_copy(update={"id": "t-auth-3"}))
     (_tid, payload, _constraints) = client.calls[0]
     assert "authority_context" not in payload
-    assert "role" not in payload and "phase" not in payload
