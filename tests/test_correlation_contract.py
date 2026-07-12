@@ -244,7 +244,6 @@ _ULID = "01KX8V7Z9DHBKYWGSN2KTWM8AB"
 _SHA = "a" * 40
 
 
-
 _NULL_SAMPLE: dict = {
     "trace_id": "a" * 32,
     "pipeline_id": _ULID,
