@@ -233,3 +233,46 @@ def test_spec_task_bridge_derives_child_key() -> None:
     assert record.source_locator == "workstreams/ws-1/spec"
     assert record.source_status == "success"  # verbatim
     assert record.status == CommonStatus.DONE  # projected
+
+
+# ---------------------------------------------------------------- gate-verdict (M-4, WS-006 handoff)
+
+_EVIDENCE_SCHEMA = json.loads(
+    (
+        Path(__file__).parent.parent
+        / "contracts"
+        / "observability"
+        / "evidence-ref.schema.json"
+    ).read_text()
+)
+
+_ULID = "01KX8V7Z9DHBKYWGSN2KTWM8AB"
+_SHA = "a" * 40
+
+
+def test_gate_verdict_builder_produces_schema_valid_ref() -> None:
+    from maestro.correlation import gate_verdict_evidence
+
+    ref = gate_verdict_evidence(_ULID, "steward.gate_check", _SHA)
+    jsonschema.validate(ref.model_dump(exclude_none=True), _EVIDENCE_SCHEMA)
+    assert ref.kind == "gate-verdict"
+
+
+def test_gate_verdict_requires_pipeline_gate_and_sha() -> None:
+    # Model and schema must agree on the required-key set.
+    for payload in (
+        {"kind": "gate-verdict", "gate_id": "g", "sha": _SHA},  # no pipeline_id
+        {"kind": "gate-verdict", "pipeline_id": _ULID, "sha": _SHA},  # no gate_id
+        {"kind": "gate-verdict", "pipeline_id": _ULID, "gate_id": "g"},  # no sha
+    ):
+        with pytest.raises(ValidationError):
+            EvidenceRef(**payload)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(payload, _EVIDENCE_SCHEMA)
+
+
+def test_gate_verdict_sha_must_be_full_hex() -> None:
+    from maestro.correlation import gate_verdict_evidence
+
+    with pytest.raises(ValidationError):
+        gate_verdict_evidence(_ULID, "steward.gate_check", "abc123")

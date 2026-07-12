@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/andrei-shtanakov/Maestro/contracts/observability/evidence-ref.schema.json",
   "title": "EvidenceRef v1",
-  "description": "Typed pointer to one piece of evidence about a work item (contracts roadmap phase 3, RD-003). Built on top of the keys the graduated observability contract already mints — trace_id/span_id (W3C), pipeline_id (Maestro session ULID), run_id (report_benchmark), decision_id (PolicyDecisionRef). See evidence-ref.md for kind semantics and required-key matrix.",
+  "description": "Typed pointer to one piece of evidence about a work item (contracts roadmap phase 3, RD-003). Built on top of the keys the graduated observability contract already mints \u2014 trace_id/span_id (W3C), pipeline_id (Maestro session ULID), run_id (report_benchmark), decision_id (PolicyDecisionRef). See evidence-ref.md for kind semantics and required-key matrix. kind=gate-verdict added 2026-07-12 (WS-006 handoff M-4, pre-adoption additive).",
   "type": "object",
   "required": [
     "kind"
@@ -16,7 +16,8 @@
         "log",
         "benchmark",
         "decision",
-        "artifact"
+        "artifact",
+        "gate-verdict"
       ],
       "description": "What the pointer refers to; drives which keys are required (see evidence-ref.md)."
     },
@@ -71,7 +72,22 @@
         "null"
       ],
       "pattern": "^(?!/)(?!\\.\\.(/|$))(?!.*/\\.\\.(/|$)).+$",
-      "description": "Project-relative path (kind=artifact: required). Absolute paths and `..` segments are rejected by the pattern — dereferencers must never be steered outside the owning repo."
+      "description": "Project-relative path (kind=artifact: required). Absolute paths and `..` segments are rejected by the pattern \u2014 dereferencers must never be steered outside the owning repo."
+    },
+    "gate_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Gate identifier the verdict was recorded for (kind=gate-verdict: required)."
+    },
+    "sha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full commit SHA the verdict is bound to (kind=gate-verdict: required; WS-006 DESIGN-608 \u2014 a new commit invalidates verdicts)."
     },
     "note": {
       "type": [
@@ -155,6 +171,23 @@
           "kind",
           "project",
           "path"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "gate-verdict"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "kind",
+          "pipeline_id",
+          "gate_id",
+          "sha"
         ]
       }
     }

@@ -40,7 +40,7 @@
         "failed",
         "cancelled"
       ],
-      "description": "Minimal common enum. Universal exits: failed, cancelled. Recovery: pending. Surjective projection only — never a claim of semantic equivalence."
+      "description": "Minimal common enum. Universal exits: failed, cancelled. Recovery: pending. Surjective projection only \u2014 never a claim of semantic equivalence."
     },
     "source_project": {
       "type": "string",
@@ -109,7 +109,8 @@
             "log",
             "benchmark",
             "decision",
-            "artifact"
+            "artifact",
+            "gate-verdict"
           ],
           "description": "What the pointer refers to; drives which keys are required (see evidence-ref.md)."
         },
@@ -164,7 +165,22 @@
             "null"
           ],
           "pattern": "^(?!/)(?!\\.\\.(/|$))(?!.*/\\.\\.(/|$)).+$",
-          "description": "Project-relative path (kind=artifact: required). Absolute paths and `..` segments are rejected by the pattern — dereferencers must never be steered outside the owning repo."
+          "description": "Project-relative path (kind=artifact: required). Absolute paths and `..` segments are rejected by the pattern \u2014 dereferencers must never be steered outside the owning repo."
+        },
+        "gate_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Gate identifier the verdict was recorded for (kind=gate-verdict: required)."
+        },
+        "sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "Full commit SHA the verdict is bound to (kind=gate-verdict: required; WS-006 DESIGN-608 \u2014 a new commit invalidates verdicts)."
         },
         "note": {
           "type": [
@@ -248,6 +264,23 @@
               "kind",
               "project",
               "path"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "gate-verdict"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "kind",
+              "pipeline_id",
+              "gate_id",
+              "sha"
             ]
           }
         }
