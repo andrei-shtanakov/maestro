@@ -19,6 +19,7 @@ from pathlib import Path
 from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
+from maestro.gates import GateDecision, GateKeeper, pipeline_log_dir
 from maestro.git import GitError, MergeConflictError
 from maestro.merge_logs import merge_logs_dir
 from maestro.models import (
@@ -140,6 +141,15 @@ class Orchestrator:
         self._pr_manager = pr_manager
         self._config = config
         self._log_dir = log_dir or Path(config.repo_path).expanduser() / "logs"
+        self._gates: GateKeeper | None = None
+        if config.gates is not None:
+            self._gates = GateKeeper(
+                config.gates,
+                project=config.project,
+                repo_path=Path(config.repo_path).expanduser(),
+                base_branch=config.base_branch,
+                log_dir=pipeline_log_dir(),
+            )
 
         self._running: dict[str, RunningWorkstream] = {}
         self._generating: dict[str, asyncio.Task[None]] = {}
@@ -589,6 +599,13 @@ class Orchestrator:
 
         # Transition to READY then RUNNING
         await self._db.update_workstream_status(workstream_id, WorkstreamStatus.READY)
+
+        # Gates (WS-006): ex-ante guard over the declared scope. A block
+        # routes to NEEDS_REVIEW; the operator re-queueing it approves the
+        # gate for this exact repo SHA (see maestro/gates.py).
+        if not await self._gate_ex_ante(workstream_id, workstream):
+            return
+
         await self._db.update_workstream_status(
             workstream_id,
             WorkstreamStatus.RUNNING,
@@ -797,6 +814,67 @@ class Orchestrator:
             subtask_progress=state.progress_label(),
         )
 
+    async def _gate_ex_ante(self, workstream_id: str, workstream: Workstream) -> bool:
+        """Evaluate the ex-ante gate; on block route READY -> NEEDS_REVIEW."""
+        if self._gates is None:
+            return True
+        decision = await self._gates.evaluate_ex_ante(
+            workstream_id, workstream.scope, prior_error=workstream.error_message
+        )
+        if decision.allow:
+            return True
+        await self._route_gate_block(
+            workstream_id, decision, expected=WorkstreamStatus.READY
+        )
+        return False
+
+    async def _gate_ex_post(
+        self,
+        workstream_id: str,
+        workstream: Workstream,
+        running: RunningWorkstream,
+    ) -> bool:
+        """Evaluate the ex-post gate; on block route RUNNING -> FAILED -> NEEDS_REVIEW."""
+        if self._gates is None:
+            return True
+        decision = await self._gates.evaluate_ex_post(
+            workstream_id,
+            workstream.scope,
+            workspace=running.workspace_path,
+            prior_error=workstream.error_message,
+        )
+        if decision.allow:
+            return True
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.FAILED,
+            expected_status=WorkstreamStatus.RUNNING,
+            error_message=decision.reason,
+        )
+        await self._route_gate_block(
+            workstream_id, decision, expected=WorkstreamStatus.FAILED
+        )
+        self._stats.failed += 1
+        # Leave the workspace intact so a human can inspect the diff.
+        return False
+
+    async def _route_gate_block(
+        self,
+        workstream_id: str,
+        decision: GateDecision,
+        *,
+        expected: WorkstreamStatus,
+    ) -> None:
+        self._logger.warning(
+            "Gates blocked workstream '%s': %s", workstream_id, decision.reason
+        )
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.NEEDS_REVIEW,
+            expected_status=expected,
+            error_message=decision.reason,
+        )
+
     async def _handle_completion(
         self,
         workstream_id: str,
@@ -831,6 +909,11 @@ class Orchestrator:
         Push branch, create PR, cleanup workspace.
         """
         workstream = await self._db.get_workstream(workstream_id)
+
+        # Gates (WS-006): ex-post guard over the actual diff (catches scope
+        # violations and tier escalations the declared scope did not show).
+        if not await self._gate_ex_post(workstream_id, workstream, _running):
+            return
 
         # Transition to MERGING
         await self._db.update_workstream_status(

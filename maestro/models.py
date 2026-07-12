@@ -9,7 +9,7 @@ orchestration with workstreams (independent work units).
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -952,7 +952,7 @@ class WorkstreamStatus(StrEnum):
         return {
             cls.PENDING: {cls.DECOMPOSING, cls.READY},
             cls.DECOMPOSING: {cls.READY, cls.FAILED},
-            cls.READY: {cls.RUNNING, cls.ABANDONED},
+            cls.READY: {cls.RUNNING, cls.NEEDS_REVIEW, cls.ABANDONED},
             cls.RUNNING: {cls.MERGING, cls.FAILED},
             cls.MERGING: {cls.PR_CREATED, cls.FAILED},
             cls.PR_CREATED: {cls.DONE, cls.FAILED},
@@ -1296,6 +1296,35 @@ class ExecutorState(BaseModel):
         return f"{self.done}/{self.total} done"
 
 
+class GatesConfig(BaseModel):
+    """Gates-in-DAG guard config (WS-006 skeleton, steward DESIGN-611). Opt-in.
+
+    When present, the orchestrator evaluates risk gates at two transition
+    edges — ex-ante before READY -> RUNNING (declared workstream scope) and
+    ex-post before RUNNING -> MERGING (the actual diff) — by shelling out to
+    ``steward risk-classify`` (single source of truth for tiers; Maestro never
+    computes risk itself). ``mode`` is fixed fail_closed: a missing or errored
+    verdict on a mandatory gate blocks the transition.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["fail_closed"] = "fail_closed"
+    steward_bin: str | None = Field(
+        default=None,
+        description="Path to the steward CLI; falls back to $MAESTRO_STEWARD_BIN",
+    )
+    risk_model: str | None = Field(
+        default=None,
+        description="Path passed to --risk-model (default: steward's own default)",
+    )
+    profile: str = Field(default="lite", description="Floor profile for risk-classify")
+    approval_tiers: list[str] = Field(
+        default=["high", "critical"],
+        description="Tiers that require a human owner approval before spawn/merge",
+    )
+
+
 class OrchestratorConfig(BaseModel):
     """Configuration for multi-process orchestration.
 
@@ -1347,6 +1376,10 @@ class OrchestratorConfig(BaseModel):
     arbiter: ArbiterConfig | None = Field(
         default=None,
         description="Arbiter MCP integration config; None keeps static routing.",
+    )
+    gates: GatesConfig | None = Field(
+        default=None,
+        description="Gates-in-DAG guard config (WS-006); None disables gates.",
     )
 
     @field_validator("repo_path")
