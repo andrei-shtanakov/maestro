@@ -3,6 +3,14 @@
 ## Unreleased
 
 ### Added
+- **`constraints.authority_context` on route_task calls (RD-006 M4):** the
+  scheduler now sends the authority execution context `{role, phase}` to
+  arbiter — `role` from the task's function (`review` tasks act as reviewers,
+  everything else the scheduler executes is `implement`), `phase: execution`.
+  Rides in constraints only, never in the task payload (arbiter structurally
+  keeps it out of the 22-dim feature vector; Maestro keeps it out of
+  capability features). Enables arbiter's role/phase-scoped allowlist
+  enforcement (arbiter #50/#51) once `config/authority.toml` is vendored.
 - **Gates-in-DAG runtime (WS-006 handoff M-1..M-3):** opt-in `gates:` section in
   `project.yaml` — the orchestrator evaluates risk gates at two transition
   edges by shelling out to `steward risk-classify` (single source of truth for
