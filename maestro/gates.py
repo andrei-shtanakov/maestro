@@ -48,6 +48,16 @@ __all__ = [
 
 APPROVAL_MARKER_PREFIX = "gates:approval-required"
 
+# Paths Maestro itself commits into the branch (spec generation); they are
+# infra, not the agent's change — excluded from ex-post classification and
+# the declared-scope check (governed-run finding H-4).
+_ORCHESTRATOR_MANAGED = ("spec/", "spec-runner.config.yaml")
+
+
+def _orchestrator_managed(path: str) -> bool:
+    return path == _ORCHESTRATOR_MANAGED[1] or path.startswith(_ORCHESTRATOR_MANAGED[0])
+
+
 _STEWARD_ENV = "MAESTRO_STEWARD_BIN"
 
 # Gates steward may demand that are enforced beyond Maestro's two edges:
@@ -155,7 +165,11 @@ class GateKeeper:
     ) -> GateDecision:
         """Guard for RUNNING -> MERGING: classify the actual diff vs base."""
         sha = await self._git_sha(workspace)
-        paths = await self._git_diff_paths(workspace)
+        paths = [
+            p
+            for p in await self._git_diff_paths(workspace)
+            if not _orchestrator_managed(p)
+        ]
         payload = {
             "project": self._project,
             "sha": sha,
@@ -260,7 +274,14 @@ class GateKeeper:
         )
         if needs_approval:
             marker = f"{APPROVAL_MARKER_PREFIX} phase={phase} sha={sha}"
-            if prior_error and marker in prior_error:
+            # H-3: the error_message marker is single-slot and phases overwrite
+            # each other; the verdict store is the durable memory. A recorded
+            # block for this exact (workstream, phase, sha) means the only way
+            # back here was an operator re-queue = approval.
+            approved = (
+                prior_error is not None and marker in prior_error
+            ) or self._prior_block_recorded(workstream_id, phase, sha)
+            if approved:
                 records.append(
                     record(
                         gate_id="human.owner_approval",
@@ -372,6 +393,34 @@ class GateKeeper:
             msg = stderr.decode(errors="replace").strip()
             raise RuntimeError(f"git {' '.join(args)} failed: {msg}")
         return stdout.decode()
+
+    def _prior_block_recorded(self, workstream_id: str, phase: str, sha: str) -> bool:
+        """Was an owner-approval block already recorded for this exact context?
+
+        Reads the run's gate_verdicts.jsonl (tolerant line-by-line): a record
+        {workstream_id, phase, sha, gate_id=human.owner_approval,
+        verdict=missing} means the workstream was blocked here before — and
+        NEEDS_REVIEW -> READY is a human-only transition, so re-arriving at
+        the same (phase, sha) implies an operator approval (H-3). A new
+        commit changes the sha and invalidates this memory (DESIGN-608).
+        """
+        path = self._log_dir / "gate_verdicts.jsonl"
+        if not path.exists():
+            return False
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                rec.get("workstream_id") == workstream_id
+                and rec.get("phase") == phase
+                and rec.get("sha") == sha
+                and rec.get("gate_id") == "human.owner_approval"
+                and rec.get("verdict") == "missing"
+            ):
+                return True
+        return False
 
     def _write(self, records: list[GateVerdictRecord]) -> None:
         self._log_dir.mkdir(parents=True, exist_ok=True)

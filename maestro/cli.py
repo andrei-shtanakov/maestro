@@ -1465,6 +1465,67 @@ def workstreams_command(
     asyncio.run(_show_workstreams_status(db_path))
 
 
+async def _approve_workstream(db: "Database", workstream_id: str) -> None:
+    """Operator approval: NEEDS_REVIEW -> READY, preserving error_message.
+
+    The preserved message may carry the gates approval marker; the durable
+    approval memory is the verdict store (gates v1.1, H-3/H-5) — this
+    command is the sanctioned re-queue that used to be a raw sqlite UPDATE.
+    """
+    from maestro.models import WorkstreamStatus
+
+    workstream = await db.get_workstream(workstream_id)
+    if workstream is None:
+        raise ValueError(f"workstream '{workstream_id}' not found")
+    if workstream.status != WorkstreamStatus.NEEDS_REVIEW:
+        raise ValueError(
+            f"workstream '{workstream_id}' is {workstream.status}, "
+            f"only NEEDS_REVIEW can be approved"
+        )
+    await db.update_workstream_status(
+        workstream_id,
+        WorkstreamStatus.READY,
+        expected_status=WorkstreamStatus.NEEDS_REVIEW,
+    )
+
+
+@app.command("workstream-approve")
+def workstream_approve_command(
+    workstream_id: Annotated[str, typer.Argument(help="Workstream ID to approve")],
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", "-d", help="Path to SQLite database file"),
+    ] = None,
+) -> None:
+    """Approve a NEEDS_REVIEW workstream (gates re-queue) back to READY.
+
+    Examples:
+        maestro workstream-approve risk-model-docs-rule --db run/maestro.db
+    """
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> None:
+        from maestro.database import Database
+
+        database = Database(db_path)
+        await database.connect()
+        await database.initialize_schema()
+        try:
+            await _approve_workstream(database, workstream_id)
+        finally:
+            await database.close()
+
+    try:
+        asyncio.run(_run())
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(
+        f"[green]Workstream '{workstream_id}' approved (NEEDS_REVIEW -> READY).[/green]\n"
+        f"Resume with: maestro orchestrate <project.yaml> --db {db_path} --resume"
+    )
+
+
 @app.command("workspaces")
 def workspaces_command(
     workspace_base: Annotated[

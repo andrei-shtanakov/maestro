@@ -3,6 +3,20 @@
 ## Unreleased
 
 ### Added
+- **`maestro workstream-approve <id>` (gates v1.1, H-5):** the sanctioned
+  operator re-queue for gate-blocked workstreams — NEEDS_REVIEW → READY with
+  `error_message` preserved (used to require a raw sqlite UPDATE).
+
+### Fixed
+- **Gates approval memory survives phase overwrites (H-3):** the single-slot
+  `error_message` marker gets overwritten when a later phase blocks; the
+  verdict store (`gate_verdicts.jsonl`) is now the durable approval memory —
+  a recorded owner-approval block for the exact (workstream, phase, sha)
+  counts as operator approval on re-evaluation (NEEDS_REVIEW → READY is a
+  human-only transition). New commits still invalidate approvals (SHA-bound).
+- **Orchestrator spec commits no longer trip the scope gate (H-4):**
+  `spec/**` and `spec-runner.config.yaml` are Maestro's own infra commits and
+  are excluded from ex-post classification and the declared-scope check.
 - **`constraints.authority_context` on route_task calls (RD-006 M4):** the
   scheduler now sends the authority execution context `{role, phase}` to
   arbiter — `role` from the task's function (`review` tasks act as reviewers,
