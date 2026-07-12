@@ -3,6 +3,21 @@
 ## Unreleased
 
 ### Added
+- **Gates-in-DAG runtime (WS-006 handoff M-1..M-3):** opt-in `gates:` section in
+  `project.yaml` — the orchestrator evaluates risk gates at two transition
+  edges by shelling out to `steward risk-classify` (single source of truth for
+  tiers): **ex-ante** before READY→RUNNING over the declared workstream scope,
+  **ex-post** before RUNNING→MERGING over the actual diff (scope violations
+  escalate). Fail-closed: a missing/errored verdict on a mandatory gate blocks
+  the transition; blocked workstreams route to NEEDS_REVIEW and an operator
+  re-queue approves the gate for that exact SHA (a new commit invalidates the
+  approval). Every evaluation appends verdict-records to
+  `logs/<ULID>/gate_verdicts.jsonl` (addressable via EvidenceRef
+  `kind=gate-verdict`); gates enforced beyond these edges (branch protection,
+  PR reviews) are recorded as advisory annotations. New: `maestro/gates.py`,
+  `GatesConfig`, preflight checks `gates-steward-missing` /
+  `gates-risk-model-missing`, and a legal READY→NEEDS_REVIEW workstream
+  transition. No behavior change when `gates:` is absent.
 - **EvidenceRef `kind: gate-verdict` (WS-006 handoff M-4):** typed pointer to
   one gate verdict-record in `logs/<ULID>/gate_verdicts.jsonl`, addressed by
   `pipeline_id` + `gate_id` + full 40-hex `sha` (verdicts are SHA-bound).

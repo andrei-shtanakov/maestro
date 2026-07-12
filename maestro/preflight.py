@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from maestro.dag import find_cycle
 from maestro.decomposer import ProjectDecomposer
-from maestro.models import OrchestratorConfig, WorkstreamConfig
+from maestro.models import GatesConfig, OrchestratorConfig, WorkstreamConfig
 
 
 Severity = Literal["error", "warning"]
@@ -82,6 +82,8 @@ def validate_project(
         issues.extend(repo_issues)
         if not repo_issues and config.workstreams:
             issues.extend(_check_scope_fs(config.workstreams, repo, overlap_pairs))
+        if config.gates is not None:
+            issues.extend(_check_gates(config.gates))
 
     return ValidationReport(issues=issues)
 
@@ -352,4 +354,42 @@ def _check_scope_fs(
                         ),
                     )
                 )
+    return issues
+
+
+def _check_gates(gates: GatesConfig) -> list[ValidationIssue]:
+    """Gates are opt-in but fail-closed: a broken setup must not pass preflight.
+
+    A missing steward binary or risk-model file would turn every guard
+    evaluation into an error verdict (= block); surface it before the run.
+    """
+    import os
+
+    issues: list[ValidationIssue] = []
+    candidate = gates.steward_bin or os.environ.get("MAESTRO_STEWARD_BIN")
+    binary = Path(candidate).expanduser() if candidate else None
+    if binary is None or not binary.is_file() or not os.access(binary, os.X_OK):
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                code="gates-steward-missing",
+                workstream_ids=[],
+                message=(
+                    "gates enabled but the steward binary is not executable: "
+                    f"{candidate or 'set gates.steward_bin or $MAESTRO_STEWARD_BIN'}"
+                ),
+            )
+        )
+    if (
+        gates.risk_model is not None
+        and not Path(gates.risk_model).expanduser().is_file()
+    ):
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                code="gates-risk-model-missing",
+                workstream_ids=[],
+                message=f"gates.risk_model file not found: {gates.risk_model}",
+            )
+        )
     return issues
