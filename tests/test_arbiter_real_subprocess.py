@@ -102,6 +102,7 @@ async def test_route_task_response_contains_decision_id_i64(real_arbiter_client)
             "complexity": "simple",
             "priority": "normal",
         },
+        {"authority_context": {"role": "implement", "phase": "execution"}},
     )
     metadata = raw.get("metadata") or {}
     assert "decision_id" in metadata, (
@@ -150,6 +151,7 @@ async def test_route_then_report_outcome_round_trip(real_arbiter_client):
             "complexity": "simple",
             "priority": "normal",
         },
+        {"authority_context": {"role": "implement", "phase": "execution"}},
     )
     assert route_resp["action"] in {"assign", "fallback"}
     chosen_agent = route_resp["chosen_agent"]

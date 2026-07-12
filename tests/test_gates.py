@@ -456,3 +456,133 @@ async def test_non_object_steward_json_fails_closed(
     keeper = _keeper(fake_steward, repo, tmp_path)
     decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
     assert not decision.allow
+
+
+# ------------------------------------------- gates v1.1 (governed-run findings H-3..H-5)
+
+
+async def test_h3_approval_survives_via_verdict_store(
+    fake_steward: Path, repo: Path, tmp_path: Path
+) -> None:
+    # H-3: the error_message marker gets overwritten between phases; the
+    # verdict store is the durable approval memory. A prior recorded block
+    # for the SAME (workstream, phase, sha) counts as operator approval on
+    # re-evaluation even when prior_error carries no marker.
+    _set_tier(fake_steward, "high")
+    keeper = _keeper(fake_steward, repo, tmp_path)
+    first = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    assert not first.allow
+    # prior_error=None — e.g. the ex-post phase overwrote the marker.
+    second = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    assert second.allow, "recorded block + re-queue must count as approval"
+    approvals = [r for r in second.records if r.gate_id == "human.owner_approval"]
+    assert approvals and approvals[0].verdict == "pass"
+
+
+async def test_h3_store_approval_still_invalidated_by_new_sha(
+    fake_steward: Path, repo: Path, tmp_path: Path
+) -> None:
+    _set_tier(fake_steward, "high")
+    keeper = _keeper(fake_steward, repo, tmp_path)
+    first = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    assert not first.allow
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    (repo / "src" / "a.py").write_text("x = 3\n")
+    subprocess.run(  # noqa: ASYNC221
+        ["git", "-C", str(repo), "commit", "-am", "new"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    second = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    assert not second.allow, "a new commit must invalidate the stored approval"
+
+
+async def test_h3_other_workstream_block_does_not_approve(
+    fake_steward: Path, repo: Path, tmp_path: Path
+) -> None:
+    _set_tier(fake_steward, "high")
+    keeper = _keeper(fake_steward, repo, tmp_path)
+    first = await keeper.evaluate_ex_ante("ws-other", ["src/**"], prior_error=None)
+    assert not first.allow
+    second = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    assert not second.allow, "approval memory is per workstream"
+
+
+async def test_h4_orchestrator_managed_paths_do_not_violate_scope(
+    fake_steward: Path, repo: Path, tmp_path: Path
+) -> None:
+    # H-4: Maestro itself commits spec/** + spec-runner.config.yaml into the
+    # branch; those infra paths must not trip the declared-scope check.
+    workspace = _branch_with_change(repo, "src/a.py", "x = 9\n")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    spec = workspace / "spec"
+    spec.mkdir(exist_ok=True)
+    (spec / "tasks.md").write_text("# t\n")
+    (workspace / "spec-runner.config.yaml").write_text("a: 1\n")
+    subprocess.run(  # noqa: ASYNC221
+        ["git", "-C", str(workspace), "add", "-A"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    subprocess.run(  # noqa: ASYNC221
+        ["git", "-C", str(workspace), "commit", "-m", "maestro: add spec"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    keeper = _keeper(fake_steward, repo, tmp_path)
+    decision = await keeper.evaluate_ex_post(
+        "ws-1", ["src/**"], workspace=workspace, prior_error=None
+    )
+    assert decision.allow, (decision.reason, [r.note for r in decision.records])
+
+
+def test_h5_workstream_approve_cli_flips_needs_review_to_ready(tmp_path: Path) -> None:
+    import asyncio as _asyncio
+
+    from maestro.database import Database
+    from maestro.models import Workstream, WorkstreamStatus
+
+    async def scenario() -> tuple[str, str | None]:
+        db = Database(tmp_path / "m.db")
+        await db.connect()
+        ws = Workstream(
+            id="ws-1",
+            title="t",
+            description="d",
+            scope=["src/**"],
+            status=WorkstreamStatus.PENDING,
+            branch="feature/ws-1",
+        )
+        try:
+            await db.create_workstream(ws)
+            await db.update_workstream_status(
+                "ws-1",
+                WorkstreamStatus.NEEDS_REVIEW,
+                error_message="gates: ... marker",
+            )
+            from maestro.cli import _approve_workstream
+
+            await _approve_workstream(db, "ws-1")
+            after = await db.get_workstream("ws-1")
+            return after.status, after.error_message
+        finally:
+            await db.close()
+
+    status, error_message = _asyncio.run(scenario())
+    assert status == WorkstreamStatus.READY
+    assert error_message and "marker" in error_message, "marker must be preserved"
