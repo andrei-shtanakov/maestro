@@ -203,7 +203,12 @@
             "required": [
               "kind",
               "trace_id"
-            ]
+            ],
+            "properties": {
+              "trace_id": {
+                "type": "string"
+              }
+            }
           }
         },
         {
@@ -218,7 +223,12 @@
             "required": [
               "kind",
               "pipeline_id"
-            ]
+            ],
+            "properties": {
+              "pipeline_id": {
+                "type": "string"
+              }
+            }
           }
         },
         {
@@ -233,7 +243,12 @@
             "required": [
               "kind",
               "run_id"
-            ]
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string"
+              }
+            }
           }
         },
         {
@@ -248,7 +263,12 @@
             "required": [
               "kind",
               "decision_id"
-            ]
+            ],
+            "properties": {
+              "decision_id": {
+                "type": "integer"
+              }
+            }
           }
         },
         {
@@ -264,7 +284,15 @@
               "kind",
               "project",
               "path"
-            ]
+            ],
+            "properties": {
+              "project": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            }
           }
         },
         {
@@ -281,7 +309,18 @@
               "pipeline_id",
               "gate_id",
               "sha"
-            ]
+            ],
+            "properties": {
+              "pipeline_id": {
+                "type": "string"
+              },
+              "gate_id": {
+                "type": "string"
+              },
+              "sha": {
+                "type": "string"
+              }
+            }
           }
         }
       ]

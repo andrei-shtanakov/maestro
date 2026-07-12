@@ -237,17 +237,22 @@ def test_spec_task_bridge_derives_child_key() -> None:
 
 # ---------------------------------------------------------------- gate-verdict (M-4, WS-006 handoff)
 
-_EVIDENCE_SCHEMA = json.loads(
-    (
-        Path(__file__).parent.parent
-        / "contracts"
-        / "observability"
-        / "evidence-ref.schema.json"
-    ).read_text()
-)
-
 _ULID = "01KX8V7Z9DHBKYWGSN2KTWM8AB"
 _SHA = "a" * 40
+
+from maestro.correlation import _EVIDENCE_REQUIRED as _EVIDENCE_REQUIRED_KEYS
+
+
+_NULL_SAMPLE: dict = {
+    "trace_id": "a" * 32,
+    "pipeline_id": _ULID,
+    "run_id": "run-1",
+    "decision_id": 1,
+    "project": "Maestro",
+    "path": "contracts/x.json",
+    "gate_id": "steward.gate_check",
+    "sha": _SHA,
+}
 
 
 def test_gate_verdict_builder_produces_schema_valid_ref() -> None:
@@ -276,3 +281,18 @@ def test_gate_verdict_sha_must_be_full_hex() -> None:
 
     with pytest.raises(ValidationError):
         gate_verdict_evidence(_ULID, "steward.gate_check", "abc123")
+
+
+@pytest.mark.parametrize("kind,required", sorted(_EVIDENCE_REQUIRED_KEYS.items()))
+def test_schema_rejects_explicit_null_for_required_keys(
+    kind: str, required: tuple[str, ...]
+) -> None:
+    # Copilot (PR #72): `required` alone accepts explicit nulls because the
+    # top-level property types are nullable — the schema must be as strict as
+    # the model, which treats None as missing.
+    base: dict = {"kind": kind, **{k: _NULL_SAMPLE[k] for k in required}}
+    jsonschema.validate(base, _EVIDENCE_SCHEMA)  # sanity: non-null passes
+    for key in required:
+        payload = {**base, key: None}
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(payload, _EVIDENCE_SCHEMA)
