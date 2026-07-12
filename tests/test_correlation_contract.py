@@ -11,6 +11,9 @@ import pytest
 from pydantic import ValidationError
 
 from maestro.correlation import (
+    _EVIDENCE_REQUIRED as _EVIDENCE_REQUIRED_KEYS,
+)
+from maestro.correlation import (
     PROJECTIONS,
     TERMINAL,
     UNIVERSAL_EXITS,
@@ -240,7 +243,6 @@ def test_spec_task_bridge_derives_child_key() -> None:
 _ULID = "01KX8V7Z9DHBKYWGSN2KTWM8AB"
 _SHA = "a" * 40
 
-from maestro.correlation import _EVIDENCE_REQUIRED as _EVIDENCE_REQUIRED_KEYS
 
 
 _NULL_SAMPLE: dict = {
