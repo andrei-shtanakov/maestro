@@ -435,3 +435,24 @@ async def test_orchestrator_gates_disabled_is_noop() -> None:
     orch._gates = None
     orch._db = MagicMock()
     assert await orch._gate_ex_ante("ws-1", _workstream(WorkstreamStatus.READY))
+
+
+async def test_structurally_invalid_steward_json_fails_closed(
+    fake_steward: Path, repo: Path, tmp_path: Path
+) -> None:
+    # Copilot (PR #73): JSON that parses but lacks the contract shape must
+    # become an error verdict, not a KeyError escaping the guard.
+    fake_steward.write_text('#!/bin/sh\necho "{}"\n')  # noqa: ASYNC240
+    keeper = _keeper(fake_steward, repo, tmp_path)
+    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    assert not decision.allow
+    assert any(r.verdict == "error" for r in decision.records)
+
+
+async def test_non_object_steward_json_fails_closed(
+    fake_steward: Path, repo: Path, tmp_path: Path
+) -> None:
+    fake_steward.write_text('#!/bin/sh\necho "[1, 2]"\n')  # noqa: ASYNC240
+    keeper = _keeper(fake_steward, repo, tmp_path)
+    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    assert not decision.allow

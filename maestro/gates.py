@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from maestro._vendor.obs import current_pipeline_id
 
@@ -81,7 +81,7 @@ class GateDecision(BaseModel):
 
     allow: bool
     reason: str | None = None
-    records: list[GateVerdictRecord] = []
+    records: list[GateVerdictRecord] = Field(default_factory=list)
 
 
 def pipeline_log_dir() -> Path:
@@ -95,6 +95,26 @@ def pipeline_log_dir() -> Path:
         or "no-pipeline"
     )
     return Path.cwd() / "logs" / pipeline
+
+
+def _validated_classification(decoded: object) -> dict | str:
+    """Shape-check the risk-classify output (DESIGN-610) — fail-closed.
+
+    JSON that parses but lacks the contract shape must become an error
+    verdict, not a KeyError escaping the guard.
+    """
+    if not isinstance(decoded, dict):
+        return f"risk-classify output is not an object: {type(decoded).__name__}"
+    tier = decoded.get("tier")
+    if not isinstance(tier, str) or not tier:
+        return "risk-classify output missing 'tier'"
+    gates = decoded.get("mandatory_gates", [])
+    flags = decoded.get("flags", [])
+    if not isinstance(gates, list) or not all(isinstance(g, str) for g in gates):
+        return "risk-classify output: 'mandatory_gates' must be a list of strings"
+    if not isinstance(flags, list) or not all(isinstance(f, str) for f in flags):
+        return "risk-classify output: 'flags' must be a list of strings"
+    return decoded
 
 
 class GateKeeper:
@@ -320,7 +340,8 @@ class GateKeeper:
                     f"risk-classify exited {process.returncode}: "
                     f"{stderr.decode(errors='replace').strip()[:500]}"
                 )
-            return json.loads(stdout.decode())
+            decoded = json.loads(stdout.decode())
+            return _validated_classification(decoded)
         except (OSError, json.JSONDecodeError) as exc:
             return f"risk-classify failed: {exc}"
         finally:
