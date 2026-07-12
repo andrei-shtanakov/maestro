@@ -11,6 +11,7 @@ from maestro.models import (
     ArbiterMode,
     RouteAction,
     Task,
+    TaskType,
 )
 from tests.fakes.fake_arbiter_client import FakeArbiterClient
 
@@ -384,3 +385,64 @@ class TestExtractDecisionId:
     def test_metadata_not_a_dict_returns_none(self) -> None:
         raw = {"metadata": "not a dict"}
         assert _extract_decision_id(raw) is None
+
+
+# ---------------------------------------------------------------- authority context (RD-006 M4)
+
+
+class _CapturingClient:
+    """Records route_task arguments; returns a canned assign."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict, dict | None]] = []
+
+    async def route_task(self, task_id, task, constraints=None):
+        self.calls.append((task_id, task, constraints))
+        return {
+            "action": "assign",
+            "chosen_agent": "claude_code@claude-sonnet-4-6",
+            "confidence": 0.9,
+            "reasoning": "ok",
+            "metadata": {"decision_id": 7},
+        }
+
+
+async def test_route_sends_authority_context_implement() -> None:
+    from maestro.coordination.routing import ArbiterRouting
+
+    client = _CapturingClient()
+    routing = ArbiterRouting(client, _cfg())
+    task = _task()
+    task = task.model_copy(update={"id": "t-auth-1", "task_type": TaskType.FEATURE})
+    await routing.route(task)
+    (_tid, _payload, constraints) = client.calls[0]
+    assert constraints is not None
+    assert constraints["authority_context"] == {
+        "role": "implement",
+        "phase": "execution",
+    }
+
+
+async def test_route_sends_review_role_for_review_tasks() -> None:
+    from maestro.coordination.routing import ArbiterRouting
+
+    client = _CapturingClient()
+    routing = ArbiterRouting(client, _cfg())
+    task = _task().model_copy(update={"id": "t-auth-2", "task_type": TaskType.REVIEW})
+    await routing.route(task)
+    (_tid, _payload, constraints) = client.calls[0]
+    assert constraints is not None
+    assert constraints["authority_context"]["role"] == "review"
+
+
+async def test_authority_context_not_in_task_payload() -> None:
+    # The context is execution context, not a task/capability feature:
+    # it must ride in constraints only (arbiter keeps it out of the
+    # feature vector; Maestro must keep it out of `task`).
+    from maestro.coordination.routing import ArbiterRouting
+
+    client = _CapturingClient()
+    routing = ArbiterRouting(client, _cfg())
+    await routing.route(_task().model_copy(update={"id": "t-auth-3"}))
+    (_tid, payload, _constraints) = client.calls[0]
+    assert "authority_context" not in payload

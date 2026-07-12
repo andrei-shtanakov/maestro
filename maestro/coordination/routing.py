@@ -25,6 +25,7 @@ from maestro.models import (
     TaskOutcome,
     TaskOutcomeStatus,
     TaskStatus,
+    TaskType,
     priority_int_to_enum,
 )
 
@@ -148,6 +149,20 @@ def _task_to_arbiter_payload(task: Task) -> dict[str, Any]:
     }
 
 
+def _authority_context(task: Task) -> dict[str, str]:
+    """Authority execution context for route_task (RD-006 M4).
+
+    Rides in `constraints.authority_context`, never in the task payload —
+    arbiter structurally keeps it out of the feature vector, and Maestro must
+    not leak it into capability features either. Role is the run's function:
+    a review-type task acts as a reviewer; everything else the scheduler
+    executes is an implementer. Phase is coarse: the scheduler always routes
+    work it is about to execute.
+    """
+    role = "review" if task.task_type == TaskType.REVIEW else "implement"
+    return {"role": role, "phase": "execution"}
+
+
 def _extract_decision_id(raw: dict[str, Any]) -> str | None:
     """Arbiter returns decision_id in metadata per its DTO spec.
 
@@ -193,10 +208,11 @@ class ArbiterRouting:
             return await self._fallback_route(task, reason_for_auto="arbiter_degraded")
 
         payload = _task_to_arbiter_payload(task)
+        constraints = {"authority_context": _authority_context(task)}
         timeout_s = self._cfg.timeout_ms / 1000.0
         try:
             raw = await asyncio.wait_for(
-                self._client.route_task(task.id, payload),
+                self._client.route_task(task.id, payload, constraints),
                 timeout=timeout_s,
             )
         except TimeoutError:
