@@ -94,6 +94,7 @@ _EVIDENCE_REQUIRED: dict[str, tuple[str, ...]] = {
     "benchmark": ("run_id",),
     "decision": ("decision_id",),
     "artifact": ("project", "path"),
+    "gate-verdict": ("pipeline_id", "gate_id", "sha"),
 }
 
 
@@ -107,7 +108,7 @@ class EvidenceRef(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["trace", "log", "benchmark", "decision", "artifact"]
+    kind: Literal["trace", "log", "benchmark", "decision", "artifact", "gate-verdict"]
     trace_id: str | None = Field(None, pattern=r"^[0-9a-f]{32}$")
     span_id: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
     pipeline_id: str | None = None
@@ -115,6 +116,8 @@ class EvidenceRef(BaseModel):
     decision_id: int | None = Field(None, ge=1)
     project: str | None = None
     path: str | None = None
+    gate_id: str | None = None
+    sha: str | None = Field(None, pattern=r"^[0-9a-f]{40}$")
     note: str | None = None
 
     @model_validator(mode="after")
@@ -156,6 +159,24 @@ def decision_evidence(decision_id: int) -> EvidenceRef:
 def artifact_evidence(project: str, path: str, note: str | None = None) -> EvidenceRef:
     """Pointer to a project-relative file in the owning repo."""
     return EvidenceRef(kind="artifact", project=project, path=path, note=note)
+
+
+def gate_verdict_evidence(
+    pipeline_id: str, gate_id: str, sha: str, note: str | None = None
+) -> EvidenceRef:
+    """Pointer to one gate verdict-record in logs/<ULID>/gate_verdicts.jsonl.
+
+    The record is addressed by (pipeline_id, gate_id, sha): the run's
+    verdict log, the gate that was evaluated, and the commit the verdict
+    is bound to (WS-006 DESIGN-607/608 — verdicts are SHA-bound).
+    """
+    return EvidenceRef(
+        kind="gate-verdict",
+        pipeline_id=pipeline_id,
+        gate_id=gate_id,
+        sha=sha,
+        note=note,
+    )
 
 
 class WorkCorrelation(BaseModel):

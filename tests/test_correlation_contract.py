@@ -11,6 +11,9 @@ import pytest
 from pydantic import ValidationError
 
 from maestro.correlation import (
+    _EVIDENCE_REQUIRED as _EVIDENCE_REQUIRED_KEYS,
+)
+from maestro.correlation import (
     PROJECTIONS,
     TERMINAL,
     UNIVERSAL_EXITS,
@@ -233,3 +236,64 @@ def test_spec_task_bridge_derives_child_key() -> None:
     assert record.source_locator == "workstreams/ws-1/spec"
     assert record.source_status == "success"  # verbatim
     assert record.status == CommonStatus.DONE  # projected
+
+
+# ---------------------------------------------------------------- gate-verdict (M-4, WS-006 handoff)
+
+_ULID = "01KX8V7Z9DHBKYWGSN2KTWM8AB"
+_SHA = "a" * 40
+
+
+_NULL_SAMPLE: dict = {
+    "trace_id": "a" * 32,
+    "pipeline_id": _ULID,
+    "run_id": "run-1",
+    "decision_id": 1,
+    "project": "Maestro",
+    "path": "contracts/x.json",
+    "gate_id": "steward.gate_check",
+    "sha": _SHA,
+}
+
+
+def test_gate_verdict_builder_produces_schema_valid_ref() -> None:
+    from maestro.correlation import gate_verdict_evidence
+
+    ref = gate_verdict_evidence(_ULID, "steward.gate_check", _SHA)
+    jsonschema.validate(ref.model_dump(exclude_none=True), _EVIDENCE_SCHEMA)
+    assert ref.kind == "gate-verdict"
+
+
+def test_gate_verdict_requires_pipeline_gate_and_sha() -> None:
+    # Model and schema must agree on the required-key set.
+    for payload in (
+        {"kind": "gate-verdict", "gate_id": "g", "sha": _SHA},  # no pipeline_id
+        {"kind": "gate-verdict", "pipeline_id": _ULID, "sha": _SHA},  # no gate_id
+        {"kind": "gate-verdict", "pipeline_id": _ULID, "gate_id": "g"},  # no sha
+    ):
+        with pytest.raises(ValidationError):
+            EvidenceRef.model_validate(payload)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(payload, _EVIDENCE_SCHEMA)
+
+
+def test_gate_verdict_sha_must_be_full_hex() -> None:
+    from maestro.correlation import gate_verdict_evidence
+
+    with pytest.raises(ValidationError):
+        gate_verdict_evidence(_ULID, "steward.gate_check", "abc123")
+
+
+@pytest.mark.parametrize("kind,required", sorted(_EVIDENCE_REQUIRED_KEYS.items()))
+def test_schema_rejects_explicit_null_for_required_keys(
+    kind: str, required: tuple[str, ...]
+) -> None:
+    # Copilot (PR #72): `required` alone accepts explicit nulls because the
+    # top-level property types are nullable — the schema must be as strict as
+    # the model, which treats None as missing.
+    base: dict = {"kind": kind, **{k: _NULL_SAMPLE[k] for k in required}}
+    jsonschema.validate(base, _EVIDENCE_SCHEMA)  # sanity: non-null passes
+    for key in required:
+        payload = {**base, key: None}
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(payload, _EVIDENCE_SCHEMA)
