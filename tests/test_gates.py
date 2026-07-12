@@ -560,7 +560,6 @@ def test_h5_workstream_approve_cli_flips_needs_review_to_ready(tmp_path: Path) -
     async def scenario() -> tuple[str, str | None]:
         db = Database(tmp_path / "m.db")
         await db.connect()
-        await db.initialize_schema()
         ws = Workstream(
             id="ws-1",
             title="t",

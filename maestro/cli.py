@@ -1509,7 +1509,6 @@ def workstream_approve_command(
 
         database = Database(db_path)
         await database.connect()
-        await database.initialize_schema()
         try:
             await _approve_workstream(database, workstream_id)
         finally:

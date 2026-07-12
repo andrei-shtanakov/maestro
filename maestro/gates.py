@@ -407,19 +407,20 @@ class GateKeeper:
         path = self._log_dir / "gate_verdicts.jsonl"
         if not path.exists():
             return False
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if (
-                rec.get("workstream_id") == workstream_id
-                and rec.get("phase") == phase
-                and rec.get("sha") == sha
-                and rec.get("gate_id") == "human.owner_approval"
-                and rec.get("verdict") == "missing"
-            ):
-                return True
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    rec.get("workstream_id") == workstream_id
+                    and rec.get("phase") == phase
+                    and rec.get("sha") == sha
+                    and rec.get("gate_id") == "human.owner_approval"
+                    and rec.get("verdict") == "missing"
+                ):
+                    return True
         return False
 
     def _write(self, records: list[GateVerdictRecord]) -> None:
