@@ -2255,3 +2255,211 @@ class TestSpawnHarnessIsolation:
             assert argv[argv.index("--spec-prefix") + 1] == SPEC_PREFIX
         finally:
             await db.close()
+
+
+def _ex_post_marker(sha: str) -> str:
+    from maestro.gates import APPROVAL_MARKER_PREFIX
+
+    return (
+        "gates: human.owner_approval required (tier=high); re-queue to "
+        f"approve. {APPROVAL_MARKER_PREFIX} phase=ex_post sha={sha}"
+    )
+
+
+class TestExPostResume:
+    """gates v1.2 (H-6): an approved ex-post block resumes at the ex-post
+    edge over the untouched worktree — no regen, no respawn, no new sha."""
+
+    async def _orch_db(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ):
+        from maestro.database import Database
+
+        db = Database(tmp_path / "o.db")
+        await db.connect()
+        cfg = OrchestratorConfig(
+            project="p",
+            repo_url="https://github.com/t/r",
+            repo_path="/tmp/r",
+            workspace_base="/tmp/ws",
+            auto_pr=True,
+            workstreams=[],
+        )
+        orch = Orchestrator(
+            db=db,
+            workspace_mgr=mock_workspace_mgr,
+            decomposer=mock_decomposer,
+            config=cfg,
+            pr_manager=mock_pr_manager,
+        )
+        return orch, db
+
+    def _seed_ready(self, zid: str, sha: str) -> Workstream:
+        return Workstream(
+            id=zid,
+            title=zid,
+            description="d",
+            scope=["s"],
+            branch=f"feature/{zid}",
+            status=WorkstreamStatus.READY,
+            error_message=_ex_post_marker(sha),
+        )
+
+    @pytest.mark.anyio
+    async def test_resume_reaches_done_without_respawn(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        sha = "a" * 40
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(self._seed_ready("z1", sha))
+            mock_workspace_mgr.workspace_exists.return_value = True
+            orch._workspace_head = AsyncMock(return_value=sha)
+            orch._merge_into_base = MagicMock()
+
+            await orch._spawn_workstream("z1")
+
+            w = await db.get_workstream("z1")
+            assert w.status == WorkstreamStatus.DONE
+            # Marker cleared exactly at DONE (crash-tail keeps it until then).
+            assert w.error_message is None
+            assert w.process_pid is None
+            assert w.generation_pid is None
+            # No pipeline replay: no spec regen, PR created from the
+            # existing worktree.
+            mock_decomposer.generate_spec.assert_not_awaited()
+            mock_pr_manager.push_and_create_pr.assert_called_once()
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_marker_survives_until_done(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        """error_message must still hold the marker at MERGING/PR_CREATED:
+        recovery resets those states to READY, and the next run needs the
+        marker to resume instead of full-respawning.
+
+        Formulation: spy on `db.update_workstream_status` (the
+        `TestSpawnWritesSentinel` pattern) and assert that no write before
+        the terminal DONE write touches `error_message` at all — the
+        marker is cleared exactly once, at DONE.
+        """
+        sha = "a" * 40
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(self._seed_ready("z1", sha))
+            mock_workspace_mgr.workspace_exists.return_value = True
+            orch._workspace_head = AsyncMock(return_value=sha)
+            orch._merge_into_base = MagicMock()
+
+            calls: list[dict] = []
+            original = db.update_workstream_status
+
+            async def spy(zid, status, *args, **kwargs):
+                calls.append({"status": status, **kwargs})
+                return await original(zid, status, *args, **kwargs)
+
+            db.update_workstream_status = spy  # type: ignore[method-assign]
+
+            await orch._spawn_workstream("z1")
+
+            assert calls, "expected at least one status write"
+            assert calls[-1]["status"] == WorkstreamStatus.DONE
+            assert calls[-1].get("error_message") is None
+            assert "error_message" in calls[-1]
+            for c in calls[:-1]:
+                assert "error_message" not in c
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_sha_mismatch_no_resume(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            from maestro.gates import parse_approval_marker
+
+            w = self._seed_ready("z2", "a" * 40)
+            await db.create_workstream(w)
+            mock_workspace_mgr.workspace_exists.return_value = True
+            orch._workspace_head = AsyncMock(return_value="b" * 40)
+            marker = parse_approval_marker(w.error_message)
+            assert marker is not None
+
+            resumed = await orch._try_resume_ex_post(w, marker)
+
+            assert resumed is False
+            assert (
+                await db.get_workstream("z2")
+            ).status == WorkstreamStatus.READY  # untouched — full respawn follows
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_missing_workspace_no_resume(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            from maestro.gates import parse_approval_marker
+
+            w = self._seed_ready("z3", "a" * 40)
+            await db.create_workstream(w)
+            mock_workspace_mgr.workspace_exists.return_value = False
+            marker = parse_approval_marker(w.error_message)
+            assert marker is not None
+
+            assert await orch._try_resume_ex_post(w, marker) is False
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_ex_ante_marker_does_not_trigger_resume(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        from maestro.gates import APPROVAL_MARKER_PREFIX
+
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            w = Workstream(
+                id="z4",
+                title="z4",
+                description="d",
+                scope=["s"],
+                branch="feature/z4",
+                status=WorkstreamStatus.READY,
+                error_message=(
+                    f"{APPROVAL_MARKER_PREFIX} phase=ex_ante sha={'c' * 40}"
+                ),
+            )
+            await db.create_workstream(w)
+            orch._try_resume_ex_post = AsyncMock()
+            fake_process = MagicMock(pid=1)
+            mock_decomposer.generate_spec = AsyncMock()
+            # _spawn_workstream's full-respawn path opens a log file under
+            # self._log_dir; unlike orch.run(), this direct unit-test call
+            # never creates it.
+            orch._log_dir.mkdir(parents=True, exist_ok=True)
+            with (
+                patch(
+                    "maestro.orchestrator.asyncio.create_subprocess_exec",
+                    new=AsyncMock(return_value=fake_process),
+                ),
+                patch("maestro.orchestrator.ensure_harness_excludes"),
+            ):
+                await orch._spawn_workstream("z4")
+            orch._try_resume_ex_post.assert_not_awaited()
+        finally:
+            await db.close()

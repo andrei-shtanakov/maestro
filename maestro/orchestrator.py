@@ -19,7 +19,13 @@ from pathlib import Path
 from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
-from maestro.gates import GateDecision, GateKeeper, pipeline_log_dir
+from maestro.gates import (
+    ApprovalMarker,
+    GateDecision,
+    GateKeeper,
+    parse_approval_marker,
+    pipeline_log_dir,
+)
 from maestro.git import GitError, MergeConflictError
 from maestro.merge_logs import merge_logs_dir
 from maestro.models import (
@@ -534,6 +540,19 @@ class Orchestrator:
         """Spawn a spec-runner process for a workstream."""
         workstream = await self._db.get_workstream(workstream_id)
 
+        # Gates v1.2 (H-6): an operator-approved ex-post block resumes at
+        # the ex-post edge over the untouched worktree. Replaying the
+        # pipeline would regenerate the spec, mint a new sha, and void the
+        # approval (DESIGN-608). Must run before DECOMPOSING and before the
+        # spawning sentinel — a resume never spawns anything.
+        marker = parse_approval_marker(workstream.error_message)
+        if (
+            marker is not None
+            and marker.phase == "ex_post"
+            and await self._try_resume_ex_post(workstream, marker)
+        ):
+            return
+
         # Transition to DECOMPOSING; write the spawning sentinel up front — it
         # marks a spawn-in-progress AND overwrites any stale prior generation
         # pid (re-decompose).
@@ -803,11 +822,76 @@ class Orchestrator:
         )
         return False
 
+    @staticmethod
+    async def _workspace_head(workspace: Path) -> str | None:
+        """HEAD sha of a worktree, or None when unreadable."""
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(workspace),
+            "rev-parse",
+            "HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await process.communicate()
+        if process.returncode != 0:
+            return None
+        return stdout.decode().strip()
+
+    async def _try_resume_ex_post(
+        self, workstream: Workstream, marker: ApprovalMarker
+    ) -> bool:
+        """Resume an ex-post-approved workstream at the ex-post edge (H-6).
+
+        True only when the worktree still exists AND sits exactly at the
+        approved sha; then the workstream goes READY -> RUNNING (explicitly
+        clearing both pids so recovery never mistakes it for a live orphan)
+        and re-enters the success continuation — ex-post re-evaluates,
+        passes via the approval memory, and the normal MERGING -> PR ->
+        merge -> DONE tail runs. False = caller proceeds with the full
+        respawn (the approval is genuinely void, DESIGN-608).
+        """
+        if not self._workspace_mgr.workspace_exists(workstream.id):
+            self._logger.warning(
+                "Workstream '%s' has an ex-post approval for sha %s but no "
+                "workspace; falling back to a full respawn",
+                workstream.id,
+                marker.sha[:12],
+            )
+            return False
+        workspace = self._workspace_mgr.get_workspace_path(workstream.id)
+        head = await self._workspace_head(workspace)
+        if head != marker.sha:
+            self._logger.warning(
+                "Workstream '%s' worktree HEAD %s != approved sha %s; the "
+                "approval is void (DESIGN-608), falling back to a full respawn",
+                workstream.id,
+                (head or "unreadable")[:12],
+                marker.sha[:12],
+            )
+            return False
+        await self._db.update_workstream_status(
+            workstream.id,
+            WorkstreamStatus.RUNNING,
+            expected_status=workstream.status,
+            process_pid=None,
+            generation_pid=None,
+            workspace_path=str(workspace),
+        )
+        self._logger.info(
+            "Resuming workstream '%s' at the ex-post gate (approved sha %s)",
+            workstream.id,
+            marker.sha[:12],
+        )
+        await self._handle_success(workstream.id, workspace)
+        return True
+
     async def _gate_ex_post(
         self,
         workstream_id: str,
         workstream: Workstream,
-        running: RunningWorkstream,
+        workspace_path: Path,
     ) -> bool:
         """Evaluate the ex-post gate; on block route RUNNING -> FAILED -> NEEDS_REVIEW."""
         if self._gates is None:
@@ -815,7 +899,7 @@ class Orchestrator:
         decision = await self._gates.evaluate_ex_post(
             workstream_id,
             workstream.scope,
-            workspace=running.workspace_path,
+            workspace=workspace_path,
             prior_error=workstream.error_message,
         )
         if decision.allow:
@@ -862,7 +946,7 @@ class Orchestrator:
                 "Workstream '%s' completed successfully",
                 workstream_id,
             )
-            await self._handle_success(workstream_id, running)
+            await self._handle_success(workstream_id, running.workspace_path)
         else:
             self._logger.warning(
                 "Workstream '%s' failed (code %d)",
@@ -877,7 +961,7 @@ class Orchestrator:
     async def _handle_success(
         self,
         workstream_id: str,
-        _running: RunningWorkstream,
+        workspace_path: Path,
     ) -> None:
         """Handle successful workstream completion.
 
@@ -887,7 +971,7 @@ class Orchestrator:
 
         # Gates (WS-006): ex-post guard over the actual diff (catches scope
         # violations and tier escalations the declared scope did not show).
-        if not await self._gate_ex_post(workstream_id, workstream, _running):
+        if not await self._gate_ex_post(workstream_id, workstream, workspace_path):
             return
 
         # Transition to MERGING
@@ -972,11 +1056,16 @@ class Orchestrator:
             # Leave the workspace intact so a human can resolve the conflict.
             return
 
-        # Merge succeeded -> DONE.
+        # Merge succeeded -> DONE. Clear error_message here ONLY: it may
+        # still hold an ex-post approval marker (H-6) that recovery needs
+        # to survive a crash-tail through MERGING/PR_CREATED (both reset to
+        # READY on recovery, and the next run must still see the marker to
+        # resume instead of full-respawning).
         await self._db.update_workstream_status(
             workstream_id,
             WorkstreamStatus.DONE,
             expected_status=WorkstreamStatus.PR_CREATED,
+            error_message=None,
         )
         self._stats.completed += 1
 
