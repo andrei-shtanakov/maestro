@@ -207,6 +207,28 @@ class TestSetupSpecRunner:
         assert (workspace_path / "spec").is_dir()
         assert (workspace_path / "spec-runner.config.yaml").exists()
 
+    @pytest.mark.integration
+    def test_setup_spec_runner_cleans_stale_dot_prefixed_state(
+        self,
+        workspace_mgr: WorkspaceManager,
+    ) -> None:
+        """H-8: a stale dot-before-prefix lock/history inherited from a prior
+        run must be cleaned — a leftover spec/.maestro-spec.lock would block
+        the next spec-runner."""
+        workspace_path = workspace_mgr.create_workspace(
+            "workstream-stale",
+            "agent/workstream-stale",
+        )
+        spec = workspace_path / "spec"
+        spec.mkdir(exist_ok=True)
+        (spec / ".maestro-spec.lock").write_text("PID: 999")
+        (spec / ".maestro-task-history.log").write_text("stale")
+
+        workspace_mgr.setup_spec_runner(workspace_path, {"run": True})
+
+        assert not (spec / ".maestro-spec.lock").exists()
+        assert not (spec / ".maestro-task-history.log").exists()
+
 
 # =============================================================================
 # Unit Tests: Cleanup Workspace
@@ -533,3 +555,52 @@ class TestEnsureHarnessExcludes:
         plain.mkdir()
         with pytest.raises(WorkspaceError):
             ensure_harness_excludes(plain)
+
+    def test_dot_prefixed_harness_files_ignored(self, tmp_path: Path) -> None:
+        """H-8: spec-runner names task-history/spec.lock with the dot BEFORE
+        the prefix (spec/.maestro-task-history.log, spec/.maestro-spec.lock);
+        those must be ignored too, not just spec/maestro-* and .executor-*."""
+        from maestro.workspace import ensure_harness_excludes
+
+        repo = _init_repo(tmp_path)
+        ensure_harness_excludes(repo)
+        content = (repo / ".git" / "info" / "exclude").read_text()
+        assert "spec/.maestro-*" in content
+
+        spec = repo / "spec"
+        spec.mkdir()
+        (spec / ".maestro-task-history.log").write_text("x")
+        (spec / ".maestro-spec.lock").write_text("x")
+        status = sp.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert ".maestro-task-history.log" not in status.stdout
+        assert ".maestro-spec.lock" not in status.stdout
+
+    def test_stale_block_refreshed_in_place(self, tmp_path: Path) -> None:
+        """H-8 migration: a repo touched by an older gates version carries an
+        outdated block; re-running must replace it in place (not no-op), so
+        the new patterns reach repos already seen — without duplicating."""
+        from maestro.workspace import (
+            _EXCLUDE_BEGIN,
+            _EXCLUDE_END,
+            ensure_harness_excludes,
+        )
+
+        repo = _init_repo(tmp_path)
+        exclude = repo / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        # Simulate the old v1.2 block (no spec/.maestro-* pattern).
+        old_block = "\n".join(
+            [_EXCLUDE_BEGIN, "spec/maestro-*", "spec/.executor-*", _EXCLUDE_END]
+        )
+        exclude.write_text(f"# user rule\n*.log\n{old_block}\n", encoding="utf-8")
+
+        ensure_harness_excludes(repo)
+        content = exclude.read_text()
+        assert "spec/.maestro-*" in content  # new pattern picked up
+        assert content.count(_EXCLUDE_BEGIN) == 1  # replaced, not duplicated
+        assert "# user rule" in content and "*.log" in content  # user lines kept

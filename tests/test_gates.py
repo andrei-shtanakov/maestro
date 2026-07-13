@@ -602,6 +602,9 @@ class TestOrchestratorManagedNarrowing:
             "spec/maestro-requirements.md",
             "spec/.executor-maestro-state.db",
             "spec/.executor-stop",
+            # H-8: dot-before-prefix harness files (spec-runner writes these).
+            "spec/.maestro-task-history.log",
+            "spec/.maestro-spec.lock",
         ],
     )
     def test_harness_paths_excluded(self, path: str) -> None:
@@ -614,6 +617,7 @@ class TestOrchestratorManagedNarrowing:
         [
             "spec/00-charter.md",  # target repo's own governance doc
             "spec/tasks.md",  # target repo's own dogfood spec
+            "spec/.gitignore",  # dot-prefixed but not maestro- (H-8 no over-match)
             "spec-runner.config.yaml",  # tracked-config clobber must be visible
             "src/main.py",
         ],
