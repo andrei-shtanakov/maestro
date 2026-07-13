@@ -10,6 +10,7 @@ Used by the `maestro validate` CLI command and by `maestro orchestrate`
 as a fail-fast preflight.
 """
 
+import subprocess
 from pathlib import Path
 from typing import Literal
 
@@ -82,6 +83,9 @@ def validate_project(
         issues.extend(repo_issues)
         if not repo_issues and config.workstreams:
             issues.extend(_check_scope_fs(config.workstreams, repo, overlap_pairs))
+        if not repo_issues:
+            issues.extend(_check_tracked_spec_runner_config(repo))
+        issues.extend(_check_spec_runner_contract())
         if config.gates is not None:
             issues.extend(_check_gates(config.gates))
 
@@ -355,6 +359,72 @@ def _check_scope_fs(
                     )
                 )
     return issues
+
+
+def _check_spec_runner_contract() -> list[ValidationIssue]:
+    """H-7 guard: the installed spec-runner must advertise --spec-prefix.
+
+    spec-runner is an external subprocess, not a pinned dependency; an old
+    binary without the flag would break prefix isolation SILENTLY (files at
+    unprefixed paths, missed by the ignore block and the narrowed gates
+    exclusion). Fail-closed: missing binary / broken --help / absent flag
+    are all errors.
+    """
+    issue = ValidationIssue(
+        severity="error",
+        code="spec-runner-prefix-unsupported",
+        workstream_ids=[],
+        message=(
+            "the installed spec-runner does not support --spec-prefix "
+            "(or is missing/broken); harness-artifact isolation (H-7) "
+            "requires it — upgrade spec-runner"
+        ),
+    )
+    try:
+        result = subprocess.run(
+            ["spec-runner", "run", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return [issue]
+    if result.returncode != 0 or "--spec-prefix" not in result.stdout:
+        return [issue]
+    return []
+
+
+def _check_tracked_spec_runner_config(repo: Path) -> list[ValidationIssue]:
+    """Warn when the target repo TRACKS its own spec-runner.config.yaml.
+
+    Maestro overwrites that file inside the worktree — a real ownership
+    conflict (fail-closed candidate per the gates v1.2 spec). Backstop:
+    the overwrite of a tracked config is ex-post-visible as a scope
+    violation since gates v1.2 no longer excludes it.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--", "spec-runner.config.yaml"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return [
+            ValidationIssue(
+                severity="warning",
+                code="spec-runner-config-tracked",
+                workstream_ids=[],
+                message=(
+                    "target repo tracks its own spec-runner.config.yaml; "
+                    "Maestro will overwrite it inside each worktree (the "
+                    "overwrite is ex-post-visible as a scope violation). "
+                    "Consider moving the repo's own config or expect "
+                    "NEEDS_REVIEW blocks."
+                ),
+            )
+        ]
+    return []
 
 
 def _check_gates(gates: GatesConfig) -> list[ValidationIssue]:
