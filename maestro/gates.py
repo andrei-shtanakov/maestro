@@ -11,7 +11,10 @@ errored verdict blocks the transition — at every tier. A blocked workstream
 routes to NEEDS_REVIEW with the approval marker in ``error_message``; a human
 re-queueing it (NEEDS_REVIEW -> READY) *is* the owner approval for that exact
 phase + SHA — a new commit changes the SHA and invalidates the approval
-(DESIGN-608, M-3). Every evaluation appends a verdict-record to
+(DESIGN-608, M-3). Gates v1.2 (H-6/H-7): an approved ex-post block resumes at
+the ex-post edge (see orchestrator._try_resume_ex_post); the infra-path
+exclusion covers only maestro-prefixed artifacts, and the approval marker in
+error_message clears only at DONE. Every evaluation appends a verdict-record to
 ``logs/<ULID>/gate_verdicts.jsonl`` (M-1); records are addressable via
 EvidenceRef ``kind=gate-verdict``. Gates whose enforcement point lies outside
 these two edges (branch protection, PR reviews) are recorded as advisory
