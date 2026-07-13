@@ -601,9 +601,11 @@ def test_workstream_approve_without_marker_records_nothing(tmp_path: Path) -> No
                 )
             )
             marker = await _approve_workstream(db, "ws-2")
-            return marker, await db.list_gate_approvals("ws-2"), (
-                await db.get_workstream("ws-2")
-            ).status
+            return (
+                marker,
+                await db.list_gate_approvals("ws-2"),
+                (await db.get_workstream("ws-2")).status,
+            )
         finally:
             await db.close()
 
@@ -805,6 +807,50 @@ class TestApprovalsAuthority:
             approvals=set(),
         )
         assert (decision.reason or "").startswith(BLOCK_REASON_PREFIX)
+
+
+# ------------------------------------- gates v1.3 (H-9): cross-restart e2e
+
+
+def test_cross_phase_approval_survives_restart(tmp_path) -> None:
+    """gates v1.3: an ex-ante approval recorded in the DB survives an
+    ex-post block message AND a new GateKeeper with a fresh log_dir
+    (= orchestrator restart, new pipeline ULID)."""
+    import asyncio as _asyncio
+
+    sha = "a" * 40
+
+    async def scenario():
+        from maestro.database import Database
+
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        try:
+            await db.record_gate_approval("z1", "ex_ante", sha)
+            return await db.list_gate_approvals("z1")
+        finally:
+            await db.close()
+
+    approvals = _asyncio.run(scenario())
+    # A brand-new keeper (fresh log_dir simulates the restart) approves
+    # ex-ante from the DB set alone; the ex-post pair is still missing.
+    keeper = _make_keeper(tmp_path / "fresh-logs")
+    ex_ante = keeper._decide(
+        "ex_ante",
+        "z1",
+        sha,
+        {"tier": "high", "mandatory_gates": [], "flags": []},
+        approvals=approvals,
+    )
+    ex_post = keeper._decide(
+        "ex_post",
+        "z1",
+        sha,
+        {"tier": "high", "mandatory_gates": [], "flags": []},
+        approvals=approvals,
+    )
+    assert ex_ante.allow is True
+    assert ex_post.allow is False  # per-phase, not per-workstream
 
 
 class TestPreserveApprovalMarker:

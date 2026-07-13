@@ -22,7 +22,11 @@ annotations, not blocks (M-2) — their transition belongs to the git host, not
 to Maestro's table. Gates v1.3 (H-9): the ``gate_approvals`` DB table is the
 single authority for "was this (workstream, phase, sha) approved" — the
 marker in ``error_message`` is operator UX and the H-6 resume-position
-signal only, never an authorization source.
+signal only, never an authorization source. Gates v1.3 (H-9): approval
+authority is the gate_approvals table, written by maestro workstream-approve
+in one transaction; the error_message marker is operator UX + the H-6
+position signal, and the verdict store is pure evidence — neither grants
+approval.
 """
 
 from __future__ import annotations
