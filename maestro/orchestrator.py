@@ -315,10 +315,13 @@ class Orchestrator:
                     # carries the marker. can_retry() is true here (gate
                     # blocks never increment retry_count), but the marker
                     # means "awaiting a human", not "retryable failure" --
-                    # routing it to READY would let evaluate_ex_post read
-                    # the marker in prior_error as an operator approval
-                    # that never happened (governance bypass). Always
-                    # finish the interrupted write as NEEDS_REVIEW instead.
+                    # routing it straight to READY would silently drop the
+                    # pending-review signal (gates v1.3/H-9: the marker is
+                    # UX only, evaluate_ex_post still re-checks the DB
+                    # approvals set and stays blocked either way, but the
+                    # workstream should surface as NEEDS_REVIEW, not READY,
+                    # until an operator actually approves it). Always finish
+                    # the interrupted write as NEEDS_REVIEW instead.
                     target = WorkstreamStatus.NEEDS_REVIEW
                 else:
                     target = (
@@ -824,8 +827,9 @@ class Orchestrator:
         """Evaluate the ex-ante gate; on block route READY -> NEEDS_REVIEW."""
         if self._gates is None:
             return True
+        approvals = await self._db.list_gate_approvals(workstream_id)
         decision = await self._gates.evaluate_ex_ante(
-            workstream_id, workstream.scope, prior_error=workstream.error_message
+            workstream_id, workstream.scope, approvals=approvals
         )
         if decision.allow:
             return True
@@ -908,11 +912,12 @@ class Orchestrator:
         """Evaluate the ex-post gate; on block route RUNNING -> FAILED -> NEEDS_REVIEW."""
         if self._gates is None:
             return True
+        approvals = await self._db.list_gate_approvals(workstream_id)
         decision = await self._gates.evaluate_ex_post(
             workstream_id,
             workstream.scope,
             workspace=workspace_path,
-            prior_error=workstream.error_message,
+            approvals=approvals,
         )
         if decision.allow:
             return True

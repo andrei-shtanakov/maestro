@@ -19,7 +19,10 @@ error_message clears only at DONE. Every evaluation appends a verdict-record to
 EvidenceRef ``kind=gate-verdict``. Gates whose enforcement point lies outside
 these two edges (branch protection, PR reviews) are recorded as advisory
 annotations, not blocks (M-2) — their transition belongs to the git host, not
-to Maestro's table.
+to Maestro's table. Gates v1.3 (H-9): the ``gate_approvals`` DB table is the
+single authority for "was this (workstream, phase, sha) approved" — the
+marker in ``error_message`` is operator UX and the H-6 resume-position
+signal only, never an authorization source.
 """
 
 from __future__ import annotations
@@ -45,15 +48,18 @@ if TYPE_CHECKING:
 
 __all__ = [
     "APPROVAL_MARKER_PREFIX",
+    "BLOCK_REASON_PREFIX",
     "ApprovalMarker",
     "GateDecision",
     "GateKeeper",
     "GateVerdictRecord",
     "parse_approval_marker",
     "pipeline_log_dir",
+    "preserve_approval_marker",
 ]
 
 APPROVAL_MARKER_PREFIX = "gates:approval-required"
+BLOCK_REASON_PREFIX = "gates: human.owner_approval required"
 
 _MARKER_RE = re.compile(
     re.escape(APPROVAL_MARKER_PREFIX)
@@ -86,6 +92,25 @@ def parse_approval_marker(error_message: str | None) -> ApprovalMarker | None:
     phase = match.group(1)
     assert phase in ("ex_ante", "ex_post")  # regex guarantees; narrows type
     return ApprovalMarker(phase=phase, sha=match.group(2))
+
+
+def preserve_approval_marker(new_message: str, prior: str | None) -> str:
+    """Carry an approval marker from a prior error_message into a new one.
+
+    H-6 position retention (NOT authority — that lives in gate_approvals):
+    losing the marker to a failure/shutdown message costs a wasteful full
+    respawn. Idempotent: extracts the first marker from `prior` and appends
+    it once; a marker already present in `new_message` is never duplicated.
+    """
+    if not prior:
+        return new_message
+    match = _MARKER_RE.search(prior)
+    if match is None:
+        return new_message
+    marker = match.group(0)
+    if marker in new_message:
+        return new_message
+    return f"{new_message} | {marker}"
 
 
 # Paths Maestro itself materializes in the worktree (spec generation +
@@ -198,20 +223,23 @@ class GateKeeper:
     # ------------------------------------------------------------ public
 
     async def evaluate_ex_ante(
-        self, workstream_id: str, scope: list[str], prior_error: str | None
+        self,
+        workstream_id: str,
+        scope: list[str],
+        approvals: set[tuple[str, str]],
     ) -> GateDecision:
         """Guard for READY -> RUNNING: classify the declared scope (REQ-605)."""
         sha = await self._git_sha(self._repo_path)
         payload = {"project": self._project, "sha": sha, "scope": scope}
         classification = await self._classify("--declared", payload)
-        return self._decide("ex_ante", workstream_id, sha, classification, prior_error)
+        return self._decide("ex_ante", workstream_id, sha, classification, approvals)
 
     async def evaluate_ex_post(
         self,
         workstream_id: str,
         scope: list[str],
         workspace: Path,
-        prior_error: str | None,
+        approvals: set[tuple[str, str]],
     ) -> GateDecision:
         """Guard for RUNNING -> MERGING: classify the actual diff vs base."""
         sha = await self._git_sha(workspace)
@@ -227,7 +255,7 @@ class GateKeeper:
             "declared_scope": scope,
         }
         classification = await self._classify("--no-fs", payload)
-        return self._decide("ex_post", workstream_id, sha, classification, prior_error)
+        return self._decide("ex_post", workstream_id, sha, classification, approvals)
 
     # ------------------------------------------------------------ decision
 
@@ -237,7 +265,7 @@ class GateKeeper:
         workstream_id: str,
         sha: str,
         classification: dict | str,
-        prior_error: str | None,
+        approvals: set[tuple[str, str]],
     ) -> GateDecision:
         ts = datetime.now(UTC).isoformat()
 
@@ -324,13 +352,10 @@ class GateKeeper:
         )
         if needs_approval:
             marker = f"{APPROVAL_MARKER_PREFIX} phase={phase} sha={sha}"
-            # H-3: the error_message marker is single-slot and phases overwrite
-            # each other; the verdict store is the durable memory. A recorded
-            # block for this exact (workstream, phase, sha) means the only way
-            # back here was an operator re-queue = approval.
-            approved = (
-                prior_error is not None and marker in prior_error
-            ) or self._prior_block_recorded(workstream_id, phase, sha)
+            # gates v1.3 (H-9): the DB approvals set is the single authority;
+            # the marker in the block message is operator UX + the H-6
+            # position signal, never authorization.
+            approved = (phase, sha) in approvals
             if approved:
                 records.append(
                     record(
@@ -359,8 +384,7 @@ class GateKeeper:
                     )
                 )
                 blocked_reason = (
-                    f"gates: human.owner_approval required ({detail}); "
-                    f"re-queue to approve. {marker}"
+                    f"{BLOCK_REASON_PREFIX} ({detail}); re-queue to approve. {marker}"
                 )
 
         self._write(records)
@@ -443,35 +467,6 @@ class GateKeeper:
             msg = stderr.decode(errors="replace").strip()
             raise RuntimeError(f"git {' '.join(args)} failed: {msg}")
         return stdout.decode()
-
-    def _prior_block_recorded(self, workstream_id: str, phase: str, sha: str) -> bool:
-        """Was an owner-approval block already recorded for this exact context?
-
-        Reads the run's gate_verdicts.jsonl (tolerant line-by-line): a record
-        {workstream_id, phase, sha, gate_id=human.owner_approval,
-        verdict=missing} means the workstream was blocked here before — and
-        NEEDS_REVIEW -> READY is a human-only transition, so re-arriving at
-        the same (phase, sha) implies an operator approval (H-3). A new
-        commit changes the sha and invalidates this memory (DESIGN-608).
-        """
-        path = self._log_dir / "gate_verdicts.jsonl"
-        if not path.exists():
-            return False
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if (
-                    rec.get("workstream_id") == workstream_id
-                    and rec.get("phase") == phase
-                    and rec.get("sha") == sha
-                    and rec.get("gate_id") == "human.owner_approval"
-                    and rec.get("verdict") == "missing"
-                ):
-                    return True
-        return False
 
     def _write(self, records: list[GateVerdictRecord]) -> None:
         self._log_dir.mkdir(parents=True, exist_ok=True)

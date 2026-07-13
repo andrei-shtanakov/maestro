@@ -1902,9 +1902,11 @@ class TestStartupRecovery:
         FAILED->NEEDS_REVIEW). A crash between them leaves a FAILED row
         carrying the marker. `can_retry()` is true here (gate blocks never
         increment retry_count), but a marker means "awaiting a human", not
-        "retryable failure" — routing it to READY would let
-        `evaluate_ex_post` read the marker in `prior_error` as operator
-        approval and merge to base with no human ever approving."""
+        "retryable failure" — routing it to READY would hide the pending
+        review instead of surfacing it (gates v1.3/H-9: the DB approvals
+        set is the sole authority, so `evaluate_ex_post` would still block
+        with an empty approvals set, but the workstream must land on
+        NEEDS_REVIEW, not silently retry, until an operator approves it)."""
         from maestro import orchestrator as orch_mod
 
         monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
