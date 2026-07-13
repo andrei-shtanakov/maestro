@@ -23,6 +23,7 @@ from maestro.gates import GateDecision, GateKeeper, pipeline_log_dir
 from maestro.git import GitError, MergeConflictError
 from maestro.merge_logs import merge_logs_dir
 from maestro.models import (
+    SPEC_PREFIX,
     OrchestratorConfig,
     Workstream,
     WorkstreamConfig,
@@ -803,7 +804,9 @@ class Orchestrator:
         """
         spec_dir = running.workspace_path / "spec"
         loop = asyncio.get_running_loop()
-        state = await loop.run_in_executor(None, read_executor_state, spec_dir)
+        state = await loop.run_in_executor(
+            None, read_executor_state, spec_dir, SPEC_PREFIX
+        )
 
         if state is None:
             return
