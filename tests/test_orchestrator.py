@@ -1843,6 +1843,93 @@ class TestStartupRecovery:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_ex_post_marker_survives_recovery_two_step(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        """A MERGING/PR_CREATED row stranded with an ex-post approval marker
+        (crash after the resume tail started but before DONE) must
+        reconcile to READY with the marker intact — the next tick's
+        `_spawn_workstream` re-reads it and takes the resume path
+        (`_try_resume_ex_post`) instead of a full respawn (H-6)."""
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            sha = "a" * 40
+            marker = _ex_post_marker(sha)
+            for zid, st in [
+                ("m", WorkstreamStatus.MERGING),
+                ("p", WorkstreamStatus.PR_CREATED),
+            ]:
+                w = self._seed(zid, st)
+                w.error_message = marker
+                await db.create_workstream(w)
+            count = await orch._recover_stranded_workstreams()
+            assert count == 2
+            for zid in ("m", "p"):
+                w = await db.get_workstream(zid)
+                assert w.status == WorkstreamStatus.READY
+                assert w.error_message is not None
+                assert "phase=ex_post" in w.error_message
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_failed_with_marker_reconciles_to_needs_review_not_ready(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        """Regression for Finding 1 (governance bypass): `_gate_ex_post`
+        blocks with TWO writes (RUNNING->FAILED-with-marker, then
+        FAILED->NEEDS_REVIEW). A crash between them leaves a FAILED row
+        carrying the marker. `can_retry()` is true here (gate blocks never
+        increment retry_count), but a marker means "awaiting a human", not
+        "retryable failure" — routing it to READY would let
+        `evaluate_ex_post` read the marker in `prior_error` as operator
+        approval and merge to base with no human ever approving."""
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            sha = "b" * 40
+            w = self._seed("gm", WorkstreamStatus.FAILED, retry_count=0, max_retries=3)
+            w.error_message = _ex_post_marker(sha)
+            await db.create_workstream(w)
+            await orch._recover_stranded_workstreams()
+            result = await db.get_workstream("gm")
+            assert result.status == WorkstreamStatus.NEEDS_REVIEW
+            assert result.error_message is not None
+            assert "phase=ex_post" in result.error_message
+            assert orch._stats.failed == 1
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_clean_states_untouched_and_count_zero(
         self,
         tmp_path,
@@ -2374,6 +2461,58 @@ class TestExPostResume:
             assert "error_message" in calls[-1]
             for c in calls[:-1]:
                 assert "error_message" not in c
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_pr_manager_error_appends_note_preserves_marker(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        """Regression for Finding 2 (marker clobber): on `PRManagerError`,
+        `_handle_success` used to overwrite `error_message` with just the
+        PR-creation note, destroying an ex-post approval marker mid-resume.
+        A later crash before DONE then loses the marker and full-respawns
+        instead of resuming. The note must be APPENDED to a marker-bearing
+        error_message instead — every pre-DONE write that touches
+        error_message must still contain the marker; only the DONE write
+        may clear it.
+        """
+        from maestro.pr_manager import PRManagerError
+
+        sha = "c" * 40
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(self._seed_ready("z5", sha))
+            mock_workspace_mgr.workspace_exists.return_value = True
+            orch._workspace_head = AsyncMock(return_value=sha)
+            orch._merge_into_base = MagicMock()
+            mock_pr_manager.push_and_create_pr.side_effect = PRManagerError(
+                "gh timeout"
+            )
+
+            calls: list[dict] = []
+            original = db.update_workstream_status
+
+            async def spy(zid, status, *args, **kwargs):
+                calls.append({"status": status, **kwargs})
+                return await original(zid, status, *args, **kwargs)
+
+            db.update_workstream_status = spy  # type: ignore[method-assign]
+
+            await orch._spawn_workstream("z5")
+
+            w = await db.get_workstream("z5")
+            # Merge still proceeds even though PR creation failed.
+            assert w.status == WorkstreamStatus.DONE
+            assert calls[-1]["status"] == WorkstreamStatus.DONE
+            assert calls[-1].get("error_message") is None
+            for c in calls[:-1]:
+                msg = c.get("error_message")
+                if msg is not None:
+                    assert "phase=ex_post" in msg
+                    assert "PR creation note" in msg
         finally:
             await db.close()
 

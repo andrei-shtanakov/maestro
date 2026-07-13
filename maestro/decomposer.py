@@ -298,7 +298,7 @@ class ProjectDecomposer:
 
         Raises:
             DecomposerError: if spec-runner is missing, exits non-zero,
-                times out, or exits 0 without producing spec/tasks.md.
+                times out, or exits 0 without producing spec/maestro-tasks.md.
         """
         spec_dir = workspace_path / "spec"
         spec_dir.mkdir(exist_ok=True)

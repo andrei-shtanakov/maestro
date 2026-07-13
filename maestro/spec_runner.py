@@ -5,7 +5,8 @@ for the executor state file. Previously Maestro's orchestrator parsed the
 state file as a plain dict directly from `.executor-state.json`, which
 broke silently when spec-runner 2.0 moved the source of truth to SQLite.
 
-Consumers should call `read_executor_state(spec_dir)` rather than opening
+Consumers should call `read_executor_state(spec_dir, prefix)` — passing the
+same `prefix` used for `spec_prefix` namespacing (H-7) — rather than opening
 the state file themselves so format changes stay isolated to this module.
 """
 

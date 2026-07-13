@@ -308,6 +308,18 @@ class Orchestrator:
                     # may be a live orphan — never reset to READY. Park for
                     # review. The NEEDS_REVIEW write below clears both pids.
                     target = WorkstreamStatus.NEEDS_REVIEW
+                elif parse_approval_marker(w.error_message) is not None:
+                    # `_gate_ex_post` blocks with TWO writes: RUNNING ->
+                    # FAILED-with-marker, then FAILED -> NEEDS_REVIEW. A
+                    # crash between them strands a FAILED row that still
+                    # carries the marker. can_retry() is true here (gate
+                    # blocks never increment retry_count), but the marker
+                    # means "awaiting a human", not "retryable failure" --
+                    # routing it to READY would let evaluate_ex_post read
+                    # the marker in prior_error as an operator approval
+                    # that never happened (governance bypass). Always
+                    # finish the interrupted write as NEEDS_REVIEW instead.
+                    target = WorkstreamStatus.NEEDS_REVIEW
                 else:
                     target = (
                         WorkstreamStatus.READY
@@ -1009,11 +1021,19 @@ class Orchestrator:
                     workstream_id,
                     e,
                 )
-                # Still mark as PR_CREATED (PR may exist)
+                # Still mark as PR_CREATED (PR may exist). If error_message
+                # currently carries an ex-post approval marker (H-6 resume
+                # tail), APPEND the note instead of overwriting it: an
+                # overwrite would destroy the marker mid-resume, and a
+                # later crash before DONE would then full-respawn instead
+                # of resuming (the marker clears ONLY on the DONE write).
+                note = f"PR creation note: {e}"
+                if parse_approval_marker(workstream.error_message) is not None:
+                    note = f"{workstream.error_message} | {note}"
                 await self._db.update_workstream_status(
                     workstream_id,
                     WorkstreamStatus.PR_CREATED,
-                    error_message=f"PR creation note: {e}",
+                    error_message=note,
                 )
 
         # Ensure the workstream is at PR_CREATED (both auto_pr paths converge
