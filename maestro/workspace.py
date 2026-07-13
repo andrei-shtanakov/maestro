@@ -4,6 +4,7 @@ This module provides WorkspaceManager for creating and managing
 isolated git worktrees for each workstream (independent work unit).
 """
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,9 +36,19 @@ _EXCLUDE_BEGIN = "# >>> maestro orchestrator artifacts (auto-managed) >>>"
 _EXCLUDE_END = "# <<< maestro orchestrator artifacts <<<"
 
 
+_EXCLUDE_BLOCK_RE = re.compile(
+    re.escape(_EXCLUDE_BEGIN) + r"\n.*?\n" + re.escape(_EXCLUDE_END),
+    re.DOTALL,
+)
+
+
 def _exclude_patterns() -> tuple[str, ...]:
     return (
         f"spec/{SPEC_PREFIX}*",
+        # Dot-before-prefix files: spec-runner names task-history and the
+        # spec lock `spec/.{prefix}task-history.log` / `spec/.{prefix}spec.lock`
+        # (H-8) — the leading dot puts them outside `spec/{prefix}*`.
+        f"spec/.{SPEC_PREFIX}*",
         "spec/.executor-*",
         "/spec-runner.config.yaml",
     )
@@ -51,6 +62,10 @@ def ensure_harness_excludes(repo_or_worktree: Path) -> None:
     dir; a per-worktree exclude does not exist without worktreeConfig).
     `spec/.executor-*` is deliberately broader than the prefix: runtime
     state (incl. the unprefixed `.executor-stop`) must never be committed.
+
+    An existing block is refreshed in place rather than left untouched: the
+    pattern set evolves across versions (gates v1.2.1 added `spec/.maestro-*`,
+    H-8), and repos touched by an older version must pick up new patterns.
 
     Raises:
         WorkspaceError: If the path is not inside a git repository.
@@ -76,10 +91,15 @@ def ensure_harness_excludes(repo_or_worktree: Path) -> None:
         raise WorkspaceError(msg)
     exclude = Path(result.stdout.strip()) / "info" / "exclude"
     existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+    block = "\n".join([_EXCLUDE_BEGIN, *_exclude_patterns(), _EXCLUDE_END])
     if _EXCLUDE_BEGIN in existing:
+        # Refresh an existing block in place (migration). subn with count=1
+        # replaces the first well-formed block; a no-op when already current.
+        new_text, n = _EXCLUDE_BLOCK_RE.subn(lambda _: block, existing, count=1)
+        if n and new_text != existing:
+            exclude.write_text(new_text, encoding="utf-8")
         return
     exclude.parent.mkdir(parents=True, exist_ok=True)
-    block = "\n".join([_EXCLUDE_BEGIN, *_exclude_patterns(), _EXCLUDE_END])
     with exclude.open("a", encoding="utf-8") as handle:
         if existing and not existing.endswith("\n"):
             handle.write("\n")
@@ -185,6 +205,9 @@ class WorkspaceManager:
             spec_dir / ".executor-state.lock",
             spec_dir / ".executor-progress.txt",
             spec_dir / ".task-history.log",
+            # Dot-before-prefix state (H-8): a stale lock would block the run.
+            spec_dir / f".{SPEC_PREFIX}task-history.log",
+            spec_dir / f".{SPEC_PREFIX}spec.lock",
         ]:
             stale.unlink(missing_ok=True)
 

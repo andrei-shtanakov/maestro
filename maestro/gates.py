@@ -95,8 +95,13 @@ def parse_approval_marker(error_message: str | None) -> ApprovalMarker | None:
 # `spec-runner.config.yaml` — in a repo that tracks its own config,
 # Maestro's overwrite must surface as a scope violation (fail-closed
 # backstop); in a repo without one the file is untracked+ignored and
-# never enters the diff.
-_ORCHESTRATOR_MANAGED = (f"spec/{SPEC_PREFIX}", "spec/.executor-")
+# never enters the diff. `spec/.{prefix}` covers the dot-before-prefix
+# harness files (task-history, spec lock) spec-runner writes (H-8).
+_ORCHESTRATOR_MANAGED = (
+    f"spec/{SPEC_PREFIX}",
+    f"spec/.{SPEC_PREFIX}",
+    "spec/.executor-",
+)
 
 
 def _orchestrator_managed(path: str) -> bool:
