@@ -1391,6 +1391,7 @@ class TestSchemaMigrationsJournal:
                 (3, "r06b_rename_zadachi_to_workstreams"),
                 (4, "cost_from_log_reported_cost"),
                 (5, "decomposing_generation_pid"),
+                (6, "gates_v13_gate_approvals"),
             ]
         finally:
             await db.close()
@@ -1414,7 +1415,7 @@ class TestSchemaMigrationsJournal:
             )
             row = await cursor.fetchone()
             assert row is not None
-            assert row["n"] == 5
+            assert row["n"] == 6
         finally:
             await db2.close()
 
@@ -1492,6 +1493,7 @@ class TestSchemaMigrationsJournal:
                 (3, "r06b_rename_zadachi_to_workstreams"),
                 (4, "cost_from_log_reported_cost"),
                 (5, "decomposing_generation_pid"),
+                (6, "gates_v13_gate_approvals"),
             ]
             # Sanity: the idempotent ALTERs must not have fired twice.
             cursor = await db._connection.execute("PRAGMA table_info(tasks)")
@@ -1997,3 +1999,160 @@ async def test_generation_pid_migration_idempotent(tmp_path) -> None:
         assert "generation_pid" in cols
     finally:
         await db2.close()
+
+
+class TestGateApprovals:
+    """gates v1.3 (H-9): durable approval memory + audit trail."""
+
+    @pytest.mark.anyio
+    async def test_record_and_list(self, tmp_path) -> None:
+        from maestro.database import Database
+
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        try:
+            await db.record_gate_approval("z1", "ex_post", "a" * 40)
+            await db.record_gate_approval("z1", "ex_ante", "b" * 40)
+            approvals = await db.list_gate_approvals("z1")
+            assert approvals == {("ex_post", "a" * 40), ("ex_ante", "b" * 40)}
+            # Other workstreams see nothing.
+            assert await db.list_gate_approvals("z2") == set()
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_record_idempotent(self, tmp_path) -> None:
+        from maestro.database import Database
+
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        try:
+            await db.record_gate_approval("z1", "ex_post", "a" * 40)
+            await db.record_gate_approval("z1", "ex_post", "a" * 40)  # no raise
+            assert await db.list_gate_approvals("z1") == {("ex_post", "a" * 40)}
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_migration_v6_creates_table_on_old_db(self, tmp_path) -> None:
+        """A database created before v6 gains the table via the journal."""
+        import aiosqlite
+
+        from maestro.database import Database
+
+        # Fresh connect creates everything (SCHEMA_SQL path) — verify the
+        # journal recorded v6 too, then verify a re-connect no-ops.
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        await db.close()
+        async with aiosqlite.connect(tmp_path / "t.db") as conn:
+            cursor = await conn.execute(
+                "SELECT version FROM schema_migrations WHERE version = 6"
+            )
+            assert await cursor.fetchone() is not None
+            cursor = await conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'gate_approvals'"
+            )
+            assert await cursor.fetchone() is not None
+        db2 = Database(tmp_path / "t.db")
+        await db2.connect()  # idempotent re-apply must not raise
+        await db2.close()
+
+
+class TestApproveWorkstreamWithGateRecord:
+    """gates v1.3: the approval act is ONE transaction — record + requeue."""
+
+    async def _db_with_needs_review(self, tmp_path, zid="z1", msg="gates: ..."):
+        from maestro.database import Database
+        from maestro.models import Workstream, WorkstreamStatus
+
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        await db.create_workstream(
+            Workstream(
+                id=zid,
+                title=zid,
+                description="d",
+                scope=["s"],
+                branch=f"feature/{zid}",
+                status=WorkstreamStatus.NEEDS_REVIEW,
+                error_message=msg,
+            )
+        )
+        return db
+
+    @pytest.mark.anyio
+    async def test_records_and_requeues_atomically(self, tmp_path) -> None:
+        from maestro.models import WorkstreamStatus
+
+        db = await self._db_with_needs_review(tmp_path)
+        try:
+            w = await db.approve_workstream_with_gate_record("z1", "ex_post", "a" * 40)
+            assert w.status == WorkstreamStatus.READY
+            assert w.error_message == "gates: ..."  # message preserved
+            assert await db.list_gate_approvals("z1") == {("ex_post", "a" * 40)}
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_phase_none_requeues_without_recording(self, tmp_path) -> None:
+        from maestro.models import WorkstreamStatus
+
+        db = await self._db_with_needs_review(tmp_path)
+        try:
+            w = await db.approve_workstream_with_gate_record("z1", None, None)
+            assert w.status == WorkstreamStatus.READY
+            assert await db.list_gate_approvals("z1") == set()
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_wrong_status_raises_and_records_nothing(self, tmp_path) -> None:
+        from maestro.models import WorkstreamStatus
+
+        db = await self._db_with_needs_review(tmp_path)
+        try:
+            await db.update_workstream_status("z1", WorkstreamStatus.READY)
+            with pytest.raises(ValueError, match="only NEEDS_REVIEW"):
+                await db.approve_workstream_with_gate_record("z1", "ex_post", "a" * 40)
+            # The transaction rolled back: no approval row either.
+            assert await db.list_gate_approvals("z1") == set()
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_unknown_workstream_raises_not_found(self, tmp_path) -> None:
+        from maestro.database import Database, WorkstreamNotFoundError
+
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        try:
+            with pytest.raises(WorkstreamNotFoundError):
+                await db.approve_workstream_with_gate_record(
+                    "ghost", "ex_post", "a" * 40
+                )
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("phase", "sha"),
+        [("ex_post", None), (None, "a" * 40)],
+    )
+    async def test_partial_phase_sha_rejected_fail_closed(
+        self, tmp_path, phase, sha
+    ) -> None:
+        """The single sanctioned approval point rejects a partially-specified
+        pair rather than silently recording nothing (Copilot review)."""
+        db = await self._db_with_needs_review(tmp_path)
+        try:
+            with pytest.raises(ValueError, match=r"both provided .* or"):
+                await db.approve_workstream_with_gate_record("z1", phase, sha)
+            # Nothing recorded and the row is untouched (no status flip).
+            assert await db.list_gate_approvals("z1") == set()
+            from maestro.models import WorkstreamStatus
+
+            w = await db.get_workstream("z1")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+        finally:
+            await db.close()

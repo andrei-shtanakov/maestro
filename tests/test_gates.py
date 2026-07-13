@@ -13,6 +13,7 @@ import pytest
 from maestro.gates import (
     APPROVAL_MARKER_PREFIX,
     GateKeeper,
+    parse_approval_marker,
     pipeline_log_dir,
 )
 from maestro.models import GatesConfig, OrchestratorConfig, WorkstreamStatus
@@ -123,6 +124,21 @@ def _keeper(fake_steward: Path, repo: Path, tmp_path: Path) -> GateKeeper:
     )
 
 
+def _make_keeper(tmp_path: Path) -> GateKeeper:
+    """A GateKeeper for `_decide`-only tests (pure method — no steward/git).
+
+    `_decide` never shells out, so unlike `_keeper` this needs no
+    `fake_steward`/`repo` fixtures.
+    """
+    return GateKeeper(
+        GatesConfig(steward_bin="/nonexistent"),
+        project="demo",
+        repo_path=tmp_path,
+        base_branch="master",
+        log_dir=tmp_path / "logs",
+    )
+
+
 def _set_tier(fake_steward: Path, tier: str) -> None:
     (fake_steward.parent / "TIER").write_text(tier)
 
@@ -134,7 +150,7 @@ async def test_ex_ante_low_tier_allows_and_writes_records(
     fake_steward: Path, repo: Path, tmp_path: Path
 ) -> None:
     keeper = _keeper(fake_steward, repo, tmp_path)
-    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], approvals=set())
     assert decision.allow
     gate_ids = [r.gate_id for r in decision.records]
     assert "steward.risk_classify_ex_ante" in gate_ids
@@ -149,7 +165,7 @@ async def test_ex_ante_high_tier_blocks_for_approval(
 ) -> None:
     _set_tier(fake_steward, "high")
     keeper = _keeper(fake_steward, repo, tmp_path)
-    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], approvals=set())
     assert not decision.allow
     assert decision.reason and APPROVAL_MARKER_PREFIX in decision.reason
     approvals = [r for r in decision.records if r.gate_id == "human.owner_approval"]
@@ -160,13 +176,17 @@ async def test_ex_ante_high_tier_blocks_for_approval(
 async def test_ex_ante_operator_requeue_counts_as_approval(
     fake_steward: Path, repo: Path, tmp_path: Path
 ) -> None:
-    # Blocked once -> operator flips NEEDS_REVIEW -> READY; the stored reason
-    # (same phase, same sha) is the approval memory.
+    # Blocked once -> operator approves (gates v1.3: recorded in the DB
+    # approvals set, same phase + same sha) -> re-evaluation allows.
     _set_tier(fake_steward, "high")
     keeper = _keeper(fake_steward, repo, tmp_path)
-    first = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    first = await keeper.evaluate_ex_ante("ws-1", ["src/**"], approvals=set())
     assert not first.allow
-    second = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=first.reason)
+    marker = parse_approval_marker(first.reason)
+    assert marker is not None
+    second = await keeper.evaluate_ex_ante(
+        "ws-1", ["src/**"], approvals={(marker.phase, marker.sha)}
+    )
     assert second.allow
     approvals = [r for r in second.records if r.gate_id == "human.owner_approval"]
     assert approvals and approvals[0].verdict == "pass"
@@ -175,10 +195,13 @@ async def test_ex_ante_operator_requeue_counts_as_approval(
 async def test_ex_ante_approval_invalidated_by_new_sha(
     fake_steward: Path, repo: Path, tmp_path: Path
 ) -> None:
-    # M-3: a new commit invalidates the stored approval (marker carries the sha).
+    # M-3/DESIGN-608: a new commit changes the sha, so the approval
+    # recorded for the old sha no longer matches.
     _set_tier(fake_steward, "high")
     keeper = _keeper(fake_steward, repo, tmp_path)
-    first = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    first = await keeper.evaluate_ex_ante("ws-1", ["src/**"], approvals=set())
+    marker = parse_approval_marker(first.reason)
+    assert marker is not None
     env = {
         **os.environ,
         "GIT_AUTHOR_NAME": "t",
@@ -193,7 +216,9 @@ async def test_ex_ante_approval_invalidated_by_new_sha(
         capture_output=True,
         env=env,
     )
-    second = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=first.reason)
+    second = await keeper.evaluate_ex_ante(
+        "ws-1", ["src/**"], approvals={(marker.phase, marker.sha)}
+    )
     assert not second.allow
 
 
@@ -206,7 +231,7 @@ async def test_missing_binary_fails_closed(repo: Path, tmp_path: Path) -> None:
         base_branch="master",
         log_dir=tmp_path / "logs" / "01TEST",
     )
-    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], approvals=set())
     assert not decision.allow
     errs = [r for r in decision.records if r.verdict == "error"]
     assert errs and errs[0].obligation == "mandatory"
@@ -217,7 +242,7 @@ async def test_steward_failure_fails_closed(
 ) -> None:
     fake_steward.write_text("#!/bin/sh\nexit 2\n")  # noqa: ASYNC240
     keeper = _keeper(fake_steward, repo, tmp_path)
-    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], approvals=set())
     assert not decision.allow
     assert any(r.verdict == "error" for r in decision.records)
 
@@ -231,7 +256,7 @@ async def test_ex_post_within_scope_allows(
     workspace = _branch_with_change(repo, "src/a.py", "x = 3\n")
     keeper = _keeper(fake_steward, repo, tmp_path)
     decision = await keeper.evaluate_ex_post(
-        "ws-1", ["src/**"], workspace=workspace, prior_error=None
+        "ws-1", ["src/**"], workspace=workspace, approvals=set()
     )
     assert decision.allow
 
@@ -242,7 +267,7 @@ async def test_ex_post_scope_violation_blocks(
     workspace = _branch_with_change(repo, "rogue.txt", "outside\n")
     keeper = _keeper(fake_steward, repo, tmp_path)
     decision = await keeper.evaluate_ex_post(
-        "ws-1", ["src/**"], workspace=workspace, prior_error=None
+        "ws-1", ["src/**"], workspace=workspace, approvals=set()
     )
     assert not decision.allow
 
@@ -414,6 +439,7 @@ async def test_orchestrator_ex_ante_block_routes_to_needs_review(
     orch._gates = _FakeKeeper(allow=False)  # type: ignore[assignment]
     orch._db = MagicMock()
     orch._db.update_workstream_status = AsyncMock()
+    orch._db.list_gate_approvals = AsyncMock(return_value=set())
     orch._logger = MagicMock()
     allowed = await orch._gate_ex_ante("ws-1", _workstream(WorkstreamStatus.READY))
     assert allowed is False
@@ -444,7 +470,7 @@ async def test_structurally_invalid_steward_json_fails_closed(
     # become an error verdict, not a KeyError escaping the guard.
     fake_steward.write_text('#!/bin/sh\necho "{}"\n')  # noqa: ASYNC240
     keeper = _keeper(fake_steward, repo, tmp_path)
-    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], approvals=set())
     assert not decision.allow
     assert any(r.verdict == "error" for r in decision.records)
 
@@ -454,65 +480,21 @@ async def test_non_object_steward_json_fails_closed(
 ) -> None:
     fake_steward.write_text('#!/bin/sh\necho "[1, 2]"\n')  # noqa: ASYNC240
     keeper = _keeper(fake_steward, repo, tmp_path)
-    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
+    decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], approvals=set())
     assert not decision.allow
 
 
 # ------------------------------------------- gates v1.1 (governed-run findings H-3..H-5)
 
-
-async def test_h3_approval_survives_via_verdict_store(
-    fake_steward: Path, repo: Path, tmp_path: Path
-) -> None:
-    # H-3: the error_message marker gets overwritten between phases; the
-    # verdict store is the durable approval memory. A prior recorded block
-    # for the SAME (workstream, phase, sha) counts as operator approval on
-    # re-evaluation even when prior_error carries no marker.
-    _set_tier(fake_steward, "high")
-    keeper = _keeper(fake_steward, repo, tmp_path)
-    first = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
-    assert not first.allow
-    # prior_error=None — e.g. the ex-post phase overwrote the marker.
-    second = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
-    assert second.allow, "recorded block + re-queue must count as approval"
-    approvals = [r for r in second.records if r.gate_id == "human.owner_approval"]
-    assert approvals and approvals[0].verdict == "pass"
-
-
-async def test_h3_store_approval_still_invalidated_by_new_sha(
-    fake_steward: Path, repo: Path, tmp_path: Path
-) -> None:
-    _set_tier(fake_steward, "high")
-    keeper = _keeper(fake_steward, repo, tmp_path)
-    first = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
-    assert not first.allow
-    env = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "t",
-        "GIT_AUTHOR_EMAIL": "t@t",
-        "GIT_COMMITTER_NAME": "t",
-        "GIT_COMMITTER_EMAIL": "t@t",
-    }
-    (repo / "src" / "a.py").write_text("x = 3\n")
-    subprocess.run(  # noqa: ASYNC221
-        ["git", "-C", str(repo), "commit", "-am", "new"],
-        check=True,
-        capture_output=True,
-        env=env,
-    )
-    second = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
-    assert not second.allow, "a new commit must invalidate the stored approval"
-
-
-async def test_h3_other_workstream_block_does_not_approve(
-    fake_steward: Path, repo: Path, tmp_path: Path
-) -> None:
-    _set_tier(fake_steward, "high")
-    keeper = _keeper(fake_steward, repo, tmp_path)
-    first = await keeper.evaluate_ex_ante("ws-other", ["src/**"], prior_error=None)
-    assert not first.allow
-    second = await keeper.evaluate_ex_ante("ws-1", ["src/**"], prior_error=None)
-    assert not second.allow, "approval memory is per workstream"
+# NOTE (gates v1.3, H-9): the H-3 verdict-store fallback (`_prior_block_recorded`
+# reading gate_verdicts.jsonl to infer a re-queue approval) is DELETED — the DB
+# `gate_approvals` set is now the single authority. The three tests that used to
+# exercise that fallback (test_h3_approval_survives_via_verdict_store,
+# test_h3_store_approval_still_invalidated_by_new_sha,
+# test_h3_other_workstream_block_does_not_approve) are removed with it; their
+# sha-binding and per-workstream-isolation guarantees are re-covered under the
+# new contract by TestApprovalsAuthority below and
+# test_ex_ante_approval_invalidated_by_new_sha above.
 
 
 async def test_h4_orchestrator_managed_paths_do_not_violate_scope(
@@ -547,46 +529,147 @@ async def test_h4_orchestrator_managed_paths_do_not_violate_scope(
     )
     keeper = _keeper(fake_steward, repo, tmp_path)
     decision = await keeper.evaluate_ex_post(
-        "ws-1", ["src/**"], workspace=workspace, prior_error=None
+        "ws-1", ["src/**"], workspace=workspace, approvals=set()
     )
     assert decision.allow, (decision.reason, [r.note for r in decision.records])
 
 
-def test_h5_workstream_approve_cli_flips_needs_review_to_ready(tmp_path: Path) -> None:
+def test_workstream_approve_records_durable_approval(tmp_path: Path) -> None:
+    """gates v1.3: the sanctioned CLI point writes the gate_approvals row."""
     import asyncio as _asyncio
 
-    from maestro.database import Database
-    from maestro.models import Workstream, WorkstreamStatus
+    sha = "a" * 40
 
-    async def scenario() -> tuple[str, str | None]:
-        db = Database(tmp_path / "m.db")
+    async def scenario():
+        from maestro.cli import _approve_workstream
+        from maestro.database import Database
+        from maestro.gates import APPROVAL_MARKER_PREFIX
+        from maestro.models import Workstream, WorkstreamStatus
+
+        db = Database(tmp_path / "t.db")
         await db.connect()
-        ws = Workstream(
-            id="ws-1",
-            title="t",
-            description="d",
-            scope=["src/**"],
-            status=WorkstreamStatus.PENDING,
-            branch="feature/ws-1",
-        )
         try:
-            await db.create_workstream(ws)
-            await db.update_workstream_status(
-                "ws-1",
-                WorkstreamStatus.NEEDS_REVIEW,
-                error_message="gates: ... marker",
+            await db.create_workstream(
+                Workstream(
+                    id="ws-1",
+                    title="t",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/ws-1",
+                    status=WorkstreamStatus.NEEDS_REVIEW,
+                    error_message=(
+                        "gates: human.owner_approval required (tier=high); "
+                        "re-queue to approve. "
+                        f"{APPROVAL_MARKER_PREFIX} phase=ex_post sha={sha}"
+                    ),
+                )
             )
-            from maestro.cli import _approve_workstream
-
-            await _approve_workstream(db, "ws-1")
+            marker = await _approve_workstream(db, "ws-1")
             after = await db.get_workstream("ws-1")
-            return after.status, after.error_message
+            approvals = await db.list_gate_approvals("ws-1")
+            return marker, after, approvals
         finally:
             await db.close()
 
-    status, error_message = _asyncio.run(scenario())
+    marker, after, approvals = _asyncio.run(scenario())
+    assert after.status == WorkstreamStatus.READY
+    assert after.error_message and "phase=ex_post" in after.error_message
+    assert approvals == {("ex_post", sha)}
+    assert marker is not None and marker.phase == "ex_post" and marker.sha == sha
+
+
+def test_workstream_approve_without_marker_records_nothing(tmp_path: Path) -> None:
+    import asyncio as _asyncio
+
+    async def scenario():
+        from maestro.cli import _approve_workstream
+        from maestro.database import Database
+        from maestro.models import Workstream, WorkstreamStatus
+
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="ws-2",
+                    title="t",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/ws-2",
+                    status=WorkstreamStatus.NEEDS_REVIEW,
+                    error_message="Base merge failed: conflict",
+                )
+            )
+            marker = await _approve_workstream(db, "ws-2")
+            return (
+                marker,
+                await db.list_gate_approvals("ws-2"),
+                (await db.get_workstream("ws-2")).status,
+            )
+        finally:
+            await db.close()
+
+    marker, approvals, status = _asyncio.run(scenario())
+    assert marker is None
+    assert approvals == set()
     assert status == WorkstreamStatus.READY
-    assert error_message and "marker" in error_message, "marker must be preserved"
+
+
+def test_workstream_approve_takes_effect_in_next_gate_evaluation(
+    tmp_path: Path,
+) -> None:
+    """End-to-end CLI -> DB -> gate loop (Task 3 final-review gap).
+
+    Seeds a NEEDS_REVIEW workstream with an ex_post marker for sha X,
+    approves it via the sanctioned CLI entry point, then feeds the
+    resulting DB approvals set straight into `GateKeeper._decide` for
+    that same phase+sha and asserts the gate now allows. Before this
+    task's rewire, `_approve_workstream` recorded nothing in
+    `gate_approvals`, so this evaluation would still block.
+    """
+    import asyncio as _asyncio
+
+    sha = "c" * 40
+
+    async def scenario():
+        from maestro.cli import _approve_workstream
+        from maestro.database import Database
+        from maestro.gates import APPROVAL_MARKER_PREFIX
+        from maestro.models import Workstream, WorkstreamStatus
+
+        db = Database(tmp_path / "loop.db")
+        await db.connect()
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="ws-loop",
+                    title="t",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/ws-loop",
+                    status=WorkstreamStatus.NEEDS_REVIEW,
+                    error_message=(
+                        "gates: human.owner_approval required (tier=high); "
+                        "re-queue to approve. "
+                        f"{APPROVAL_MARKER_PREFIX} phase=ex_post sha={sha}"
+                    ),
+                )
+            )
+            await _approve_workstream(db, "ws-loop")
+            return await db.list_gate_approvals("ws-loop")
+        finally:
+            await db.close()
+
+    approvals = _asyncio.run(scenario())
+    keeper = _make_keeper(tmp_path)
+    decision = keeper._decide(
+        "ex_post",
+        "ws-loop",
+        sha,
+        {"tier": "high", "mandatory_gates": [], "flags": []},
+        approvals=approvals,
+    )
+    assert decision.allow is True
 
 
 # --------------------------------- gates v1.2 (H-6): resume via approval marker
@@ -663,3 +746,132 @@ class TestParseApprovalMarker:
         assert parse_approval_marker("spec-runner exited with code 2") is None
         # Prefix present but malformed tail -> no marker.
         assert parse_approval_marker("gates:approval-required phase=bogus") is None
+
+
+class TestApprovalsAuthority:
+    """gates v1.3 (H-9): the DB approvals set is the ONLY approval source."""
+
+    def test_approved_when_pair_in_set(self, tmp_path) -> None:
+        keeper = _make_keeper(tmp_path)  # use the file's existing helper/fixture
+        sha = "a" * 40
+        decision = keeper._decide(
+            "ex_post",
+            "z1",
+            sha,
+            {"tier": "high", "mandatory_gates": [], "flags": []},
+            approvals={("ex_post", sha)},
+        )
+        assert decision.allow is True
+
+    def test_marker_in_message_does_NOT_grant_approval(self, tmp_path) -> None:
+        """KEY regression guard: pre-v1.3 the marker in prior_error granted
+        approval; now only the DB set does."""
+        keeper = _make_keeper(tmp_path)
+        sha = "a" * 40
+        decision = keeper._decide(
+            "ex_post",
+            "z1",
+            sha,
+            {"tier": "high", "mandatory_gates": [], "flags": []},
+            approvals=set(),
+        )
+        assert decision.allow is False
+        assert "re-queue to approve" in (decision.reason or "")
+
+    def test_sha_bound(self, tmp_path) -> None:
+        """DESIGN-608: an approval for sha X never approves sha Y."""
+        keeper = _make_keeper(tmp_path)
+        decision = keeper._decide(
+            "ex_post",
+            "z1",
+            "b" * 40,  # evaluated at sha Y...
+            {"tier": "high", "mandatory_gates": [], "flags": []},
+            approvals={("ex_post", "a" * 40)},  # ...approved at sha X
+        )
+        assert decision.allow is False
+
+    def test_prior_block_recorded_is_gone(self) -> None:
+        from maestro.gates import GateKeeper
+
+        assert not hasattr(GateKeeper, "_prior_block_recorded")
+
+    def test_block_reason_uses_exported_prefix(self, tmp_path) -> None:
+        from maestro.gates import BLOCK_REASON_PREFIX
+
+        keeper = _make_keeper(tmp_path)
+        decision = keeper._decide(
+            "ex_ante",
+            "z1",
+            "c" * 40,
+            {"tier": "high", "mandatory_gates": [], "flags": []},
+            approvals=set(),
+        )
+        assert (decision.reason or "").startswith(BLOCK_REASON_PREFIX)
+
+
+# ------------------------------------- gates v1.3 (H-9): cross-restart e2e
+
+
+def test_cross_phase_approval_survives_restart(tmp_path) -> None:
+    """gates v1.3: an ex-ante approval recorded in the DB survives an
+    ex-post block message AND a new GateKeeper with a fresh log_dir
+    (= orchestrator restart, new pipeline ULID)."""
+    import asyncio as _asyncio
+
+    sha = "a" * 40
+
+    async def scenario():
+        from maestro.database import Database
+
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        try:
+            await db.record_gate_approval("z1", "ex_ante", sha)
+            return await db.list_gate_approvals("z1")
+        finally:
+            await db.close()
+
+    approvals = _asyncio.run(scenario())
+    # A brand-new keeper (fresh log_dir simulates the restart) approves
+    # ex-ante from the DB set alone; the ex-post pair is still missing.
+    keeper = _make_keeper(tmp_path / "fresh-logs")
+    ex_ante = keeper._decide(
+        "ex_ante",
+        "z1",
+        sha,
+        {"tier": "high", "mandatory_gates": [], "flags": []},
+        approvals=approvals,
+    )
+    ex_post = keeper._decide(
+        "ex_post",
+        "z1",
+        sha,
+        {"tier": "high", "mandatory_gates": [], "flags": []},
+        approvals=approvals,
+    )
+    assert ex_ante.allow is True
+    assert ex_post.allow is False  # per-phase, not per-workstream
+
+
+class TestPreserveApprovalMarker:
+    def test_appends_marker_from_prior(self) -> None:
+        from maestro.gates import APPROVAL_MARKER_PREFIX, preserve_approval_marker
+
+        marker = f"{APPROVAL_MARKER_PREFIX} phase=ex_post sha={'a' * 40}"
+        out = preserve_approval_marker("spec-runner exited 1", f"blocked. {marker}")
+        assert out == f"spec-runner exited 1 | {marker}"
+
+    def test_idempotent_no_duplication(self) -> None:
+        from maestro.gates import APPROVAL_MARKER_PREFIX, preserve_approval_marker
+
+        marker = f"{APPROVAL_MARKER_PREFIX} phase=ex_post sha={'a' * 40}"
+        once = preserve_approval_marker("err2", f"err1 | {marker}")
+        assert once.count(APPROVAL_MARKER_PREFIX) == 1
+        # New message already carrying the marker is returned as-is.
+        assert preserve_approval_marker(once, once) == once
+
+    def test_no_marker_passthrough(self) -> None:
+        from maestro.gates import preserve_approval_marker
+
+        assert preserve_approval_marker("err", None) == "err"
+        assert preserve_approval_marker("err", "plain failure") == "err"

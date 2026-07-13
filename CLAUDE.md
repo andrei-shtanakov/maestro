@@ -33,6 +33,7 @@ uv run maestro approve <task-id> --db maestro.db  # Approve an AWAITING_APPROVAL
 # === Multi-Process Orchestrator (new mode) ===
 uv run maestro orchestrate <project.yaml>   # Run orchestrator
 uv run maestro workstreams --db maestro.db       # Show workstreams status
+uv run maestro workstream-approve <workstream-id> --db maestro.db  # Approve a NEEDS_REVIEW workstream — records the durable gate approval (phase+sha) and re-queues
 uv run maestro workspaces <project.yaml>     # List active worktrees
 
 # === Mode-2 config authoring ===
