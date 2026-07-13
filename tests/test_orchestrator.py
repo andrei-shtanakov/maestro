@@ -80,6 +80,24 @@ def mock_pr_manager() -> MagicMock:
     return mgr
 
 
+@pytest.fixture(autouse=True)
+def _no_real_git_excludes():
+    """Default-patch `ensure_harness_excludes` (git-backed, unit-tested in
+    test_workspace.py) to a no-op for every test in this module.
+
+    Orchestrator tests exercise `_spawn_workstream`/`_generate_and_launch`
+    against fake or mocked workspace paths that are not real git repos;
+    without this, the real `ensure_harness_excludes` call (H-7) raises
+    `WorkspaceError` before `generate_spec` ever runs, which starves any
+    test waiting on the mocked `generate_spec` side effect (deadlock, not
+    just a failure). Tests that specifically assert on this call (e.g.
+    `TestSpawnHarnessIsolation`) apply their own nested `patch(...)`,
+    which layers on top of this one without conflict.
+    """
+    with patch("maestro.orchestrator.ensure_harness_excludes"):
+        yield
+
+
 @pytest.fixture
 def orchestrator(
     mock_db: MagicMock,
@@ -897,7 +915,6 @@ class TestBackgroundGeneration:
         orchestrator._workspace_mgr.get_workspace_path = MagicMock(
             return_value=workspace
         )
-        orchestrator._commit_spec_in_workspace = MagicMock()
 
         mock_db.get_workstream = AsyncMock(
             return_value=_ws("z1", WorkstreamStatus.READY)
@@ -942,7 +959,6 @@ class TestBackgroundGeneration:
         orchestrator._workspace_mgr.get_workspace_path = MagicMock(
             return_value=workspace
         )
-        orchestrator._commit_spec_in_workspace = MagicMock()
         mock_db.get_workstream = AsyncMock(
             return_value=_ws("z1", WorkstreamStatus.READY)
         )
@@ -1016,7 +1032,14 @@ class TestBackgroundGeneration:
 
         await orchestrator._spawn_ready(["z1"])
         first = orchestrator._generating["z1"]
-        await asyncio.sleep(0)  # let the task run up to the blocked call
+        # Let the task run up to the blocked call. H-7 now interposes an
+        # executor round-trip (ensure_harness_excludes) before
+        # generate_spec, so a single sleep(0) no longer reliably reaches
+        # it -- pump the loop until the mock actually records the call.
+        for _ in range(100):
+            if mock_decomposer.generate_spec.called:
+                break
+            await asyncio.sleep(0)
 
         # Second tick before z1 flips to DECOMPOSING: must not overwrite.
         await orchestrator._spawn_ready(["z1"])
@@ -1108,11 +1131,10 @@ class TestGenerationPidLifecycle:
             # entry-clear assertion actually proves the re-decompose window
             # is closed (rather than the field coincidentally being None).
             await db.create_workstream(self._seed("a", generation_pid=4242))
-            # Stub the downstream _spawn_workstream steps that would
+            # Stub the downstream _spawn_workstream step that would
             # otherwise touch the real filesystem/subprocess so the happy
-            # path can reach a clean end: committing the generated spec in
-            # the worktree, and the `spec-runner run --all` process spawn.
-            orch._commit_spec_in_workspace = MagicMock()
+            # path can reach a clean end: the `spec-runner run --all`
+            # process spawn.
             fake_process = MagicMock(pid=12345)
             pid_calls = self._spy_generation_pid_writes(db)
             with patch(
@@ -1275,10 +1297,9 @@ class TestSpawnWritesSentinel:
                     status=WorkstreamStatus.READY,
                 )
             )
-            # Stub the downstream steps that would otherwise touch the real
+            # Stub the downstream step that would otherwise touch the real
             # filesystem/subprocess, as TestGenerationPidLifecycle does, so
             # the flow reaches the RUNNING spawn.
-            orch._commit_spec_in_workspace = MagicMock()
             fake_process = MagicMock(pid=12345)
             with patch(
                 "maestro.orchestrator.asyncio.create_subprocess_exec",
@@ -2162,5 +2183,75 @@ class TestHandleSuccessMergeGating:
             # ...which happens after
             assert orch._stats.completed == 1
             assert (await db.get_workstream("a")).status == WorkstreamStatus.DONE
+        finally:
+            await db.close()
+
+
+class TestSpawnHarnessIsolation:
+    """gates v1.2 (H-7): config lands before generation, artifacts are
+    ignored (never committed), and run --all is prefix-namespaced."""
+
+    @pytest.mark.anyio
+    async def test_config_before_generate_no_commit_prefixed_run(
+        self, tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+    ) -> None:
+        from maestro.database import Database
+        from maestro.models import SPEC_PREFIX
+
+        db = Database(tmp_path / "o.db")
+        await db.connect()
+        order: list[str] = []
+
+        mock_workspace_mgr.setup_spec_runner = MagicMock(
+            side_effect=lambda *_a, **_k: order.append("config")
+        )
+        decomposer = MagicMock()
+
+        async def gen(workstream, workspace_path, *, on_pid=None):
+            order.append("generate")
+
+        decomposer.generate_spec = gen
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        orch = Orchestrator(
+            db=db,
+            workspace_mgr=mock_workspace_mgr,
+            decomposer=decomposer,
+            config=orch_config,
+            pr_manager=mock_pr_manager,
+            log_dir=log_dir,
+        )
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="a",
+                    title="a",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/a",
+                    status=WorkstreamStatus.READY,
+                )
+            )
+            fake_process = MagicMock(pid=12345)
+            with (
+                patch(
+                    "maestro.orchestrator.asyncio.create_subprocess_exec",
+                    new=AsyncMock(return_value=fake_process),
+                ) as spawn,
+                patch("maestro.orchestrator.ensure_harness_excludes") as excludes,
+            ):
+                await orch._generate_and_launch("a")
+
+            # Config is written BEFORE spec generation (prefix must be
+            # visible to `plan --full`).
+            assert order == ["config", "generate"]
+            # Repo-local ignore block is ensured for the worktree.
+            excludes.assert_called_once()
+            # The spec-commit is gone.
+            assert not hasattr(orch, "_commit_spec_in_workspace")
+            # run --all carries the prefix.
+            argv = spawn.call_args.args
+            assert "--spec-prefix" in argv
+            assert argv[argv.index("--spec-prefix") + 1] == SPEC_PREFIX
         finally:
             await db.close()

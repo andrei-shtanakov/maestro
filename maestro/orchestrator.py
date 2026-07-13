@@ -31,7 +31,7 @@ from maestro.models import (
 )
 from maestro.pr_manager import PRManager, PRManagerError
 from maestro.spec_runner import read_executor_state
-from maestro.workspace import WorkspaceManager
+from maestro.workspace import WorkspaceManager, ensure_harness_excludes
 
 
 class OrchestratorError(Exception):
@@ -559,6 +559,20 @@ class Orchestrator:
             workspace_path=str(workspace),
         )
 
+        # H-7: keep every harness artifact untracked in the target repo —
+        # repo-local ignore block, shared by all linked worktrees.
+        await asyncio.get_running_loop().run_in_executor(
+            None, ensure_harness_excludes, workspace
+        )
+
+        # Setup spec-runner config BEFORE generation so `plan --full`
+        # writes prefix-namespaced spec files from the start (H-7).
+        executor_config = self._config.spec_runner.to_executor_config()
+        # Set main_branch to the workstream branch (so spec-runner
+        # merges subtask branches back to it)
+        executor_config.setdefault("executor", {})["main_branch"] = workstream.branch
+        self._workspace_mgr.setup_spec_runner(workspace, executor_config)
+
         # Generate spec for this workstream
         # Always regenerate: the repo may already have spec/tasks.md
         # from a previous run or different project phase
@@ -582,22 +596,6 @@ class Orchestrator:
             workstream_config, workspace, on_pid=_on_gen_pid
         )
 
-        # Setup spec-runner config
-        executor_config = self._config.spec_runner.to_executor_config()
-        # Set main_branch to the workstream branch (so spec-runner
-        # merges subtask branches back to it)
-        executor_config.setdefault("executor", {})["main_branch"] = workstream.branch
-        self._workspace_mgr.setup_spec_runner(workspace, executor_config)
-
-        # Commit generated spec + config so spec-runner subtask
-        # branches don't lose them during merge
-        await asyncio.get_running_loop().run_in_executor(
-            None,
-            self._commit_spec_in_workspace,
-            workspace,
-            workstream_id,
-        )
-
         # Transition to READY then RUNNING
         await self._db.update_workstream_status(workstream_id, WorkstreamStatus.READY)
 
@@ -617,7 +615,7 @@ class Orchestrator:
         # Spawn spec-runner
         log_file = self._log_dir / f"{workstream_id}.log"
 
-        cmd = ["spec-runner", "run", "--all"]
+        cmd = ["spec-runner", "run", "--all", "--spec-prefix", SPEC_PREFIX]
 
         # Add callback URL if REST API is running
         # (optional — we also poll state files)
@@ -668,32 +666,6 @@ class Orchestrator:
             process.pid,
             workspace,
         )
-
-    @staticmethod
-    def _commit_spec_in_workspace(
-        workspace: Path,
-        workstream_id: str,
-    ) -> None:
-        """Commit generated spec files in the worktree.
-
-        This ensures spec-runner subtask branches inherit
-        the generated tasks.md when they branch off.
-        """
-        with span("task.execute", task_id=workstream_id):
-            subprocess.run(
-                ["git", "add", "spec/", "spec-runner.config.yaml"],
-                cwd=workspace,
-                env={**os.environ, **child_env()},
-                capture_output=True,
-                check=False,
-            )
-            subprocess.run(
-                ["git", "commit", "-m", f"maestro: add spec for {workstream_id}"],
-                cwd=workspace,
-                env={**os.environ, **child_env()},
-                capture_output=True,
-                check=False,
-            )
 
     def _merge_into_base(self, feature_branch: str) -> None:
         """Merge feature branch into base branch in the main repo.
