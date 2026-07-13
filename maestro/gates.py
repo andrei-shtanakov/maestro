@@ -8,25 +8,23 @@ never computes risk itself (DESIGN-610/612).
 
 Semantics (DESIGN-606, fail-closed): a mandatory gate with a missing or
 errored verdict blocks the transition — at every tier. A blocked workstream
-routes to NEEDS_REVIEW with the approval marker in ``error_message``; a human
-re-queueing it (NEEDS_REVIEW -> READY) *is* the owner approval for that exact
-phase + SHA — a new commit changes the SHA and invalidates the approval
-(DESIGN-608, M-3). Gates v1.2 (H-6/H-7): an approved ex-post block resumes at
-the ex-post edge (see orchestrator._try_resume_ex_post); the infra-path
-exclusion covers only maestro-prefixed artifacts, and the approval marker in
-error_message clears only at DONE. Every evaluation appends a verdict-record to
+routes to NEEDS_REVIEW with an approval marker in ``error_message``; an
+operator approves via ``maestro workstream-approve``, which records the
+(workstream, phase, sha) approval durably (see Gates v1.3 below). A new
+commit changes the SHA and invalidates the approval (DESIGN-608, M-3).
+Gates v1.2 (H-6/H-7): an approved ex-post block resumes at the ex-post edge
+(see orchestrator._try_resume_ex_post); the infra-path exclusion covers only
+maestro-prefixed artifacts, and the approval marker in error_message clears
+only at DONE. Every evaluation appends a verdict-record to
 ``logs/<ULID>/gate_verdicts.jsonl`` (M-1); records are addressable via
 EvidenceRef ``kind=gate-verdict``. Gates whose enforcement point lies outside
 these two edges (branch protection, PR reviews) are recorded as advisory
 annotations, not blocks (M-2) — their transition belongs to the git host, not
-to Maestro's table. Gates v1.3 (H-9): the ``gate_approvals`` DB table is the
-single authority for "was this (workstream, phase, sha) approved" — the
-marker in ``error_message`` is operator UX and the H-6 resume-position
-signal only, never an authorization source. Gates v1.3 (H-9): approval
-authority is the gate_approvals table, written by maestro workstream-approve
-in one transaction; the error_message marker is operator UX + the H-6
-position signal, and the verdict store is pure evidence — neither grants
-approval.
+to Maestro's table. Gates v1.3 (H-9): the ``gate_approvals`` DB table (written
+by ``maestro workstream-approve`` in one transaction) is the single authority
+for "was this (workstream, phase, sha) approved". The marker in
+``error_message`` is operator UX and the H-6 resume-position signal only; the
+verdict store is pure evidence — neither grants approval.
 """
 
 from __future__ import annotations
@@ -368,7 +366,7 @@ class GateKeeper:
                         verdict="pass",
                         tier=tier,
                         risk_model_version=model_version,
-                        note="operator re-queued after NEEDS_REVIEW (same sha)",
+                        note="approval recorded in gate_approvals (same sha)",
                     )
                 )
             else:
