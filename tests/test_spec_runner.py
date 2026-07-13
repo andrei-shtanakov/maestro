@@ -273,6 +273,7 @@ class TestSpecRunnerConfigContract:
             "task_timeout_minutes",
             "claude_command",
             "auto_commit",
+            "spec_prefix",
             "hooks",
             "commands",
         ):
@@ -284,6 +285,12 @@ class TestSpecRunnerConfigContract:
             "auto_commit",
         }
         assert set(executor["commands"].keys()) == {"test", "lint"}
+
+    def test_spec_prefix_in_executor_section(self) -> None:
+        from maestro.models import SPEC_PREFIX, SpecRunnerConfig
+
+        cfg = SpecRunnerConfig().to_executor_config()
+        assert cfg["executor"]["spec_prefix"] == SPEC_PREFIX == "maestro-"
 
 
 # ---------------------------------------------------------------------------
