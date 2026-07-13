@@ -126,6 +126,18 @@ CREATE TABLE IF NOT EXISTS task_costs (
     FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 
+-- Gates v1.3 (H-9): durable approval memory + audit trail. Append-only;
+-- one row per (workstream, phase, sha) approval act. Never deleted (DONE
+-- keeps history); rows for superseded shas are inert (DESIGN-608).
+CREATE TABLE IF NOT EXISTS gate_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workstream_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('ex_ante', 'ex_post')),
+    sha TEXT NOT NULL,
+    approved_at TEXT NOT NULL,
+    UNIQUE (workstream_id, phase, sha)
+);
+
 -- Mini-R: Linear migration journal. Every applied schema migration inserts
 -- exactly one row here so future connects can skip already-applied work
 -- without PRAGMA scanning every startup.
@@ -397,6 +409,7 @@ class Database:
                 "decomposing_generation_pid",
                 self._migrate_workstreams_generation_pid,
             ),
+            (6, "gates_v13_gate_approvals", self._migrate_gate_approvals),
         ]
 
         for version, name, fn in ordered:
@@ -575,6 +588,26 @@ class Database:
             await self._connection.execute(
                 "ALTER TABLE workstreams ADD COLUMN generation_pid INTEGER"
             )
+
+    async def _migrate_gate_approvals(self) -> None:
+        """Migration 6: gates v1.3 durable approval memory (H-9).
+
+        `CREATE TABLE IF NOT EXISTS` — a no-op on databases whose SCHEMA_SQL
+        already created the table; creates it for pre-v6 databases.
+        """
+        assert self._connection is not None
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gate_approvals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workstream_id TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (phase IN ('ex_ante', 'ex_post')),
+                sha TEXT NOT NULL,
+                approved_at TEXT NOT NULL,
+                UNIQUE (workstream_id, phase, sha)
+            )
+            """
+        )
 
     @asynccontextmanager
     async def transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:
@@ -1995,6 +2028,40 @@ class Database:
         await self._connection.commit()
 
         return cursor.rowcount > 0
+
+    # =========================================================================
+    # Gate Approvals Operations
+    # =========================================================================
+
+    async def record_gate_approval(
+        self, workstream_id: str, phase: str, sha: str
+    ) -> None:
+        """Record an operator's gate approval (gates v1.3, H-9).
+
+        Idempotent: `INSERT OR IGNORE` under UNIQUE(workstream_id, phase,
+        sha). Append-only — nothing ever deletes rows (audit trail).
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        await self._connection.execute(
+            "INSERT OR IGNORE INTO gate_approvals "
+            "(workstream_id, phase, sha, approved_at) VALUES (?, ?, ?, ?)",
+            (workstream_id, phase, sha, _format_datetime(datetime.now(UTC))),
+        )
+        await self._connection.commit()
+
+    async def list_gate_approvals(self, workstream_id: str) -> set[tuple[str, str]]:
+        """(phase, sha) pairs the operator has approved for this workstream."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT phase, sha FROM gate_approvals WHERE workstream_id = ?",
+            (workstream_id,),
+        )
+        rows = await cursor.fetchall()
+        return {(row["phase"], row["sha"]) for row in rows}
 
 
 # Convenience function for creating and initializing a database

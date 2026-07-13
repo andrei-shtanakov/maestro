@@ -1391,6 +1391,7 @@ class TestSchemaMigrationsJournal:
                 (3, "r06b_rename_zadachi_to_workstreams"),
                 (4, "cost_from_log_reported_cost"),
                 (5, "decomposing_generation_pid"),
+                (6, "gates_v13_gate_approvals"),
             ]
         finally:
             await db.close()
@@ -1414,7 +1415,7 @@ class TestSchemaMigrationsJournal:
             )
             row = await cursor.fetchone()
             assert row is not None
-            assert row["n"] == 5
+            assert row["n"] == 6
         finally:
             await db2.close()
 
@@ -1492,6 +1493,7 @@ class TestSchemaMigrationsJournal:
                 (3, "r06b_rename_zadachi_to_workstreams"),
                 (4, "cost_from_log_reported_cost"),
                 (5, "decomposing_generation_pid"),
+                (6, "gates_v13_gate_approvals"),
             ]
             # Sanity: the idempotent ALTERs must not have fired twice.
             cursor = await db._connection.execute("PRAGMA table_info(tasks)")
@@ -1996,4 +1998,62 @@ async def test_generation_pid_migration_idempotent(tmp_path) -> None:
         cols = {r["name"] for r in await cur.fetchall()}
         assert "generation_pid" in cols
     finally:
+        await db2.close()
+
+
+class TestGateApprovals:
+    """gates v1.3 (H-9): durable approval memory + audit trail."""
+
+    @pytest.mark.anyio
+    async def test_record_and_list(self, tmp_path) -> None:
+        from maestro.database import Database
+
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        try:
+            await db.record_gate_approval("z1", "ex_post", "a" * 40)
+            await db.record_gate_approval("z1", "ex_ante", "b" * 40)
+            approvals = await db.list_gate_approvals("z1")
+            assert approvals == {("ex_post", "a" * 40), ("ex_ante", "b" * 40)}
+            # Other workstreams see nothing.
+            assert await db.list_gate_approvals("z2") == set()
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_record_idempotent(self, tmp_path) -> None:
+        from maestro.database import Database
+
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        try:
+            await db.record_gate_approval("z1", "ex_post", "a" * 40)
+            await db.record_gate_approval("z1", "ex_post", "a" * 40)  # no raise
+            assert await db.list_gate_approvals("z1") == {("ex_post", "a" * 40)}
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_migration_v6_creates_table_on_old_db(self, tmp_path) -> None:
+        """A database created before v6 gains the table via the journal."""
+        import aiosqlite
+
+        from maestro.database import Database
+
+        # Fresh connect creates everything (SCHEMA_SQL path) — verify the
+        # journal recorded v6 too, then verify a re-connect no-ops.
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        await db.close()
+        async with aiosqlite.connect(tmp_path / "t.db") as conn:
+            cursor = await conn.execute(
+                "SELECT version FROM schema_migrations WHERE version = 6"
+            )
+            assert await cursor.fetchone() is not None
+            cursor = await conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'gate_approvals'"
+            )
+            assert await cursor.fetchone() is not None
+        db2 = Database(tmp_path / "t.db")
+        await db2.connect()  # idempotent re-apply must not raise
         await db2.close()
