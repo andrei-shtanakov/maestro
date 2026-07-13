@@ -2063,6 +2063,57 @@ class Database:
         rows = await cursor.fetchall()
         return {(row["phase"], row["sha"]) for row in rows}
 
+    async def approve_workstream_with_gate_record(
+        self, workstream_id: str, phase: str | None, sha: str | None
+    ) -> Workstream:
+        """Operator approval as ONE transaction (gates v1.3, H-9).
+
+        `INSERT OR IGNORE` into gate_approvals (when phase/sha are given —
+        the gate-block case) plus the guarded NEEDS_REVIEW -> READY flip,
+        on one connection. `update_workstream_status` commits per call, so
+        this method writes raw SQL inside `self.transaction()` instead of
+        composing helpers. `phase=None` is the no-marker requeue: status
+        flip only, nothing recorded.
+
+        Raises:
+            WorkstreamNotFoundError: If the workstream does not exist.
+            ValueError: If the workstream is not in NEEDS_REVIEW.
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        async with self.transaction() as conn:
+            if phase is not None and sha is not None:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO gate_approvals "
+                    "(workstream_id, phase, sha, approved_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (workstream_id, phase, sha, _format_datetime(datetime.now(UTC))),
+                )
+            cursor = await conn.execute(
+                "UPDATE workstreams SET status = 'ready' "
+                "WHERE id = ? AND status = 'needs_review'",
+                (workstream_id,),
+            )
+            if cursor.rowcount == 0:
+                # Distinguish missing vs wrong-status; raising rolls back
+                # the INSERT above via the transaction context.
+                check = await conn.execute(
+                    "SELECT status FROM workstreams WHERE id = ?",
+                    (workstream_id,),
+                )
+                row = await check.fetchone()
+                if row is None:
+                    msg = f"Workstream with ID '{workstream_id}' not found"
+                    raise WorkstreamNotFoundError(msg)
+                msg = (
+                    f"workstream '{workstream_id}' is {row['status']}, "
+                    f"only NEEDS_REVIEW can be approved"
+                )
+                raise ValueError(msg)
+        return await self.get_workstream(workstream_id)
+
 
 # Convenience function for creating and initializing a database
 async def create_database(db_path: str | Path) -> Database:
