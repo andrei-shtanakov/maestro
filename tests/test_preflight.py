@@ -3,8 +3,6 @@
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from maestro.models import OrchestratorConfig, WorkstreamConfig
 from maestro.preflight import ValidationIssue, ValidationReport, validate_project
 
@@ -40,31 +38,6 @@ def make_git_repo(tmp_path: Path, files: list[str]) -> Path:
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text("x")
     return repo
-
-
-@pytest.fixture(autouse=True)
-def _stub_spec_runner_help(monkeypatch: pytest.MonkeyPatch) -> None:
-    """validate_project(check_fs=True) now shells out to `spec-runner run
-    --help` (H-7 contract guard). Stub it to a passing response so these
-    tests don't depend on a locally installed spec-runner binary/version.
-    Other subprocess.run calls (e.g. real `git` invocations made directly
-    by tests, or by _check_tracked_spec_runner_config) pass through
-    untouched. Tests that want to exercise the contract guard itself
-    override this via their own monkeypatch.setattr call, which wins
-    because it runs later in the same test.
-    """
-    from maestro import preflight
-
-    real_run = subprocess.run
-
-    def fake_run(cmd, **kwargs):
-        if cmd[:3] == ["spec-runner", "run", "--help"]:
-            return subprocess.CompletedProcess(
-                cmd, 0, stdout="usage: ... --spec-prefix SPEC_PREFIX ...", stderr=""
-            )
-        return real_run(cmd, **kwargs)
-
-    monkeypatch.setattr(preflight.subprocess, "run", fake_run)
 
 
 class TestValidationReport:

@@ -605,7 +605,7 @@ class Orchestrator:
         self._workspace_mgr.setup_spec_runner(workspace, executor_config)
 
         # Generate spec for this workstream
-        # Always regenerate: the repo may already have spec/tasks.md
+        # Always regenerate: the repo may already have spec/maestro-tasks.md
         # from a previous run or different project phase
         workstream_config = WorkstreamConfig(
             id=workstream.id,

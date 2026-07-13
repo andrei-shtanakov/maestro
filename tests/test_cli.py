@@ -3,7 +3,6 @@
 import asyncio
 import contextlib
 import os
-import subprocess
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
@@ -90,28 +89,6 @@ async def _seed_workstream(db_path: Path, workstream_id: str) -> None:
 # =============================================================================
 # Fixtures
 # =============================================================================
-
-
-@pytest.fixture(autouse=True)
-def _stub_spec_runner_help(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`maestro validate`/`orchestrate` run preflight with check_fs=True,
-    which now shells out to `spec-runner run --help` (H-7 contract guard).
-    Stub it to a passing response so these CLI tests don't depend on a
-    locally installed spec-runner binary/version. Other subprocess.run
-    calls pass through untouched.
-    """
-    from maestro import preflight
-
-    real_run = subprocess.run
-
-    def fake_run(cmd, **kwargs):
-        if cmd[:3] == ["spec-runner", "run", "--help"]:
-            return subprocess.CompletedProcess(
-                cmd, 0, stdout="usage: ... --spec-prefix SPEC_PREFIX ...", stderr=""
-            )
-        return real_run(cmd, **kwargs)
-
-    monkeypatch.setattr(preflight.subprocess, "run", fake_run)
 
 
 @pytest.fixture
