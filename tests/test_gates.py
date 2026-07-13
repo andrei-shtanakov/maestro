@@ -518,8 +518,9 @@ async def test_h3_other_workstream_block_does_not_approve(
 async def test_h4_orchestrator_managed_paths_do_not_violate_scope(
     fake_steward: Path, repo: Path, tmp_path: Path
 ) -> None:
-    # H-4: Maestro itself commits spec/** + spec-runner.config.yaml into the
-    # branch; those infra paths must not trip the declared-scope check.
+    # H-4 (narrowed in gates v1.2/H-7): Maestro itself commits
+    # spec/maestro-* + spec/.executor-* into the branch; those infra paths
+    # must not trip the declared-scope check.
     workspace = _branch_with_change(repo, "src/a.py", "x = 9\n")
     env = {
         **os.environ,
@@ -530,8 +531,8 @@ async def test_h4_orchestrator_managed_paths_do_not_violate_scope(
     }
     spec = workspace / "spec"
     spec.mkdir(exist_ok=True)
-    (spec / "tasks.md").write_text("# t\n")
-    (workspace / "spec-runner.config.yaml").write_text("a: 1\n")
+    (spec / "maestro-tasks.md").write_text("# t\n")
+    (spec / ".executor-maestro-state.db").write_text("sqlite\n")
     subprocess.run(  # noqa: ASYNC221
         ["git", "-C", str(workspace), "add", "-A"],
         check=True,
@@ -589,6 +590,38 @@ def test_h5_workstream_approve_cli_flips_needs_review_to_ready(tmp_path: Path) -
 
 
 # --------------------------------- gates v1.2 (H-6): resume via approval marker
+
+
+class TestOrchestratorManagedNarrowing:
+    """gates v1.2 (H-7): only maestro-namespaced artifacts are infra."""
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "spec/maestro-tasks.md",
+            "spec/maestro-requirements.md",
+            "spec/.executor-maestro-state.db",
+            "spec/.executor-stop",
+        ],
+    )
+    def test_harness_paths_excluded(self, path: str) -> None:
+        from maestro.gates import _orchestrator_managed
+
+        assert _orchestrator_managed(path) is True
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "spec/00-charter.md",  # target repo's own governance doc
+            "spec/tasks.md",  # target repo's own dogfood spec
+            "spec-runner.config.yaml",  # tracked-config clobber must be visible
+            "src/main.py",
+        ],
+    )
+    def test_target_repo_paths_visible(self, path: str) -> None:
+        from maestro.gates import _orchestrator_managed
+
+        assert _orchestrator_managed(path) is False
 
 
 class TestParseApprovalMarker:

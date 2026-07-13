@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from maestro._vendor.obs import current_pipeline_id
+from maestro.models import SPEC_PREFIX
 
 
 if TYPE_CHECKING:
@@ -84,14 +85,19 @@ def parse_approval_marker(error_message: str | None) -> ApprovalMarker | None:
     return ApprovalMarker(phase=phase, sha=match.group(2))
 
 
-# Paths Maestro itself commits into the branch (spec generation); they are
-# infra, not the agent's change — excluded from ex-post classification and
-# the declared-scope check (governed-run finding H-4).
-_ORCHESTRATOR_MANAGED = ("spec/", "spec-runner.config.yaml")
+# Paths Maestro itself materializes in the worktree (spec generation +
+# executor runtime state); they are infra, not the agent's change —
+# excluded from ex-post classification and the declared-scope check
+# (H-4, narrowed in gates v1.2/H-7). Deliberately NOT excluded:
+# `spec-runner.config.yaml` — in a repo that tracks its own config,
+# Maestro's overwrite must surface as a scope violation (fail-closed
+# backstop); in a repo without one the file is untracked+ignored and
+# never enters the diff.
+_ORCHESTRATOR_MANAGED = (f"spec/{SPEC_PREFIX}", "spec/.executor-")
 
 
 def _orchestrator_managed(path: str) -> bool:
-    return path == _ORCHESTRATOR_MANAGED[1] or path.startswith(_ORCHESTRATOR_MANAGED[0])
+    return path.startswith(_ORCHESTRATOR_MANAGED)
 
 
 _STEWARD_ENV = "MAESTRO_STEWARD_BIN"
