@@ -586,3 +586,43 @@ def test_h5_workstream_approve_cli_flips_needs_review_to_ready(tmp_path: Path) -
     status, error_message = _asyncio.run(scenario())
     assert status == WorkstreamStatus.READY
     assert error_message and "marker" in error_message, "marker must be preserved"
+
+
+# --------------------------------- gates v1.2 (H-6): resume via approval marker
+
+
+class TestParseApprovalMarker:
+    """gates v1.2 (H-6): parse the phase+sha marker out of a stored block reason."""
+
+    def test_round_trip_with_blocked_reason_format(self) -> None:
+        from maestro.gates import APPROVAL_MARKER_PREFIX, parse_approval_marker
+
+        sha = "a" * 40
+        reason = (
+            "gates: human.owner_approval required (tier=high); "
+            f"re-queue to approve. {APPROVAL_MARKER_PREFIX} phase=ex_post sha={sha}"
+        )
+        marker = parse_approval_marker(reason)
+        assert marker is not None
+        assert marker.phase == "ex_post"
+        assert marker.sha == sha
+
+    def test_ex_ante_phase_parses(self) -> None:
+        from maestro.gates import APPROVAL_MARKER_PREFIX, parse_approval_marker
+
+        sha = "b" * 40
+        marker = parse_approval_marker(
+            f"{APPROVAL_MARKER_PREFIX} phase=ex_ante sha={sha}"
+        )
+        assert marker is not None
+        assert marker.phase == "ex_ante"
+        assert marker.sha == sha
+
+    def test_none_and_garbage_return_none(self) -> None:
+        from maestro.gates import parse_approval_marker
+
+        assert parse_approval_marker(None) is None
+        assert parse_approval_marker("") is None
+        assert parse_approval_marker("spec-runner exited with code 2") is None
+        # Prefix present but malformed tail -> no marker.
+        assert parse_approval_marker("gates:approval-required phase=bogus") is None
