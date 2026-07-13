@@ -80,6 +80,24 @@ def mock_pr_manager() -> MagicMock:
     return mgr
 
 
+@pytest.fixture(autouse=True)
+def _no_real_git_excludes():
+    """Default-patch `ensure_harness_excludes` (git-backed, unit-tested in
+    test_workspace.py) to a no-op for every test in this module.
+
+    Orchestrator tests exercise `_spawn_workstream`/`_generate_and_launch`
+    against fake or mocked workspace paths that are not real git repos;
+    without this, the real `ensure_harness_excludes` call (H-7) raises
+    `WorkspaceError` before `generate_spec` ever runs, which starves any
+    test waiting on the mocked `generate_spec` side effect (deadlock, not
+    just a failure). Tests that specifically assert on this call (e.g.
+    `TestSpawnHarnessIsolation`) apply their own nested `patch(...)`,
+    which layers on top of this one without conflict.
+    """
+    with patch("maestro.orchestrator.ensure_harness_excludes"):
+        yield
+
+
 @pytest.fixture
 def orchestrator(
     mock_db: MagicMock,
@@ -897,7 +915,6 @@ class TestBackgroundGeneration:
         orchestrator._workspace_mgr.get_workspace_path = MagicMock(
             return_value=workspace
         )
-        orchestrator._commit_spec_in_workspace = MagicMock()
 
         mock_db.get_workstream = AsyncMock(
             return_value=_ws("z1", WorkstreamStatus.READY)
@@ -942,7 +959,6 @@ class TestBackgroundGeneration:
         orchestrator._workspace_mgr.get_workspace_path = MagicMock(
             return_value=workspace
         )
-        orchestrator._commit_spec_in_workspace = MagicMock()
         mock_db.get_workstream = AsyncMock(
             return_value=_ws("z1", WorkstreamStatus.READY)
         )
@@ -1016,7 +1032,14 @@ class TestBackgroundGeneration:
 
         await orchestrator._spawn_ready(["z1"])
         first = orchestrator._generating["z1"]
-        await asyncio.sleep(0)  # let the task run up to the blocked call
+        # Let the task run up to the blocked call. H-7 now interposes an
+        # executor round-trip (ensure_harness_excludes) before
+        # generate_spec, so a single sleep(0) no longer reliably reaches
+        # it -- pump the loop until the mock actually records the call.
+        for _ in range(100):
+            if mock_decomposer.generate_spec.called:
+                break
+            await asyncio.sleep(0)
 
         # Second tick before z1 flips to DECOMPOSING: must not overwrite.
         await orchestrator._spawn_ready(["z1"])
@@ -1108,11 +1131,10 @@ class TestGenerationPidLifecycle:
             # entry-clear assertion actually proves the re-decompose window
             # is closed (rather than the field coincidentally being None).
             await db.create_workstream(self._seed("a", generation_pid=4242))
-            # Stub the downstream _spawn_workstream steps that would
+            # Stub the downstream _spawn_workstream step that would
             # otherwise touch the real filesystem/subprocess so the happy
-            # path can reach a clean end: committing the generated spec in
-            # the worktree, and the `spec-runner run --all` process spawn.
-            orch._commit_spec_in_workspace = MagicMock()
+            # path can reach a clean end: the `spec-runner run --all`
+            # process spawn.
             fake_process = MagicMock(pid=12345)
             pid_calls = self._spy_generation_pid_writes(db)
             with patch(
@@ -1275,10 +1297,9 @@ class TestSpawnWritesSentinel:
                     status=WorkstreamStatus.READY,
                 )
             )
-            # Stub the downstream steps that would otherwise touch the real
+            # Stub the downstream step that would otherwise touch the real
             # filesystem/subprocess, as TestGenerationPidLifecycle does, so
             # the flow reaches the RUNNING spawn.
-            orch._commit_spec_in_workspace = MagicMock()
             fake_process = MagicMock(pid=12345)
             with patch(
                 "maestro.orchestrator.asyncio.create_subprocess_exec",
@@ -1822,6 +1843,93 @@ class TestStartupRecovery:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_ex_post_marker_survives_recovery_two_step(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        """A MERGING/PR_CREATED row stranded with an ex-post approval marker
+        (crash after the resume tail started but before DONE) must
+        reconcile to READY with the marker intact — the next tick's
+        `_spawn_workstream` re-reads it and takes the resume path
+        (`_try_resume_ex_post`) instead of a full respawn (H-6)."""
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            sha = "a" * 40
+            marker = _ex_post_marker(sha)
+            for zid, st in [
+                ("m", WorkstreamStatus.MERGING),
+                ("p", WorkstreamStatus.PR_CREATED),
+            ]:
+                w = self._seed(zid, st)
+                w.error_message = marker
+                await db.create_workstream(w)
+            count = await orch._recover_stranded_workstreams()
+            assert count == 2
+            for zid in ("m", "p"):
+                w = await db.get_workstream(zid)
+                assert w.status == WorkstreamStatus.READY
+                assert w.error_message is not None
+                assert "phase=ex_post" in w.error_message
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_failed_with_marker_reconciles_to_needs_review_not_ready(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        """Regression for Finding 1 (governance bypass): `_gate_ex_post`
+        blocks with TWO writes (RUNNING->FAILED-with-marker, then
+        FAILED->NEEDS_REVIEW). A crash between them leaves a FAILED row
+        carrying the marker. `can_retry()` is true here (gate blocks never
+        increment retry_count), but a marker means "awaiting a human", not
+        "retryable failure" — routing it to READY would let
+        `evaluate_ex_post` read the marker in `prior_error` as operator
+        approval and merge to base with no human ever approving."""
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+        )
+        try:
+            sha = "b" * 40
+            w = self._seed("gm", WorkstreamStatus.FAILED, retry_count=0, max_retries=3)
+            w.error_message = _ex_post_marker(sha)
+            await db.create_workstream(w)
+            await orch._recover_stranded_workstreams()
+            result = await db.get_workstream("gm")
+            assert result.status == WorkstreamStatus.NEEDS_REVIEW
+            assert result.error_message is not None
+            assert "phase=ex_post" in result.error_message
+            assert orch._stats.failed == 1
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_clean_states_untouched_and_count_zero(
         self,
         tmp_path,
@@ -2162,5 +2270,335 @@ class TestHandleSuccessMergeGating:
             # ...which happens after
             assert orch._stats.completed == 1
             assert (await db.get_workstream("a")).status == WorkstreamStatus.DONE
+        finally:
+            await db.close()
+
+
+class TestSpawnHarnessIsolation:
+    """gates v1.2 (H-7): config lands before generation, artifacts are
+    ignored (never committed), and run --all is prefix-namespaced."""
+
+    @pytest.mark.anyio
+    async def test_config_before_generate_no_commit_prefixed_run(
+        self, tmp_path, mock_workspace_mgr, mock_pr_manager, orch_config
+    ) -> None:
+        from maestro.database import Database
+        from maestro.models import SPEC_PREFIX
+
+        db = Database(tmp_path / "o.db")
+        await db.connect()
+        order: list[str] = []
+
+        mock_workspace_mgr.setup_spec_runner = MagicMock(
+            side_effect=lambda *_a, **_k: order.append("config")
+        )
+        decomposer = MagicMock()
+
+        async def gen(workstream, workspace_path, *, on_pid=None):
+            order.append("generate")
+
+        decomposer.generate_spec = gen
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        orch = Orchestrator(
+            db=db,
+            workspace_mgr=mock_workspace_mgr,
+            decomposer=decomposer,
+            config=orch_config,
+            pr_manager=mock_pr_manager,
+            log_dir=log_dir,
+        )
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="a",
+                    title="a",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/a",
+                    status=WorkstreamStatus.READY,
+                )
+            )
+            fake_process = MagicMock(pid=12345)
+            with (
+                patch(
+                    "maestro.orchestrator.asyncio.create_subprocess_exec",
+                    new=AsyncMock(return_value=fake_process),
+                ) as spawn,
+                patch("maestro.orchestrator.ensure_harness_excludes") as excludes,
+            ):
+                await orch._generate_and_launch("a")
+
+            # Config is written BEFORE spec generation (prefix must be
+            # visible to `plan --full`).
+            assert order == ["config", "generate"]
+            # Repo-local ignore block is ensured for the worktree.
+            excludes.assert_called_once()
+            # The spec-commit is gone.
+            assert not hasattr(orch, "_commit_spec_in_workspace")
+            # run --all carries the prefix.
+            argv = spawn.call_args.args
+            assert "--spec-prefix" in argv
+            assert argv[argv.index("--spec-prefix") + 1] == SPEC_PREFIX
+        finally:
+            await db.close()
+
+
+def _ex_post_marker(sha: str) -> str:
+    from maestro.gates import APPROVAL_MARKER_PREFIX
+
+    return (
+        "gates: human.owner_approval required (tier=high); re-queue to "
+        f"approve. {APPROVAL_MARKER_PREFIX} phase=ex_post sha={sha}"
+    )
+
+
+class TestExPostResume:
+    """gates v1.2 (H-6): an approved ex-post block resumes at the ex-post
+    edge over the untouched worktree — no regen, no respawn, no new sha."""
+
+    async def _orch_db(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ):
+        from maestro.database import Database
+
+        db = Database(tmp_path / "o.db")
+        await db.connect()
+        cfg = OrchestratorConfig(
+            project="p",
+            repo_url="https://github.com/t/r",
+            repo_path="/tmp/r",
+            workspace_base="/tmp/ws",
+            auto_pr=True,
+            workstreams=[],
+        )
+        orch = Orchestrator(
+            db=db,
+            workspace_mgr=mock_workspace_mgr,
+            decomposer=mock_decomposer,
+            config=cfg,
+            pr_manager=mock_pr_manager,
+        )
+        return orch, db
+
+    def _seed_ready(self, zid: str, sha: str) -> Workstream:
+        return Workstream(
+            id=zid,
+            title=zid,
+            description="d",
+            scope=["s"],
+            branch=f"feature/{zid}",
+            status=WorkstreamStatus.READY,
+            error_message=_ex_post_marker(sha),
+        )
+
+    @pytest.mark.anyio
+    async def test_resume_reaches_done_without_respawn(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        sha = "a" * 40
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(self._seed_ready("z1", sha))
+            mock_workspace_mgr.workspace_exists.return_value = True
+            orch._workspace_head = AsyncMock(return_value=sha)
+            orch._merge_into_base = MagicMock()
+
+            await orch._spawn_workstream("z1")
+
+            w = await db.get_workstream("z1")
+            assert w.status == WorkstreamStatus.DONE
+            # Marker cleared exactly at DONE (crash-tail keeps it until then).
+            assert w.error_message is None
+            assert w.process_pid is None
+            assert w.generation_pid is None
+            # No pipeline replay: no spec regen, PR created from the
+            # existing worktree.
+            mock_decomposer.generate_spec.assert_not_awaited()
+            mock_pr_manager.push_and_create_pr.assert_called_once()
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_marker_survives_until_done(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        """error_message must still hold the marker at MERGING/PR_CREATED:
+        recovery resets those states to READY, and the next run needs the
+        marker to resume instead of full-respawning.
+
+        Formulation: spy on `db.update_workstream_status` (the
+        `TestSpawnWritesSentinel` pattern) and assert that no write before
+        the terminal DONE write touches `error_message` at all — the
+        marker is cleared exactly once, at DONE.
+        """
+        sha = "a" * 40
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(self._seed_ready("z1", sha))
+            mock_workspace_mgr.workspace_exists.return_value = True
+            orch._workspace_head = AsyncMock(return_value=sha)
+            orch._merge_into_base = MagicMock()
+
+            calls: list[dict] = []
+            original = db.update_workstream_status
+
+            async def spy(zid, status, *args, **kwargs):
+                calls.append({"status": status, **kwargs})
+                return await original(zid, status, *args, **kwargs)
+
+            db.update_workstream_status = spy  # type: ignore[method-assign]
+
+            await orch._spawn_workstream("z1")
+
+            assert calls, "expected at least one status write"
+            assert calls[-1]["status"] == WorkstreamStatus.DONE
+            assert calls[-1].get("error_message") is None
+            assert "error_message" in calls[-1]
+            for c in calls[:-1]:
+                assert "error_message" not in c
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_pr_manager_error_appends_note_preserves_marker(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        """Regression for Finding 2 (marker clobber): on `PRManagerError`,
+        `_handle_success` used to overwrite `error_message` with just the
+        PR-creation note, destroying an ex-post approval marker mid-resume.
+        A later crash before DONE then loses the marker and full-respawns
+        instead of resuming. The note must be APPENDED to a marker-bearing
+        error_message instead — every pre-DONE write that touches
+        error_message must still contain the marker; only the DONE write
+        may clear it.
+        """
+        from maestro.pr_manager import PRManagerError
+
+        sha = "c" * 40
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(self._seed_ready("z5", sha))
+            mock_workspace_mgr.workspace_exists.return_value = True
+            orch._workspace_head = AsyncMock(return_value=sha)
+            orch._merge_into_base = MagicMock()
+            mock_pr_manager.push_and_create_pr.side_effect = PRManagerError(
+                "gh timeout"
+            )
+
+            calls: list[dict] = []
+            original = db.update_workstream_status
+
+            async def spy(zid, status, *args, **kwargs):
+                calls.append({"status": status, **kwargs})
+                return await original(zid, status, *args, **kwargs)
+
+            db.update_workstream_status = spy  # type: ignore[method-assign]
+
+            await orch._spawn_workstream("z5")
+
+            w = await db.get_workstream("z5")
+            # Merge still proceeds even though PR creation failed.
+            assert w.status == WorkstreamStatus.DONE
+            assert calls[-1]["status"] == WorkstreamStatus.DONE
+            assert calls[-1].get("error_message") is None
+            for c in calls[:-1]:
+                msg = c.get("error_message")
+                if msg is not None:
+                    assert "phase=ex_post" in msg
+                    assert "PR creation note" in msg
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_sha_mismatch_no_resume(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            from maestro.gates import parse_approval_marker
+
+            w = self._seed_ready("z2", "a" * 40)
+            await db.create_workstream(w)
+            mock_workspace_mgr.workspace_exists.return_value = True
+            orch._workspace_head = AsyncMock(return_value="b" * 40)
+            marker = parse_approval_marker(w.error_message)
+            assert marker is not None
+
+            resumed = await orch._try_resume_ex_post(w, marker)
+
+            assert resumed is False
+            assert (
+                await db.get_workstream("z2")
+            ).status == WorkstreamStatus.READY  # untouched — full respawn follows
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_missing_workspace_no_resume(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            from maestro.gates import parse_approval_marker
+
+            w = self._seed_ready("z3", "a" * 40)
+            await db.create_workstream(w)
+            mock_workspace_mgr.workspace_exists.return_value = False
+            marker = parse_approval_marker(w.error_message)
+            assert marker is not None
+
+            assert await orch._try_resume_ex_post(w, marker) is False
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_ex_ante_marker_does_not_trigger_resume(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        from maestro.gates import APPROVAL_MARKER_PREFIX
+
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            w = Workstream(
+                id="z4",
+                title="z4",
+                description="d",
+                scope=["s"],
+                branch="feature/z4",
+                status=WorkstreamStatus.READY,
+                error_message=(
+                    f"{APPROVAL_MARKER_PREFIX} phase=ex_ante sha={'c' * 40}"
+                ),
+            )
+            await db.create_workstream(w)
+            orch._try_resume_ex_post = AsyncMock()
+            fake_process = MagicMock(pid=1)
+            mock_decomposer.generate_spec = AsyncMock()
+            # _spawn_workstream's full-respawn path opens a log file under
+            # self._log_dir; unlike orch.run(), this direct unit-test call
+            # never creates it.
+            orch._log_dir.mkdir(parents=True, exist_ok=True)
+            with (
+                patch(
+                    "maestro.orchestrator.asyncio.create_subprocess_exec",
+                    new=AsyncMock(return_value=fake_process),
+                ),
+                patch("maestro.orchestrator.ensure_harness_excludes"),
+            ):
+                await orch._spawn_workstream("z4")
+            orch._try_resume_ex_post.assert_not_awaited()
         finally:
             await db.close()

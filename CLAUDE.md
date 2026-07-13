@@ -143,6 +143,8 @@ PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
                             └-> ABANDONED
 ```
 
+An ex-post gate block that the operator approved resumes at the ex-post edge (H-6): READY + approval marker + unchanged worktree HEAD -> straight to MERGING tail, no regen/respawn; the marker in error_message clears only at DONE.
+
 ### Key Design Decisions
 
 - **Two modes**: Scheduler for single-process tasks, Orchestrator for multi-process isolation
@@ -160,11 +162,11 @@ PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
 1. Load project.yaml
 2. Decompose project into workstreams (Claude CLI or manual config)
 3. For each ready workstream:
-   a. Create git worktree + branch
-   b. Generate spec/tasks.md via Claude CLI (read-only tools)
-   c. Write spec-runner.config.yaml
-   d. Commit spec in feature branch
-   e. Spawn `spec-runner run --all` subprocess
+   a. Create git worktree + branch (+ ensure repo-local harness excludes)
+   b. Write spec-runner.config.yaml (spec_prefix: maestro-)
+   c. Generate spec/maestro-tasks.md via `spec-runner plan --full --spec-prefix maestro-`
+   d. Spawn `spec-runner run --all --spec-prefix maestro-` subprocess
+      (harness artifacts stay untracked — never committed, never in the PR)
 4. Monitor processes (poll returncode + callbacks)
 5. On success: create PR (if auto_pr), then merge feature branch into base BEFORE marking DONE (DONE is gated on the merge — a conflict routes the workstream to NEEDS_REVIEW with the worktree left intact; a crash mid-merge is recoverable via startup recovery), then cleanup worktree
 6. On failure: retry or mark NEEDS_REVIEW

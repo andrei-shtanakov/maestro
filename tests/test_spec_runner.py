@@ -110,6 +110,71 @@ class TestReadExecutorStateJSON:
 
 
 # ---------------------------------------------------------------------------
+# Prefix-aware state reader (H-7: namespaced executor state files)
+# ---------------------------------------------------------------------------
+
+
+class TestReadExecutorStatePrefixed:
+    """H-7: with spec_prefix, state files are namespaced and MUST be read
+    from the prefixed paths — otherwise progress reads empty forever."""
+
+    def test_reads_prefixed_json_state(self, tmp_path: Path) -> None:
+        from maestro.models import SPEC_PREFIX
+
+        spec_dir = tmp_path / "spec"
+        spec_dir.mkdir()
+        payload = {
+            "tasks": {
+                "t-1": {
+                    "status": "success",
+                    "started_at": "2026-04-16T00:00:00",
+                    "completed_at": "2026-04-16T00:05:00",
+                    "attempts": [
+                        {
+                            "timestamp": "2026-04-16T00:00:01",
+                            "success": True,
+                            "duration_seconds": 4.2,
+                            "error": None,
+                            "error_code": None,
+                            "claude_output": "ok",
+                        }
+                    ],
+                },
+                "t-2": {"status": "pending", "attempts": []},
+            },
+            "consecutive_failures": 0,
+            "total_completed": 1,
+            "total_failed": 0,
+        }
+        (spec_dir / f".executor-{SPEC_PREFIX}state.json").write_text(
+            json.dumps(payload)
+        )
+        assert read_executor_state(spec_dir, SPEC_PREFIX) is not None
+        # Unprefixed read misses the prefixed file.
+        assert read_executor_state(spec_dir) is None
+
+    def test_reads_prefixed_sqlite_state(self, tmp_path: Path) -> None:
+        from maestro.models import SPEC_PREFIX
+
+        spec_dir = tmp_path / "spec"
+        spec_dir.mkdir()
+        _build_sqlite_state(
+            spec_dir / f".executor-{SPEC_PREFIX}state.db",
+            tasks=[
+                ("t-1", "success", "2026-04-16T00:00:00", "2026-04-16T00:02:00"),
+                ("t-2", "running", "2026-04-16T00:02:30", None),
+            ],
+            attempts=[
+                ("t-1", "2026-04-16T00:00:10", 1, 5.5, None, None, "done"),
+            ],
+            meta={"consecutive_failures": 0, "total_completed": 1, "total_failed": 0},
+        )
+        assert read_executor_state(spec_dir, SPEC_PREFIX) is not None
+        # Unprefixed read misses the prefixed file.
+        assert read_executor_state(spec_dir) is None
+
+
+# ---------------------------------------------------------------------------
 # SQLite path (spec-runner 2.0+)
 # ---------------------------------------------------------------------------
 
@@ -273,6 +338,7 @@ class TestSpecRunnerConfigContract:
             "task_timeout_minutes",
             "claude_command",
             "auto_commit",
+            "spec_prefix",
             "hooks",
             "commands",
         ):
@@ -284,6 +350,12 @@ class TestSpecRunnerConfigContract:
             "auto_commit",
         }
         assert set(executor["commands"].keys()) == {"test", "lint"}
+
+    def test_spec_prefix_in_executor_section(self) -> None:
+        from maestro.models import SPEC_PREFIX, SpecRunnerConfig
+
+        cfg = SpecRunnerConfig().to_executor_config()
+        assert cfg["executor"]["spec_prefix"] == SPEC_PREFIX == "maestro-"
 
 
 # ---------------------------------------------------------------------------

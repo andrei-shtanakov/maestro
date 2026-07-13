@@ -1,5 +1,6 @@
 """Unit tests for preflight validation (maestro validate)."""
 
+import subprocess
 from pathlib import Path
 
 from maestro.models import OrchestratorConfig, WorkstreamConfig
@@ -343,3 +344,77 @@ class TestDanglingDeps:
         config = make_config([ws("a", ["src/a/**"], []), ws("b", ["src/b/**"], ["a"])])
         report = validate_project(config, check_fs=False)
         assert all(i.code != "dangling-dep" for i in report.issues)
+
+
+class TestSpecRunnerContractGuard:
+    """H-7 guard: gates+prefix isolation must not run on a spec-runner
+    that does not support --spec-prefix (artifacts would silently land at
+    unprefixed paths, missed by both the ignore block and the gates
+    exclusion)."""
+
+    def test_help_with_flag_passes(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        def fake_run(cmd, **kwargs):
+            assert cmd == ["spec-runner", "run", "--help"]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="usage: ... --spec-prefix SPEC_PREFIX ...", stderr=""
+            )
+
+        monkeypatch.setattr(preflight.subprocess, "run", fake_run)
+        assert preflight._check_spec_runner_contract() == []
+
+    def test_help_without_flag_errors(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        monkeypatch.setattr(
+            preflight.subprocess,
+            "run",
+            lambda cmd, **_kw: subprocess.CompletedProcess(
+                cmd, 0, stdout="usage: old spec-runner", stderr=""
+            ),
+        )
+        issues = preflight._check_spec_runner_contract()
+        assert [i.code for i in issues] == ["spec-runner-prefix-unsupported"]
+        assert issues[0].severity == "error"
+
+    def test_missing_binary_errors(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        def raise_fnf(cmd, **kw):
+            raise FileNotFoundError("spec-runner")
+
+        monkeypatch.setattr(preflight.subprocess, "run", raise_fnf)
+        issues = preflight._check_spec_runner_contract()
+        assert [i.code for i in issues] == ["spec-runner-prefix-unsupported"]
+        assert issues[0].severity == "error"
+
+
+class TestTrackedSpecRunnerConfigWarning:
+    def test_tracked_config_warns(self, tmp_path) -> None:
+        from maestro import preflight
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True
+        )
+        (repo / "spec-runner.config.yaml").write_text("x: 1\n")
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "spec-runner.config.yaml"],
+            check=True,
+            capture_output=True,
+        )
+        issues = preflight._check_tracked_spec_runner_config(repo)
+        assert [i.code for i in issues] == ["spec-runner-config-tracked"]
+        assert issues[0].severity == "warning"
+
+    def test_untracked_or_absent_is_silent(self, tmp_path) -> None:
+        from maestro import preflight
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True
+        )
+        assert preflight._check_tracked_spec_runner_config(repo) == []

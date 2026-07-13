@@ -14,7 +14,7 @@ from maestro.decomposer import (
     ScopeOverlapWarning,
     _patterns_overlap,
 )
-from maestro.models import WorkstreamConfig
+from maestro.models import SPEC_PREFIX, WorkstreamConfig
 
 
 # =============================================================================
@@ -355,7 +355,9 @@ class TestGenerateSpec:
         workspace = temp_dir / "ws"
         workspace.mkdir()
         (workspace / "spec").mkdir()
-        (workspace / "spec" / "tasks.md").write_text("# tasks\n", encoding="utf-8")
+        (workspace / "spec" / f"{SPEC_PREFIX}tasks.md").write_text(
+            "# tasks\n", encoding="utf-8"
+        )
         dec = ProjectDecomposer(repo_path=temp_dir)
         proc = self._fake_proc()
         with patch(
@@ -375,7 +377,9 @@ class TestGenerateSpec:
     ) -> None:
         workspace = temp_dir / "ws"
         (workspace / "spec").mkdir(parents=True)
-        (workspace / "spec" / "tasks.md").write_text("x", encoding="utf-8")
+        (workspace / "spec" / f"{SPEC_PREFIX}tasks.md").write_text(
+            "x", encoding="utf-8"
+        )
         dec = ProjectDecomposer(repo_path=temp_dir)
         captured = {}
 
@@ -398,7 +402,9 @@ class TestGenerateSpec:
     ) -> None:
         workspace = temp_dir / "ws"
         (workspace / "spec").mkdir(parents=True)
-        (workspace / "spec" / "tasks.md").write_text("x", encoding="utf-8")
+        (workspace / "spec" / f"{SPEC_PREFIX}tasks.md").write_text(
+            "x", encoding="utf-8"
+        )
         dec = ProjectDecomposer(repo_path=temp_dir, spec_gen_budget_usd=None)
         proc = self._fake_proc()
         with patch(
@@ -473,7 +479,9 @@ class TestGenerateSpec:
     ) -> None:
         workspace = temp_dir / "ws"
         (workspace / "spec").mkdir(parents=True)
-        (workspace / "spec" / "tasks.md").write_text("x", encoding="utf-8")
+        (workspace / "spec" / f"{SPEC_PREFIX}tasks.md").write_text(
+            "x", encoding="utf-8"
+        )
         dec = ProjectDecomposer(repo_path=temp_dir)
         captured: dict[str, str] = {}
 
@@ -504,6 +512,70 @@ class TestGenerateSpec:
         ):
             await dec.generate_spec(workstream, workspace)
         assert not Path(captured["desc"]).exists()  # noqa: ASYNC240
+
+
+# =============================================================================
+# Unit Tests: generate_spec() prefixing (H-7)
+# =============================================================================
+
+
+class TestGenerateSpecPrefix:
+    """H-7: generation is namespaced with SPEC_PREFIX end to end."""
+
+    @pytest.fixture
+    def workstream(self) -> WorkstreamConfig:
+        return WorkstreamConfig(
+            id="ws1",
+            title="Feature X",
+            description="Do the thing",
+            scope=["src/x.py", "tests/test_x.py"],
+        )
+
+    def _fake_proc(self, returncode: int = 0, stderr: bytes = b""):
+        proc = MagicMock()
+        proc.returncode = returncode
+        proc.communicate = AsyncMock(return_value=(b"", stderr))
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock(return_value=returncode)
+        return proc
+
+    @pytest.mark.anyio
+    async def test_plan_cmd_carries_spec_prefix_and_checks_prefixed_tasks(
+        self, temp_dir: Path, workstream: WorkstreamConfig
+    ) -> None:
+        workspace = temp_dir / "ws"
+        workspace.mkdir()
+        (workspace / "spec").mkdir()
+        (workspace / "spec" / f"{SPEC_PREFIX}tasks.md").write_text(
+            "### TASK-001: t\n", encoding="utf-8"
+        )
+        dec = ProjectDecomposer(repo_path=temp_dir)
+        proc = self._fake_proc()
+        with patch(
+            "asyncio.create_subprocess_exec", AsyncMock(return_value=proc)
+        ) as exec_mock:
+            await dec.generate_spec(workstream, workspace)
+        cmd = list(exec_mock.call_args[0])
+        idx = cmd.index("--spec-prefix")
+        assert cmd[idx + 1] == SPEC_PREFIX
+
+    @pytest.mark.anyio
+    async def test_unprefixed_tasks_md_no_longer_satisfies_check(
+        self, temp_dir: Path, workstream: WorkstreamConfig
+    ) -> None:
+        workspace = temp_dir / "ws"
+        (workspace / "spec").mkdir(parents=True)
+        (workspace / "spec" / "tasks.md").write_text(  # legacy unprefixed path
+            "### TASK-001: t\n", encoding="utf-8"
+        )
+        dec = ProjectDecomposer(repo_path=temp_dir)
+        proc = self._fake_proc()
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(DecomposerError, match=r"tasks\.md was not"),
+        ):
+            await dec.generate_spec(workstream, workspace)
 
 
 # =============================================================================

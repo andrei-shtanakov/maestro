@@ -5,7 +5,8 @@ for the executor state file. Previously Maestro's orchestrator parsed the
 state file as a plain dict directly from `.executor-state.json`, which
 broke silently when spec-runner 2.0 moved the source of truth to SQLite.
 
-Consumers should call `read_executor_state(spec_dir)` rather than opening
+Consumers should call `read_executor_state(spec_dir, prefix)` — passing the
+same `prefix` used for `spec_prefix` namespacing (H-7) — rather than opening
 the state file themselves so format changes stay isolated to this module.
 """
 
@@ -37,27 +38,29 @@ SPEC_RUNNER_REQUIRED_VERSION = "2.0.0"
 
 # Filenames inside the workspace's `spec/` directory. SQLite is the canonical
 # format since spec-runner 2.0; JSON is kept as a read-only fallback so old
-# state files (pre-migration) can still be displayed.
+# state files (pre-migration) can still be displayed. These are the unprefixed
+# defaults (prefix=""); with a prefix like "maestro-", the files are
+# ".executor-maestro-state.db" and ".executor-maestro-state.json".
 SQLITE_STATE_FILENAME = ".executor-state.db"
 JSON_STATE_FILENAME = ".executor-state.json"
 
 
-def read_executor_state(spec_dir: Path) -> ExecutorState | None:
+def read_executor_state(spec_dir: Path, prefix: str = "") -> ExecutorState | None:
     """Read the executor state from a workspace's `spec/` directory.
 
-    Prefers the SQLite state file (spec-runner 2.0+), falls back to the JSON
-    file if only it exists (legacy or pre-migration snapshots). Returns
-    `None` when neither file exists or the content is unreadable — callers
-    treat that as "no progress yet" rather than as an error.
+    `prefix` mirrors spec-runner's `spec_prefix` namespacing (H-7): with
+    prefix "maestro-" the files are `.executor-maestro-state.{db,json}`.
+    Prefers the SQLite state file (spec-runner 2.0+), falls back to the
+    JSON file. Returns None when neither exists or is unreadable.
     """
-    sqlite_path = spec_dir / SQLITE_STATE_FILENAME
+    sqlite_path = spec_dir / f".executor-{prefix}state.db"
     if sqlite_path.exists():
         try:
             return _read_state_from_sqlite(sqlite_path)
         except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
             logger.debug("Failed to read SQLite state %s: %s", sqlite_path, exc)
 
-    json_path = spec_dir / JSON_STATE_FILENAME
+    json_path = spec_dir / f".executor-{prefix}state.json"
     if json_path.exists():
         try:
             return _read_state_from_json(json_path)

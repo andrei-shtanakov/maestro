@@ -219,3 +219,34 @@ def catalog_env(monkeypatch: pytest.MonkeyPatch) -> Path:
     fixture = Path(__file__).parent / "fixtures" / "agents-catalog.toml"
     monkeypatch.setenv("ATP_CATALOG", str(fixture))
     return fixture
+
+
+# =============================================================================
+# External Binary Stubs
+# =============================================================================
+
+
+@pytest.fixture(autouse=True)
+def _stub_spec_runner_help(monkeypatch: pytest.MonkeyPatch) -> None:
+    """validate_project(check_fs=True) shells out to `spec-runner run
+    --help` (H-7 contract guard). Stub it to a passing response so the
+    suite doesn't depend on a locally installed spec-runner binary/version.
+    Other subprocess.run calls (e.g. real `git` invocations made directly
+    by tests) pass through untouched. Tests that want to exercise the
+    contract guard itself override this via their own monkeypatch.setattr
+    call, which wins because it runs later in the same test.
+    """
+    import subprocess
+
+    from maestro import preflight
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["spec-runner", "run", "--help"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="usage: ... --spec-prefix SPEC_PREFIX ...", stderr=""
+            )
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(preflight.subprocess, "run", fake_run)

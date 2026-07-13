@@ -11,7 +11,10 @@ errored verdict blocks the transition — at every tier. A blocked workstream
 routes to NEEDS_REVIEW with the approval marker in ``error_message``; a human
 re-queueing it (NEEDS_REVIEW -> READY) *is* the owner approval for that exact
 phase + SHA — a new commit changes the SHA and invalidates the approval
-(DESIGN-608, M-3). Every evaluation appends a verdict-record to
+(DESIGN-608, M-3). Gates v1.2 (H-6/H-7): an approved ex-post block resumes at
+the ex-post edge (see orchestrator._try_resume_ex_post); the infra-path
+exclusion covers only maestro-prefixed artifacts, and the approval marker in
+error_message clears only at DONE. Every evaluation appends a verdict-record to
 ``logs/<ULID>/gate_verdicts.jsonl`` (M-1); records are addressable via
 EvidenceRef ``kind=gate-verdict``. Gates whose enforcement point lies outside
 these two edges (branch protection, PR reviews) are recorded as advisory
@@ -24,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +36,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from maestro._vendor.obs import current_pipeline_id
+from maestro.models import SPEC_PREFIX
 
 
 if TYPE_CHECKING:
@@ -40,22 +45,62 @@ if TYPE_CHECKING:
 
 __all__ = [
     "APPROVAL_MARKER_PREFIX",
+    "ApprovalMarker",
     "GateDecision",
     "GateKeeper",
     "GateVerdictRecord",
+    "parse_approval_marker",
     "pipeline_log_dir",
 ]
 
 APPROVAL_MARKER_PREFIX = "gates:approval-required"
 
-# Paths Maestro itself commits into the branch (spec generation); they are
-# infra, not the agent's change — excluded from ex-post classification and
-# the declared-scope check (governed-run finding H-4).
-_ORCHESTRATOR_MANAGED = ("spec/", "spec-runner.config.yaml")
+_MARKER_RE = re.compile(
+    re.escape(APPROVAL_MARKER_PREFIX)
+    + r" phase=(ex_ante|ex_post) sha=([0-9a-fA-F]{7,64})"
+)
+
+
+class ApprovalMarker(BaseModel):
+    """Parsed `gates:approval-required phase=<p> sha=<sha>` marker (H-6)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    phase: Literal["ex_ante", "ex_post"]
+    sha: str
+
+
+def parse_approval_marker(error_message: str | None) -> ApprovalMarker | None:
+    """Extract the gates approval marker from a stored block reason.
+
+    Returns None when the message is empty or carries no well-formed
+    marker. The marker is the durable half of the approval memory: it
+    lives in the workstream row and survives orchestrator restarts,
+    unlike the verdict store bound to one run's logs/<ULID>/ directory.
+    """
+    if not error_message:
+        return None
+    match = _MARKER_RE.search(error_message)
+    if match is None:
+        return None
+    phase = match.group(1)
+    assert phase in ("ex_ante", "ex_post")  # regex guarantees; narrows type
+    return ApprovalMarker(phase=phase, sha=match.group(2))
+
+
+# Paths Maestro itself materializes in the worktree (spec generation +
+# executor runtime state); they are infra, not the agent's change —
+# excluded from ex-post classification and the declared-scope check
+# (H-4, narrowed in gates v1.2/H-7). Deliberately NOT excluded:
+# `spec-runner.config.yaml` — in a repo that tracks its own config,
+# Maestro's overwrite must surface as a scope violation (fail-closed
+# backstop); in a repo without one the file is untracked+ignored and
+# never enters the diff.
+_ORCHESTRATOR_MANAGED = (f"spec/{SPEC_PREFIX}", "spec/.executor-")
 
 
 def _orchestrator_managed(path: str) -> bool:
-    return path == _ORCHESTRATOR_MANAGED[1] or path.startswith(_ORCHESTRATOR_MANAGED[0])
+    return path.startswith(_ORCHESTRATOR_MANAGED)
 
 
 _STEWARD_ENV = "MAESTRO_STEWARD_BIN"

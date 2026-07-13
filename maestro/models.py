@@ -14,6 +14,14 @@ from typing import Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+# Namespace for every file Maestro generates inside a target repo's
+# worktree (gates v1.2, H-7): spec/maestro-{tasks,requirements,design}.md,
+# spec/.executor-maestro-state.db, ... spec-runner's own multi-phase
+# `spec_prefix` mechanism does the namespacing; this constant is the single
+# source of the prefix value across Maestro.
+SPEC_PREFIX = "maestro-"
+
+
 class TaskStatus(StrEnum):
     """Task execution status with valid state transitions.
 
@@ -1181,6 +1189,7 @@ class SpecRunnerConfig(BaseModel):
                 "task_timeout_minutes": self.task_timeout_minutes,
                 "claude_command": self.claude_command,
                 "auto_commit": self.auto_commit,
+                "spec_prefix": SPEC_PREFIX,
                 "hooks": {
                     "pre_start": {
                         "create_git_branch": self.create_git_branch,

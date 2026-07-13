@@ -19,10 +19,17 @@ from pathlib import Path
 from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
-from maestro.gates import GateDecision, GateKeeper, pipeline_log_dir
+from maestro.gates import (
+    ApprovalMarker,
+    GateDecision,
+    GateKeeper,
+    parse_approval_marker,
+    pipeline_log_dir,
+)
 from maestro.git import GitError, MergeConflictError
 from maestro.merge_logs import merge_logs_dir
 from maestro.models import (
+    SPEC_PREFIX,
     OrchestratorConfig,
     Workstream,
     WorkstreamConfig,
@@ -30,7 +37,7 @@ from maestro.models import (
 )
 from maestro.pr_manager import PRManager, PRManagerError
 from maestro.spec_runner import read_executor_state
-from maestro.workspace import WorkspaceManager
+from maestro.workspace import WorkspaceManager, ensure_harness_excludes
 
 
 class OrchestratorError(Exception):
@@ -301,6 +308,18 @@ class Orchestrator:
                     # may be a live orphan — never reset to READY. Park for
                     # review. The NEEDS_REVIEW write below clears both pids.
                     target = WorkstreamStatus.NEEDS_REVIEW
+                elif parse_approval_marker(w.error_message) is not None:
+                    # `_gate_ex_post` blocks with TWO writes: RUNNING ->
+                    # FAILED-with-marker, then FAILED -> NEEDS_REVIEW. A
+                    # crash between them strands a FAILED row that still
+                    # carries the marker. can_retry() is true here (gate
+                    # blocks never increment retry_count), but the marker
+                    # means "awaiting a human", not "retryable failure" --
+                    # routing it to READY would let evaluate_ex_post read
+                    # the marker in prior_error as an operator approval
+                    # that never happened (governance bypass). Always
+                    # finish the interrupted write as NEEDS_REVIEW instead.
+                    target = WorkstreamStatus.NEEDS_REVIEW
                 else:
                     target = (
                         WorkstreamStatus.READY
@@ -533,6 +552,19 @@ class Orchestrator:
         """Spawn a spec-runner process for a workstream."""
         workstream = await self._db.get_workstream(workstream_id)
 
+        # Gates v1.2 (H-6): an operator-approved ex-post block resumes at
+        # the ex-post edge over the untouched worktree. Replaying the
+        # pipeline would regenerate the spec, mint a new sha, and void the
+        # approval (DESIGN-608). Must run before DECOMPOSING and before the
+        # spawning sentinel — a resume never spawns anything.
+        marker = parse_approval_marker(workstream.error_message)
+        if (
+            marker is not None
+            and marker.phase == "ex_post"
+            and await self._try_resume_ex_post(workstream, marker)
+        ):
+            return
+
         # Transition to DECOMPOSING; write the spawning sentinel up front — it
         # marks a spawn-in-progress AND overwrites any stale prior generation
         # pid (re-decompose).
@@ -558,8 +590,22 @@ class Orchestrator:
             workspace_path=str(workspace),
         )
 
+        # H-7: keep every harness artifact untracked in the target repo —
+        # repo-local ignore block, shared by all linked worktrees.
+        await asyncio.get_running_loop().run_in_executor(
+            None, ensure_harness_excludes, workspace
+        )
+
+        # Setup spec-runner config BEFORE generation so `plan --full`
+        # writes prefix-namespaced spec files from the start (H-7).
+        executor_config = self._config.spec_runner.to_executor_config()
+        # Set main_branch to the workstream branch (so spec-runner
+        # merges subtask branches back to it)
+        executor_config.setdefault("executor", {})["main_branch"] = workstream.branch
+        self._workspace_mgr.setup_spec_runner(workspace, executor_config)
+
         # Generate spec for this workstream
-        # Always regenerate: the repo may already have spec/tasks.md
+        # Always regenerate: the repo may already have spec/maestro-tasks.md
         # from a previous run or different project phase
         workstream_config = WorkstreamConfig(
             id=workstream.id,
@@ -581,22 +627,6 @@ class Orchestrator:
             workstream_config, workspace, on_pid=_on_gen_pid
         )
 
-        # Setup spec-runner config
-        executor_config = self._config.spec_runner.to_executor_config()
-        # Set main_branch to the workstream branch (so spec-runner
-        # merges subtask branches back to it)
-        executor_config.setdefault("executor", {})["main_branch"] = workstream.branch
-        self._workspace_mgr.setup_spec_runner(workspace, executor_config)
-
-        # Commit generated spec + config so spec-runner subtask
-        # branches don't lose them during merge
-        await asyncio.get_running_loop().run_in_executor(
-            None,
-            self._commit_spec_in_workspace,
-            workspace,
-            workstream_id,
-        )
-
         # Transition to READY then RUNNING
         await self._db.update_workstream_status(workstream_id, WorkstreamStatus.READY)
 
@@ -616,7 +646,7 @@ class Orchestrator:
         # Spawn spec-runner
         log_file = self._log_dir / f"{workstream_id}.log"
 
-        cmd = ["spec-runner", "run", "--all"]
+        cmd = ["spec-runner", "run", "--all", "--spec-prefix", SPEC_PREFIX]
 
         # Add callback URL if REST API is running
         # (optional — we also poll state files)
@@ -667,32 +697,6 @@ class Orchestrator:
             process.pid,
             workspace,
         )
-
-    @staticmethod
-    def _commit_spec_in_workspace(
-        workspace: Path,
-        workstream_id: str,
-    ) -> None:
-        """Commit generated spec files in the worktree.
-
-        This ensures spec-runner subtask branches inherit
-        the generated tasks.md when they branch off.
-        """
-        with span("task.execute", task_id=workstream_id):
-            subprocess.run(
-                ["git", "add", "spec/", "spec-runner.config.yaml"],
-                cwd=workspace,
-                env={**os.environ, **child_env()},
-                capture_output=True,
-                check=False,
-            )
-            subprocess.run(
-                ["git", "commit", "-m", f"maestro: add spec for {workstream_id}"],
-                cwd=workspace,
-                env={**os.environ, **child_env()},
-                capture_output=True,
-                check=False,
-            )
 
     def _merge_into_base(self, feature_branch: str) -> None:
         """Merge feature branch into base branch in the main repo.
@@ -803,7 +807,9 @@ class Orchestrator:
         """
         spec_dir = running.workspace_path / "spec"
         loop = asyncio.get_running_loop()
-        state = await loop.run_in_executor(None, read_executor_state, spec_dir)
+        state = await loop.run_in_executor(
+            None, read_executor_state, spec_dir, SPEC_PREFIX
+        )
 
         if state is None:
             return
@@ -828,11 +834,76 @@ class Orchestrator:
         )
         return False
 
+    @staticmethod
+    async def _workspace_head(workspace: Path) -> str | None:
+        """HEAD sha of a worktree, or None when unreadable."""
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(workspace),
+            "rev-parse",
+            "HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await process.communicate()
+        if process.returncode != 0:
+            return None
+        return stdout.decode().strip()
+
+    async def _try_resume_ex_post(
+        self, workstream: Workstream, marker: ApprovalMarker
+    ) -> bool:
+        """Resume an ex-post-approved workstream at the ex-post edge (H-6).
+
+        True only when the worktree still exists AND sits exactly at the
+        approved sha; then the workstream goes READY -> RUNNING (explicitly
+        clearing both pids so recovery never mistakes it for a live orphan)
+        and re-enters the success continuation — ex-post re-evaluates,
+        passes via the approval memory, and the normal MERGING -> PR ->
+        merge -> DONE tail runs. False = caller proceeds with the full
+        respawn (the approval is genuinely void, DESIGN-608).
+        """
+        if not self._workspace_mgr.workspace_exists(workstream.id):
+            self._logger.warning(
+                "Workstream '%s' has an ex-post approval for sha %s but no "
+                "workspace; falling back to a full respawn",
+                workstream.id,
+                marker.sha[:12],
+            )
+            return False
+        workspace = self._workspace_mgr.get_workspace_path(workstream.id)
+        head = await self._workspace_head(workspace)
+        if head != marker.sha:
+            self._logger.warning(
+                "Workstream '%s' worktree HEAD %s != approved sha %s; the "
+                "approval is void (DESIGN-608), falling back to a full respawn",
+                workstream.id,
+                (head or "unreadable")[:12],
+                marker.sha[:12],
+            )
+            return False
+        await self._db.update_workstream_status(
+            workstream.id,
+            WorkstreamStatus.RUNNING,
+            expected_status=workstream.status,
+            process_pid=None,
+            generation_pid=None,
+            workspace_path=str(workspace),
+        )
+        self._logger.info(
+            "Resuming workstream '%s' at the ex-post gate (approved sha %s)",
+            workstream.id,
+            marker.sha[:12],
+        )
+        await self._handle_success(workstream.id, workspace)
+        return True
+
     async def _gate_ex_post(
         self,
         workstream_id: str,
         workstream: Workstream,
-        running: RunningWorkstream,
+        workspace_path: Path,
     ) -> bool:
         """Evaluate the ex-post gate; on block route RUNNING -> FAILED -> NEEDS_REVIEW."""
         if self._gates is None:
@@ -840,7 +911,7 @@ class Orchestrator:
         decision = await self._gates.evaluate_ex_post(
             workstream_id,
             workstream.scope,
-            workspace=running.workspace_path,
+            workspace=workspace_path,
             prior_error=workstream.error_message,
         )
         if decision.allow:
@@ -887,7 +958,7 @@ class Orchestrator:
                 "Workstream '%s' completed successfully",
                 workstream_id,
             )
-            await self._handle_success(workstream_id, running)
+            await self._handle_success(workstream_id, running.workspace_path)
         else:
             self._logger.warning(
                 "Workstream '%s' failed (code %d)",
@@ -902,7 +973,7 @@ class Orchestrator:
     async def _handle_success(
         self,
         workstream_id: str,
-        _running: RunningWorkstream,
+        workspace_path: Path,
     ) -> None:
         """Handle successful workstream completion.
 
@@ -912,7 +983,7 @@ class Orchestrator:
 
         # Gates (WS-006): ex-post guard over the actual diff (catches scope
         # violations and tier escalations the declared scope did not show).
-        if not await self._gate_ex_post(workstream_id, workstream, _running):
+        if not await self._gate_ex_post(workstream_id, workstream, workspace_path):
             return
 
         # Transition to MERGING
@@ -950,11 +1021,19 @@ class Orchestrator:
                     workstream_id,
                     e,
                 )
-                # Still mark as PR_CREATED (PR may exist)
+                # Still mark as PR_CREATED (PR may exist). If error_message
+                # currently carries an ex-post approval marker (H-6 resume
+                # tail), APPEND the note instead of overwriting it: an
+                # overwrite would destroy the marker mid-resume, and a
+                # later crash before DONE would then full-respawn instead
+                # of resuming (the marker clears ONLY on the DONE write).
+                note = f"PR creation note: {e}"
+                if parse_approval_marker(workstream.error_message) is not None:
+                    note = f"{workstream.error_message} | {note}"
                 await self._db.update_workstream_status(
                     workstream_id,
                     WorkstreamStatus.PR_CREATED,
-                    error_message=f"PR creation note: {e}",
+                    error_message=note,
                 )
 
         # Ensure the workstream is at PR_CREATED (both auto_pr paths converge
@@ -997,11 +1076,16 @@ class Orchestrator:
             # Leave the workspace intact so a human can resolve the conflict.
             return
 
-        # Merge succeeded -> DONE.
+        # Merge succeeded -> DONE. Clear error_message here ONLY: it may
+        # still hold an ex-post approval marker (H-6) that recovery needs
+        # to survive a crash-tail through MERGING/PR_CREATED (both reset to
+        # READY on recovery, and the next run must still see the marker to
+        # resume instead of full-respawning).
         await self._db.update_workstream_status(
             workstream_id,
             WorkstreamStatus.DONE,
             expected_status=WorkstreamStatus.PR_CREATED,
+            error_message=None,
         )
         self._stats.completed += 1
 
