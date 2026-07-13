@@ -2087,9 +2087,7 @@ class TestApproveWorkstreamWithGateRecord:
 
         db = await self._db_with_needs_review(tmp_path)
         try:
-            w = await db.approve_workstream_with_gate_record(
-                "z1", "ex_post", "a" * 40
-            )
+            w = await db.approve_workstream_with_gate_record("z1", "ex_post", "a" * 40)
             assert w.status == WorkstreamStatus.READY
             assert w.error_message == "gates: ..."  # message preserved
             assert await db.list_gate_approvals("z1") == {("ex_post", "a" * 40)}
@@ -2116,9 +2114,7 @@ class TestApproveWorkstreamWithGateRecord:
         try:
             await db.update_workstream_status("z1", WorkstreamStatus.READY)
             with pytest.raises(ValueError, match="only NEEDS_REVIEW"):
-                await db.approve_workstream_with_gate_record(
-                    "z1", "ex_post", "a" * 40
-                )
+                await db.approve_workstream_with_gate_record("z1", "ex_post", "a" * 40)
             # The transaction rolled back: no approval row either.
             assert await db.list_gate_approvals("z1") == set()
         finally:
