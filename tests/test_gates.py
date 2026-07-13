@@ -534,41 +534,140 @@ async def test_h4_orchestrator_managed_paths_do_not_violate_scope(
     assert decision.allow, (decision.reason, [r.note for r in decision.records])
 
 
-def test_h5_workstream_approve_cli_flips_needs_review_to_ready(tmp_path: Path) -> None:
+def test_workstream_approve_records_durable_approval(tmp_path: Path) -> None:
+    """gates v1.3: the sanctioned CLI point writes the gate_approvals row."""
     import asyncio as _asyncio
 
-    from maestro.database import Database
-    from maestro.models import Workstream, WorkstreamStatus
+    sha = "a" * 40
 
-    async def scenario() -> tuple[str, str | None]:
-        db = Database(tmp_path / "m.db")
+    async def scenario():
+        from maestro.cli import _approve_workstream
+        from maestro.database import Database
+        from maestro.gates import APPROVAL_MARKER_PREFIX
+        from maestro.models import Workstream, WorkstreamStatus
+
+        db = Database(tmp_path / "t.db")
         await db.connect()
-        ws = Workstream(
-            id="ws-1",
-            title="t",
-            description="d",
-            scope=["src/**"],
-            status=WorkstreamStatus.PENDING,
-            branch="feature/ws-1",
-        )
         try:
-            await db.create_workstream(ws)
-            await db.update_workstream_status(
-                "ws-1",
-                WorkstreamStatus.NEEDS_REVIEW,
-                error_message="gates: ... marker",
+            await db.create_workstream(
+                Workstream(
+                    id="ws-1",
+                    title="t",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/ws-1",
+                    status=WorkstreamStatus.NEEDS_REVIEW,
+                    error_message=(
+                        "gates: human.owner_approval required (tier=high); "
+                        "re-queue to approve. "
+                        f"{APPROVAL_MARKER_PREFIX} phase=ex_post sha={sha}"
+                    ),
+                )
             )
-            from maestro.cli import _approve_workstream
-
-            await _approve_workstream(db, "ws-1")
+            marker = await _approve_workstream(db, "ws-1")
             after = await db.get_workstream("ws-1")
-            return after.status, after.error_message
+            approvals = await db.list_gate_approvals("ws-1")
+            return marker, after, approvals
         finally:
             await db.close()
 
-    status, error_message = _asyncio.run(scenario())
+    marker, after, approvals = _asyncio.run(scenario())
+    assert after.status == WorkstreamStatus.READY
+    assert after.error_message and "phase=ex_post" in after.error_message
+    assert approvals == {("ex_post", sha)}
+    assert marker is not None and marker.phase == "ex_post" and marker.sha == sha
+
+
+def test_workstream_approve_without_marker_records_nothing(tmp_path: Path) -> None:
+    import asyncio as _asyncio
+
+    async def scenario():
+        from maestro.cli import _approve_workstream
+        from maestro.database import Database
+        from maestro.models import Workstream, WorkstreamStatus
+
+        db = Database(tmp_path / "t.db")
+        await db.connect()
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="ws-2",
+                    title="t",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/ws-2",
+                    status=WorkstreamStatus.NEEDS_REVIEW,
+                    error_message="Base merge failed: conflict",
+                )
+            )
+            marker = await _approve_workstream(db, "ws-2")
+            return marker, await db.list_gate_approvals("ws-2"), (
+                await db.get_workstream("ws-2")
+            ).status
+        finally:
+            await db.close()
+
+    marker, approvals, status = _asyncio.run(scenario())
+    assert marker is None
+    assert approvals == set()
     assert status == WorkstreamStatus.READY
-    assert error_message and "marker" in error_message, "marker must be preserved"
+
+
+def test_workstream_approve_takes_effect_in_next_gate_evaluation(
+    tmp_path: Path,
+) -> None:
+    """End-to-end CLI -> DB -> gate loop (Task 3 final-review gap).
+
+    Seeds a NEEDS_REVIEW workstream with an ex_post marker for sha X,
+    approves it via the sanctioned CLI entry point, then feeds the
+    resulting DB approvals set straight into `GateKeeper._decide` for
+    that same phase+sha and asserts the gate now allows. Before this
+    task's rewire, `_approve_workstream` recorded nothing in
+    `gate_approvals`, so this evaluation would still block.
+    """
+    import asyncio as _asyncio
+
+    sha = "c" * 40
+
+    async def scenario():
+        from maestro.cli import _approve_workstream
+        from maestro.database import Database
+        from maestro.gates import APPROVAL_MARKER_PREFIX
+        from maestro.models import Workstream, WorkstreamStatus
+
+        db = Database(tmp_path / "loop.db")
+        await db.connect()
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="ws-loop",
+                    title="t",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/ws-loop",
+                    status=WorkstreamStatus.NEEDS_REVIEW,
+                    error_message=(
+                        "gates: human.owner_approval required (tier=high); "
+                        "re-queue to approve. "
+                        f"{APPROVAL_MARKER_PREFIX} phase=ex_post sha={sha}"
+                    ),
+                )
+            )
+            await _approve_workstream(db, "ws-loop")
+            return await db.list_gate_approvals("ws-loop")
+        finally:
+            await db.close()
+
+    approvals = _asyncio.run(scenario())
+    keeper = _make_keeper(tmp_path)
+    decision = keeper._decide(
+        "ex_post",
+        "ws-loop",
+        sha,
+        {"tier": "high", "mandatory_gates": [], "flags": []},
+        approvals=approvals,
+    )
+    assert decision.allow is True
 
 
 # --------------------------------- gates v1.2 (H-6): resume via approval marker

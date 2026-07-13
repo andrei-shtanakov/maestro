@@ -18,7 +18,7 @@ import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich.console import Console
@@ -72,6 +72,10 @@ from maestro.spawners import (
 )
 from maestro.spawners.base import AgentSpawner
 from maestro.workspace import WorkspaceManager
+
+
+if TYPE_CHECKING:
+    from maestro.gates import ApprovalMarker
 
 
 # Default paths
@@ -1465,13 +1469,19 @@ def workstreams_command(
     asyncio.run(_show_workstreams_status(db_path))
 
 
-async def _approve_workstream(db: "Database", workstream_id: str) -> None:
-    """Operator approval: NEEDS_REVIEW -> READY, preserving error_message.
+async def _approve_workstream(
+    db: "Database", workstream_id: str
+) -> "ApprovalMarker | None":
+    """Operator approval: record the gate approval + NEEDS_REVIEW -> READY
+    in one transaction (gates v1.3, H-9).
 
-    The preserved message may carry the gates approval marker; the durable
-    approval memory is the verdict store (gates v1.1, H-3/H-5) — this
-    command is the sanctioned re-queue that used to be a raw sqlite UPDATE.
+    Parses the approval marker from the stored block reason; with a marker
+    the (phase, sha) approval is recorded durably in gate_approvals — the
+    single approval authority the gates consult. Without a marker this is
+    a plain requeue and records nothing. Returns the recorded marker (or
+    None) so the CLI can say exactly what was approved.
     """
+    from maestro.gates import parse_approval_marker
     from maestro.models import WorkstreamStatus
 
     workstream = await db.get_workstream(workstream_id)
@@ -1482,11 +1492,13 @@ async def _approve_workstream(db: "Database", workstream_id: str) -> None:
             f"workstream '{workstream_id}' is {workstream.status}, "
             f"only NEEDS_REVIEW can be approved"
         )
-    await db.update_workstream_status(
+    marker = parse_approval_marker(workstream.error_message)
+    await db.approve_workstream_with_gate_record(
         workstream_id,
-        WorkstreamStatus.READY,
-        expected_status=WorkstreamStatus.NEEDS_REVIEW,
+        marker.phase if marker else None,
+        marker.sha if marker else None,
     )
+    return marker
 
 
 @app.command("workstream-approve")
@@ -1504,23 +1516,34 @@ def workstream_approve_command(
     """
     db_path = db or DEFAULT_DB_PATH
 
-    async def _run() -> None:
+    async def _run() -> "ApprovalMarker | None":
         from maestro.database import Database
 
         database = Database(db_path)
         await database.connect()
         try:
-            await _approve_workstream(database, workstream_id)
+            return await _approve_workstream(database, workstream_id)
         finally:
             await database.close()
 
     try:
-        asyncio.run(_run())
+        marker = asyncio.run(_run())
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
+    if marker is not None:
+        console.print(
+            f"[green]Workstream '{workstream_id}' approved "
+            f"(NEEDS_REVIEW -> READY); recorded approval "
+            f"phase={marker.phase} sha={marker.sha[:12]}.[/green]"
+        )
+    else:
+        console.print(
+            f"[yellow]Workstream '{workstream_id}' re-queued "
+            f"(NEEDS_REVIEW -> READY) — no gate marker in error_message, "
+            f"NO approval recorded.[/yellow]"
+        )
     console.print(
-        f"[green]Workstream '{workstream_id}' approved (NEEDS_REVIEW -> READY).[/green]\n"
         f"Resume with: maestro orchestrate <project.yaml> --db {db_path} --resume"
     )
 
