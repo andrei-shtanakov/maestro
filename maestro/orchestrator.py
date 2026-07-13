@@ -20,11 +20,13 @@ from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
 from maestro.gates import (
+    BLOCK_REASON_PREFIX,
     ApprovalMarker,
     GateDecision,
     GateKeeper,
     parse_approval_marker,
     pipeline_log_dir,
+    preserve_approval_marker,
 )
 from maestro.git import GitError, MergeConflictError
 from maestro.merge_logs import merge_logs_dir
@@ -308,20 +310,18 @@ class Orchestrator:
                     # may be a live orphan — never reset to READY. Park for
                     # review. The NEEDS_REVIEW write below clears both pids.
                     target = WorkstreamStatus.NEEDS_REVIEW
-                elif parse_approval_marker(w.error_message) is not None:
+                elif w.error_message is not None and w.error_message.startswith(
+                    BLOCK_REASON_PREFIX
+                ):
                     # `_gate_ex_post` blocks with TWO writes: RUNNING ->
-                    # FAILED-with-marker, then FAILED -> NEEDS_REVIEW. A
-                    # crash between them strands a FAILED row that still
-                    # carries the marker. can_retry() is true here (gate
-                    # blocks never increment retry_count), but the marker
-                    # means "awaiting a human", not "retryable failure" --
-                    # routing it straight to READY would silently drop the
-                    # pending-review signal (gates v1.3/H-9: the marker is
-                    # UX only, evaluate_ex_post still re-checks the DB
-                    # approvals set and stays blocked either way, but the
-                    # workstream should surface as NEEDS_REVIEW, not READY,
-                    # until an operator actually approves it). Always finish
-                    # the interrupted write as NEEDS_REVIEW instead.
+                    # FAILED-with-block-reason, then FAILED -> NEEDS_REVIEW.
+                    # A crash between them strands a FAILED row whose
+                    # error_message IS the gate-block reason. Finish the
+                    # interrupted write as NEEDS_REVIEW. NOTE (v1.3): the
+                    # predicate is the BLOCK_REASON_PREFIX, not marker
+                    # presence — `_handle_failure` now APPENDS markers to
+                    # ordinary failure messages (H-6 position retention),
+                    # and those must follow the normal retry rule.
                     target = WorkstreamStatus.NEEDS_REVIEW
                 else:
                     target = (
@@ -1033,12 +1033,12 @@ class Orchestrator:
                 # later crash before DONE would then full-respawn instead
                 # of resuming (the marker clears ONLY on the DONE write).
                 note = f"PR creation note: {e}"
-                if parse_approval_marker(workstream.error_message) is not None:
-                    note = f"{workstream.error_message} | {note}"
                 await self._db.update_workstream_status(
                     workstream_id,
                     WorkstreamStatus.PR_CREATED,
-                    error_message=note,
+                    error_message=preserve_approval_marker(
+                        note, workstream.error_message
+                    ),
                 )
 
         # Ensure the workstream is at PR_CREATED (both auto_pr paths converge
@@ -1105,6 +1105,12 @@ class Orchestrator:
         """Handle workstream failure with retry logic."""
         workstream = await self._db.get_workstream(workstream_id)
 
+        # H-6 position retention (not authority — that lives in
+        # gate_approvals): preserve any approval marker already carried in
+        # error_message so an ordinary failure overwrite doesn't force a
+        # full respawn on the next approved retry.
+        preserved = preserve_approval_marker(error_message, workstream.error_message)
+
         if workstream.can_retry():
             new_count = workstream.retry_count + 1
             self._logger.info(
@@ -1116,7 +1122,7 @@ class Orchestrator:
             await self._db.update_workstream_status(
                 workstream_id,
                 WorkstreamStatus.FAILED,
-                error_message=error_message,
+                error_message=preserved,
                 retry_count=new_count,
             )
             await self._db.update_workstream_status(
@@ -1132,7 +1138,7 @@ class Orchestrator:
             await self._db.update_workstream_status(
                 workstream_id,
                 WorkstreamStatus.FAILED,
-                error_message=error_message,
+                error_message=preserved,
             )
             await self._db.update_workstream_status(
                 workstream_id,

@@ -2604,3 +2604,171 @@ class TestExPostResume:
             orch._try_resume_ex_post.assert_not_awaited()
         finally:
             await db.close()
+
+
+class TestDurableApprovalMemory:
+    """gates v1.3 (H-9): approval survives error_message overwrites and
+    orchestrator restarts; recovery distinguishes gate blocks from failures."""
+
+    async def _orch_db(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ):
+        from maestro.database import Database
+
+        db = Database(tmp_path / "o.db")
+        await db.connect()
+        cfg = OrchestratorConfig(
+            project="p",
+            repo_url="https://github.com/t/r",
+            repo_path="/tmp/r",
+            workspace_base="/tmp/ws",
+            auto_pr=True,
+            workstreams=[],
+        )
+        orch = Orchestrator(
+            db=db,
+            workspace_mgr=mock_workspace_mgr,
+            decomposer=mock_decomposer,
+            config=cfg,
+            pr_manager=mock_pr_manager,
+        )
+        return orch, db
+
+    @pytest.mark.anyio
+    async def test_h9_regression_failure_overwrite_does_not_lose_approval(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        """The exact run-#3 arc: approve -> genuine failure overwrites the
+        message -> retry reaches the gate -> passes via the DB record."""
+        from maestro.gates import GateKeeper
+        from maestro.models import GatesConfig
+
+        sha = "a" * 40
+        _orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="z1",
+                    title="z1",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/z1",
+                    status=WorkstreamStatus.READY,
+                    error_message="spec-runner plan --full failed with code 1",
+                )
+            )
+            await db.record_gate_approval("z1", "ex_ante", sha)
+            keeper = GateKeeper(
+                GatesConfig(steward_bin="/nonexistent"),
+                project="p",
+                repo_path=Path("/tmp/r"),
+                base_branch="master",
+                log_dir=tmp_path / "logs",
+            )
+            # Classification stubbed to tier=high (approval-needing) so the
+            # decision depends solely on the approvals set.
+            decision = keeper._decide(
+                "ex_ante",
+                "z1",
+                sha,
+                {"tier": "high", "mandatory_gates": [], "flags": []},
+                approvals=await db.list_gate_approvals("z1"),
+            )
+            assert decision.allow is True
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_handle_failure_preserves_marker(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        sha = "a" * 40
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="z2",
+                    title="z2",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/z2",
+                    status=WorkstreamStatus.RUNNING,
+                    error_message=_ex_post_marker(sha),
+                    retry_count=0,
+                    max_retries=2,
+                )
+            )
+            await orch._handle_failure("z2", "spec-runner exited with code 2")
+            w = await db.get_workstream("z2")
+            assert w.status == WorkstreamStatus.READY  # retry path
+            assert "spec-runner exited with code 2" in (w.error_message or "")
+            assert f"phase=ex_post sha={sha}" in (w.error_message or "")
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_recovery_failure_with_appended_marker_goes_ready(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        """THE new edge (spec review): approve -> failure with preserved
+        marker -> crash before READY -> recovery returns READY, not
+        NEEDS_REVIEW."""
+        sha = "a" * 40
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="z3",
+                    title="z3",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/z3",
+                    status=WorkstreamStatus.FAILED,
+                    error_message=(
+                        "spec-runner exited with code 2 | "
+                        f"gates:approval-required phase=ex_post sha={sha}"
+                    ),
+                    retry_count=1,
+                    max_retries=2,
+                )
+            )
+            await orch._recover_stranded_workstreams()
+            w = await db.get_workstream("z3")
+            assert w.status == WorkstreamStatus.READY
+            assert f"phase=ex_post sha={sha}" in (w.error_message or "")
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_recovery_true_gate_block_still_parks_needs_review(
+        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+    ) -> None:
+        sha = "a" * 40
+        orch, db = await self._orch_db(
+            tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        )
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="z4",
+                    title="z4",
+                    description="d",
+                    scope=["s"],
+                    branch="feature/z4",
+                    status=WorkstreamStatus.FAILED,
+                    error_message=_ex_post_marker(sha),  # starts with prefix
+                    retry_count=0,
+                    max_retries=2,
+                )
+            )
+            await orch._recover_stranded_workstreams()
+            w = await db.get_workstream("z4")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+        finally:
+            await db.close()
