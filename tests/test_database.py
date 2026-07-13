@@ -2133,3 +2133,26 @@ class TestApproveWorkstreamWithGateRecord:
                 )
         finally:
             await db.close()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("phase", "sha"),
+        [("ex_post", None), (None, "a" * 40)],
+    )
+    async def test_partial_phase_sha_rejected_fail_closed(
+        self, tmp_path, phase, sha
+    ) -> None:
+        """The single sanctioned approval point rejects a partially-specified
+        pair rather than silently recording nothing (Copilot review)."""
+        db = await self._db_with_needs_review(tmp_path)
+        try:
+            with pytest.raises(ValueError, match=r"both provided .* or"):
+                await db.approve_workstream_with_gate_record("z1", phase, sha)
+            # Nothing recorded and the row is untouched (no status flip).
+            assert await db.list_gate_approvals("z1") == set()
+            from maestro.models import WorkstreamStatus
+
+            w = await db.get_workstream("z1")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+        finally:
+            await db.close()

@@ -2072,17 +2072,27 @@ class Database:
         the gate-block case) plus the guarded NEEDS_REVIEW -> READY flip,
         on one connection. `update_workstream_status` commits per call, so
         this method writes raw SQL inside `self.transaction()` instead of
-        composing helpers. `phase=None` is the no-marker requeue: status
-        flip only, nothing recorded.
+        composing helpers. Both `phase=None` and `sha=None` is the no-marker
+        requeue: status flip only, nothing recorded. As the single
+        sanctioned approval point, a partially-specified pair (exactly one
+        of phase/sha given) is rejected fail-closed — it would otherwise
+        silently record no approval.
 
         Raises:
             WorkstreamNotFoundError: If the workstream does not exist.
-            ValueError: If the workstream is not in NEEDS_REVIEW.
+            ValueError: If the workstream is not in NEEDS_REVIEW, or if
+                phase/sha are partially specified (must be both or neither).
             DatabaseError: If database not connected.
         """
         if self._connection is None:
             msg = "Database not connected"
             raise DatabaseError(msg)
+        if (phase is None) != (sha is None):
+            msg = (
+                "phase and sha must be both provided (record an approval) or "
+                f"both None (plain requeue); got phase={phase!r}, sha={sha!r}"
+            )
+            raise ValueError(msg)
         async with self.transaction() as conn:
             if phase is not None and sha is not None:
                 await conn.execute(
