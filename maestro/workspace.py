@@ -5,12 +5,14 @@ isolated git worktrees for each workstream (independent work unit).
 """
 
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from maestro.git import GitManager, WorktreeError
+from maestro.models import SPEC_PREFIX
 
 
 class WorkspaceError(Exception):
@@ -23,6 +25,65 @@ class WorkspaceExistsError(WorkspaceError):
 
 class WorkspaceNotFoundError(WorkspaceError):
     """Raised when workspace directory not found."""
+
+
+# H-7: every file Maestro generates inside a target repo's worktree stays
+# untracked. Ignored files survive spec-runner's subtask branching/merges
+# and are invisible to the agent's `git add -A` auto-commit, so no harness
+# artifact ever reaches the feature branch or the PR.
+_EXCLUDE_BEGIN = "# >>> maestro orchestrator artifacts (auto-managed) >>>"
+_EXCLUDE_END = "# <<< maestro orchestrator artifacts <<<"
+
+
+def _exclude_patterns() -> tuple[str, ...]:
+    return (
+        f"spec/{SPEC_PREFIX}*",
+        "spec/.executor-*",
+        "/spec-runner.config.yaml",
+    )
+
+
+def ensure_harness_excludes(repo_or_worktree: Path) -> None:
+    """Idempotently add the maestro ignore block to the repo's exclude file.
+
+    Writes to `$GIT_COMMON_DIR/info/exclude` — repo-local and shared by all
+    linked worktrees (git resolves a linked worktree's `info/` to the common
+    dir; a per-worktree exclude does not exist without worktreeConfig).
+    `spec/.executor-*` is deliberately broader than the prefix: runtime
+    state (incl. the unprefixed `.executor-stop`) must never be committed.
+
+    Raises:
+        WorkspaceError: If the path is not inside a git repository.
+    """
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_or_worktree),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        msg = (
+            f"cannot resolve git common dir for {repo_or_worktree}: "
+            f"{result.stderr.strip()}"
+        )
+        raise WorkspaceError(msg)
+    exclude = Path(result.stdout.strip()) / "info" / "exclude"
+    existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+    if _EXCLUDE_BEGIN in existing:
+        return
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    block = "\n".join([_EXCLUDE_BEGIN, *_exclude_patterns(), _EXCLUDE_END])
+    with exclude.open("a", encoding="utf-8") as handle:
+        if existing and not existing.endswith("\n"):
+            handle.write("\n")
+        handle.write(block + "\n")
 
 
 class WorkspaceManager:
@@ -113,6 +174,10 @@ class WorkspaceManager:
         # Clean stale spec-runner state from previous runs
         # (the worktree inherits spec/ from the base branch)
         for stale in [
+            spec_dir / f".executor-{SPEC_PREFIX}state.db",
+            spec_dir / f".executor-{SPEC_PREFIX}state.db-wal",
+            spec_dir / f".executor-{SPEC_PREFIX}state.db-shm",
+            spec_dir / f".executor-{SPEC_PREFIX}state.json",
             spec_dir / ".executor-state.db",
             spec_dir / ".executor-state.db-wal",
             spec_dir / ".executor-state.db-shm",

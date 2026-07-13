@@ -1,5 +1,7 @@
 """Tests for the Workspace Manager module."""
 
+import os
+import subprocess as sp
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -448,3 +450,86 @@ class TestCleanupAll:
         workspace_mgr.cleanup_all()
 
         assert workspace_mgr.list_workspaces() == []
+
+
+def _init_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sp.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    sp.run(
+        ["git", "-C", str(repo), "commit", "--allow-empty", "-m", "init"],
+        check=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    return repo
+
+
+class TestEnsureHarnessExcludes:
+    """H-7: harness artifacts are kept untracked via the repo-local
+    $GIT_COMMON_DIR/info/exclude (shared by all linked worktrees)."""
+
+    def test_appends_block_with_narrow_patterns(self, tmp_path: Path) -> None:
+        from maestro.workspace import ensure_harness_excludes
+
+        repo = _init_repo(tmp_path)
+        ensure_harness_excludes(repo)
+        content = (repo / ".git" / "info" / "exclude").read_text()
+        assert "spec/maestro-*" in content
+        assert "spec/.executor-*" in content
+        assert "/spec-runner.config.yaml" in content
+
+    def test_idempotent(self, tmp_path: Path) -> None:
+        from maestro.workspace import ensure_harness_excludes
+
+        repo = _init_repo(tmp_path)
+        ensure_harness_excludes(repo)
+        once = (repo / ".git" / "info" / "exclude").read_text()
+        ensure_harness_excludes(repo)
+        assert (repo / ".git" / "info" / "exclude").read_text() == once
+
+    def test_worktree_path_resolves_to_common_dir(self, tmp_path: Path) -> None:
+        from maestro.workspace import ensure_harness_excludes
+
+        repo = _init_repo(tmp_path)
+        wt = tmp_path / "wt"
+        sp.run(
+            ["git", "-C", str(repo), "worktree", "add", str(wt), "-b", "f/x"],
+            check=True,
+            capture_output=True,
+        )
+        ensure_harness_excludes(wt)  # called with the WORKTREE path
+        content = (repo / ".git" / "info" / "exclude").read_text()
+        assert "spec/maestro-*" in content
+
+    def test_untracked_harness_file_is_ignored(self, tmp_path: Path) -> None:
+        from maestro.workspace import ensure_harness_excludes
+
+        repo = _init_repo(tmp_path)
+        ensure_harness_excludes(repo)
+        spec = repo / "spec"
+        spec.mkdir()
+        (spec / "maestro-tasks.md").write_text("x")
+        (repo / "spec-runner.config.yaml").write_text("x")
+        status = sp.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert "maestro-tasks.md" not in status.stdout
+        assert "spec-runner.config.yaml" not in status.stdout
+
+    def test_non_repo_raises(self, tmp_path: Path) -> None:
+        from maestro.workspace import WorkspaceError, ensure_harness_excludes
+
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        with pytest.raises(WorkspaceError):
+            ensure_harness_excludes(plain)
