@@ -17,7 +17,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from maestro._vendor.obs import child_env
-from maestro.models import WorkstreamConfig
+from maestro.models import SPEC_PREFIX, WorkstreamConfig
 
 
 class DecomposerError(Exception):
@@ -293,7 +293,7 @@ class ProjectDecomposer:
     ) -> None:
         """Generate spec files by delegating to `spec-runner plan --full`.
 
-        Writes spec/{requirements,design,tasks}.md into the workspace.
+        Writes spec/maestro-{requirements,design,tasks}.md into the workspace.
         spec-runner owns the tasks.md format (no built-in prompt copy).
 
         Raises:
@@ -325,6 +325,8 @@ class ProjectDecomposer:
                 "--no-branch",
                 "--no-commit",
                 "--no-interactive",
+                "--spec-prefix",
+                SPEC_PREFIX,
             ]
             if self._spec_gen_budget_usd is not None:
                 cmd += ["--budget", str(self._spec_gen_budget_usd)]
@@ -339,11 +341,11 @@ class ProjectDecomposer:
         finally:
             desc_path.unlink(missing_ok=True)  # noqa: ASYNC240
 
-        tasks_path = spec_dir / "tasks.md"
+        tasks_path = spec_dir / f"{SPEC_PREFIX}tasks.md"
         if not tasks_path.is_file():
             msg = (
-                "spec-runner plan --full exited 0 but spec/tasks.md was not "
-                f"created (workstream '{workstream.id}')"
+                f"spec-runner plan --full exited 0 but spec/{SPEC_PREFIX}tasks.md "
+                f"was not created (workstream '{workstream.id}')"
             )
             raise DecomposerError(msg)
         self._logger.info("Spec generated for workstream '%s'", workstream.id)
