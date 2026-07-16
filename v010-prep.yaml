@@ -1,5 +1,5 @@
 project: maestro-v010-prep
-repo: /Users/Andrei_Shtanakov/labs/all_ai_orchestrators/Maestro
+repo: /Users/Andrei_Shtanakov/labs/all_ai_orchestrators/maestro
 max_concurrent: 3
 
 git:

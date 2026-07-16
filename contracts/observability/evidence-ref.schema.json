@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/andrei-shtanakov/Maestro/contracts/observability/evidence-ref.schema.json",
+  "$id": "https://github.com/andrei-shtanakov/maestro/contracts/observability/evidence-ref.schema.json",
   "title": "EvidenceRef v1",
   "description": "Typed pointer to one piece of evidence about a work item (contracts roadmap phase 3, RD-003). Built on top of the keys the graduated observability contract already mints \u2014 trace_id/span_id (W3C), pipeline_id (Maestro session ULID), run_id (report_benchmark), decision_id (PolicyDecisionRef). See evidence-ref.md for kind semantics and required-key matrix. kind=gate-verdict added 2026-07-12 (WS-006 handoff M-4, pre-adoption additive).",
   "type": "object",

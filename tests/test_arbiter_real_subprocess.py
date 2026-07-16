@@ -26,8 +26,8 @@ from maestro.coordination.routing import _extract_decision_id
 
 
 def _arbiter_repo_root() -> Path:
-    """Locate the `arbiter` sibling repo. Maestro lives at
-    `<root>/Maestro/` and arbiter at `<root>/arbiter/` in this monorepo."""
+    """Locate the `arbiter` sibling repo. maestro lives at
+    `<root>/maestro/` and arbiter at `<root>/arbiter/` in this workspace."""
     return Path(__file__).resolve().parent.parent.parent / "arbiter"
 
 

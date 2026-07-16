@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/andrei-shtanakov/Maestro/contracts/work-correlation/schema.json",
+  "$id": "https://github.com/andrei-shtanakov/maestro/contracts/work-correlation/schema.json",
   "title": "WorkCorrelation v1",
   "description": "Thin cross-project correlation record. Maestro mints work_item_id (its own task/workstream id, inherited by consumers verbatim); status is a lossy surjective projection of the source vocabulary onto a minimal common enum, with source_status kept verbatim for auditability. See rationale.md. evidence_refs[] carries typed evidence pointers (EvidenceRef v1, roadmap phase 3).",
   "type": "object",
