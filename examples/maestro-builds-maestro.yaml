@@ -15,7 +15,7 @@
 # =============================================================================
 
 project: maestro-dogfood
-repo: ~/labs/all_ai_orchestrators/Maestro   # Absolute or ~ path to the maestro clone
+repo: ~/labs/all_ai_orchestrators/maestro   # Absolute or ~ path to the maestro clone
 max_concurrent: 2
 
 git:

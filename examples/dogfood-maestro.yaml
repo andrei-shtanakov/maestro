@@ -11,7 +11,7 @@
 # =============================================================================
 
 project: maestro-dogfood
-repo: /Users/Andrei_Shtanakov/labs/all_ai_orchestrators/Maestro
+repo: /Users/Andrei_Shtanakov/labs/all_ai_orchestrators/maestro
 max_concurrent: 2
 
 git:
