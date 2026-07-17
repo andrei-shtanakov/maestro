@@ -1149,6 +1149,22 @@ class Workstream(BaseModel):
         )
 
 
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``override`` onto ``base``, without mutating either.
+
+    Keys present in both are merged recursively when both values are dicts;
+    otherwise ``override``'s value replaces ``base``'s outright.
+    """
+    result = dict(base)
+    for key, override_value in override.items():
+        base_value = result.get(key)
+        if isinstance(base_value, dict) and isinstance(override_value, dict):
+            result[key] = _deep_merge(base_value, override_value)
+        else:
+            result[key] = override_value
+    return result
+
+
 class SpecRunnerConfig(BaseModel):
     """Configuration passed through to spec-runner."""
 
@@ -1180,15 +1196,37 @@ class SpecRunnerConfig(BaseModel):
             "None disables the cap"
         ),
     )
+    claude_model: str = Field(
+        default="", description="Claude model for tasks (empty = CLI default)"
+    )
+    review_command: str = Field(
+        default="", description="Review CLI command (empty = claude_command)"
+    )
+    review_model: str = Field(
+        default="", description="Review model (empty = claude_model)"
+    )
+    extra_executor_config: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Arbitrary overlay merged on top of the generated executor "
+            "config, for ExecutorConfig fields SpecRunnerConfig doesn't "
+            "mirror explicitly (e.g. personas, review_parallel, "
+            "telegram_*, webhook_*, budgets). Deep-merged; keys here win "
+            "over generated values."
+        ),
+    )
 
     def to_executor_config(self) -> dict[str, Any]:
         """Convert to executor.config.yaml format."""
-        return {
+        result: dict[str, Any] = {
             "executor": {
                 "max_retries": self.max_retries,
                 "task_timeout_minutes": self.task_timeout_minutes,
                 "claude_command": self.claude_command,
                 "auto_commit": self.auto_commit,
+                "claude_model": self.claude_model,
+                "review_command": self.review_command,
+                "review_model": self.review_model,
                 "spec_prefix": SPEC_PREFIX,
                 "hooks": {
                     "pre_start": {
@@ -1206,6 +1244,9 @@ class SpecRunnerConfig(BaseModel):
                 },
             },
         }
+        if self.extra_executor_config:
+            result = _deep_merge(result, self.extra_executor_config)
+        return result
 
 
 class ExecutorTaskStatus(StrEnum):

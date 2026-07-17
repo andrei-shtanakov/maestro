@@ -102,6 +102,64 @@
       "title": "ArbiterMode",
       "type": "string"
     },
+    "GatesConfig": {
+      "additionalProperties": false,
+      "description": "Gates-in-DAG guard config (WS-006 skeleton, steward DESIGN-611). Opt-in.\n\nWhen present, the orchestrator evaluates risk gates at two transition\nedges \u2014 ex-ante before READY -> RUNNING (declared workstream scope) and\nex-post before RUNNING -> MERGING (the actual diff) \u2014 by shelling out to\n``steward risk-classify`` (single source of truth for tiers; Maestro never\ncomputes risk itself). ``mode`` is fixed fail_closed: a missing or errored\nverdict on a mandatory gate blocks the transition.",
+      "properties": {
+        "mode": {
+          "const": "fail_closed",
+          "default": "fail_closed",
+          "title": "Mode",
+          "type": "string"
+        },
+        "steward_bin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to the steward CLI; falls back to $MAESTRO_STEWARD_BIN",
+          "title": "Steward Bin"
+        },
+        "risk_model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path passed to --risk-model (default: steward's own default)",
+          "title": "Risk Model"
+        },
+        "profile": {
+          "default": "lite",
+          "description": "Floor profile for risk-classify",
+          "title": "Profile",
+          "type": "string"
+        },
+        "approval_tiers": {
+          "default": [
+            "high",
+            "critical"
+          ],
+          "description": "Tiers that require a human owner approval before spawn/merge",
+          "items": {
+            "type": "string"
+          },
+          "title": "Approval Tiers",
+          "type": "array"
+        }
+      },
+      "title": "GatesConfig",
+      "type": "object"
+    },
     "NotificationConfig": {
       "description": "Notification configuration.",
       "properties": {
@@ -212,6 +270,52 @@
           "description": "Run lint after task",
           "title": "Run Lint On Done",
           "type": "boolean"
+        },
+        "spec_gen_budget_usd": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 1.0,
+          "description": "USD cap for `spec-runner plan --full` spec generation; None disables the cap",
+          "title": "Spec Gen Budget Usd"
+        },
+        "claude_model": {
+          "default": "",
+          "description": "Claude model for tasks (empty = CLI default)",
+          "title": "Claude Model",
+          "type": "string"
+        },
+        "review_command": {
+          "default": "",
+          "description": "Review CLI command (empty = claude_command)",
+          "title": "Review Command",
+          "type": "string"
+        },
+        "review_model": {
+          "default": "",
+          "description": "Review model (empty = claude_model)",
+          "title": "Review Model",
+          "type": "string"
+        },
+        "extra_executor_config": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Arbitrary overlay merged on top of the generated executor config, for ExecutorConfig fields SpecRunnerConfig doesn't mirror explicitly (e.g. personas, review_parallel, telegram_*, webhook_*, budgets). Deep-merged; keys here win over generated values.",
+          "title": "Extra Executor Config"
         }
       },
       "title": "SpecRunnerConfig",
@@ -371,6 +475,18 @@
       ],
       "default": null,
       "description": "Arbiter MCP integration config; None keeps static routing."
+    },
+    "gates": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatesConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Gates-in-DAG guard config (WS-006); None disables gates."
     }
   },
   "required": [

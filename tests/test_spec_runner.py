@@ -317,6 +317,60 @@ class TestReadExecutorStateSQLite:
 
 
 # ---------------------------------------------------------------------------
+# _deep_merge helper
+# ---------------------------------------------------------------------------
+
+
+class TestDeepMerge:
+    """`_deep_merge` is the merge primitive behind `extra_executor_config`."""
+
+    def test_override_wins_on_scalar_conflict(self) -> None:
+        from maestro.models import _deep_merge
+
+        result = _deep_merge({"a": 1, "b": 2}, {"b": 3})
+        assert result == {"a": 1, "b": 3}
+
+    def test_recurses_into_nested_dicts(self) -> None:
+        from maestro.models import _deep_merge
+
+        base = {
+            "executor": {"hooks": {"post_done": {"run_tests": True, "run_lint": True}}}
+        }
+        override = {"executor": {"hooks": {"post_done": {"lint_blocking": True}}}}
+        result = _deep_merge(base, override)
+        assert result == {
+            "executor": {
+                "hooks": {
+                    "post_done": {
+                        "run_tests": True,
+                        "run_lint": True,
+                        "lint_blocking": True,
+                    },
+                },
+            },
+        }
+
+    def test_does_not_mutate_inputs(self) -> None:
+        from maestro.models import _deep_merge
+
+        base = {"executor": {"hooks": {"post_done": {"run_tests": True}}}}
+        override = {"executor": {"hooks": {"post_done": {"lint_blocking": True}}}}
+        base_copy = {"executor": {"hooks": {"post_done": {"run_tests": True}}}}
+        override_copy = {"executor": {"hooks": {"post_done": {"lint_blocking": True}}}}
+
+        _deep_merge(base, override)
+
+        assert base == base_copy
+        assert override == override_copy
+
+    def test_dict_override_replaces_non_dict_base(self) -> None:
+        from maestro.models import _deep_merge
+
+        result = _deep_merge({"a": 1}, {"a": {"nested": True}})
+        assert result == {"a": {"nested": True}}
+
+
+# ---------------------------------------------------------------------------
 # Maestro → spec-runner contract
 # ---------------------------------------------------------------------------
 
@@ -356,6 +410,73 @@ class TestSpecRunnerConfigContract:
 
         cfg = SpecRunnerConfig().to_executor_config()
         assert cfg["executor"]["spec_prefix"] == SPEC_PREFIX == "maestro-"
+
+    def test_model_fields_default_empty(self) -> None:
+        from maestro.models import SpecRunnerConfig
+
+        executor = SpecRunnerConfig().to_executor_config()["executor"]
+        assert executor["claude_model"] == ""
+        assert executor["review_command"] == ""
+        assert executor["review_model"] == ""
+
+    def test_model_fields_pass_through_explicit_values(self) -> None:
+        from maestro.models import SpecRunnerConfig
+
+        cfg = SpecRunnerConfig(
+            claude_model="claude-opus-4-8",
+            review_command="codex",
+            review_model="claude-sonnet-5",
+        )
+        executor = cfg.to_executor_config()["executor"]
+        assert executor["claude_model"] == "claude-opus-4-8"
+        assert executor["review_command"] == "codex"
+        assert executor["review_model"] == "claude-sonnet-5"
+
+    def test_extra_executor_config_merges_nested_without_dropping_siblings(
+        self,
+    ) -> None:
+        from maestro.models import SpecRunnerConfig
+
+        cfg = SpecRunnerConfig(
+            extra_executor_config={
+                "executor": {"hooks": {"post_done": {"lint_blocking": True}}},
+            },
+        )
+        post_done = cfg.to_executor_config()["executor"]["hooks"]["post_done"]
+        assert post_done["lint_blocking"] is True
+        assert post_done["run_tests"] is True  # sibling key survives the merge
+        assert post_done["run_lint"] is True
+
+    def test_extra_executor_config_can_add_top_level_key(self) -> None:
+        """Merge-mechanics check: the overlay isn't confined to `executor`.
+
+        `metadata` is not a section spec-runner processes — this only proves
+        `_deep_merge` runs on the whole config document, not on `executor`
+        specifically.
+        """
+        from maestro.models import SpecRunnerConfig
+
+        cfg = SpecRunnerConfig(extra_executor_config={"metadata": {"owner": "team-x"}})
+        result = cfg.to_executor_config()
+        assert result["metadata"] == {"owner": "team-x"}
+        assert "executor" in result  # untouched sibling section survives
+
+    def test_extra_executor_config_wins_on_scalar_conflict(self) -> None:
+        from maestro.models import SpecRunnerConfig
+
+        cfg = SpecRunnerConfig(
+            claude_model="claude-sonnet-5",
+            extra_executor_config={"executor": {"claude_model": "claude-opus-4-8"}},
+        )
+        assert cfg.to_executor_config()["executor"]["claude_model"] == "claude-opus-4-8"
+
+    def test_extra_executor_config_none_is_noop(self) -> None:
+        from maestro.models import SpecRunnerConfig
+
+        assert (
+            SpecRunnerConfig().to_executor_config()
+            == SpecRunnerConfig(extra_executor_config=None).to_executor_config()
+        )
 
 
 # ---------------------------------------------------------------------------
