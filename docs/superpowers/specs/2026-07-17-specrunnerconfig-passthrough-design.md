@@ -103,8 +103,13 @@ clobbering sibling keys, and also add keys *outside* `executor` entirely
   (`executor.hooks.post_done.lint_blocking`) without dropping sibling keys
   (`run_tests`, `run_lint`).
 - `extra_executor_config` can add a **top-level** key not under `executor`
-  (e.g. `{"environment": {"FOO": "bar"}}`), proving the escape hatch covers
-  the whole config document, not just the `executor` section.
+  (e.g. `{"metadata": {"FOO": "bar"}}`), proving the escape hatch covers the
+  whole config document, not just the `executor` section. Note: this is a
+  merge-mechanics test only — spec-runner only *processes* its supported
+  top-level sections (`executor`; `environment` is explicitly a
+  `_DEAD_SECTIONS` entry that warns "top-level key ignored", per
+  `spec-runner/src/spec_runner/validate.py:383`), so an arbitrary top-level
+  key isn't itself a useful passthrough example.
 - `_deep_merge` is pure: calling it does not mutate the base or override
   dict arguments.
 
@@ -119,5 +124,7 @@ shipped JSON Schema reflects the new fields. No hand-editing.
 - No typed fields for personas/parallel-review/notifications/budgets — reach
   those via `extra_executor_config`.
 - No validation of `extra_executor_config`'s shape against `ExecutorConfig` —
-  it's a trusted escape hatch; malformed keys are spec-runner's problem to
-  reject (fails loud there, same as any other spec-runner config error).
+  it's a trusted escape hatch; unknown/unsupported keys follow spec-runner's
+  existing validation/loading behavior (its config loader picks known fields
+  and its `validate_config` warns on unrecognized top-level sections — it
+  does not uniformly fail loud).
