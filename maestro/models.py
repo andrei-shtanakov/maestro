@@ -1196,6 +1196,15 @@ class SpecRunnerConfig(BaseModel):
             "None disables the cap"
         ),
     )
+    claude_model: str = Field(
+        default="", description="Claude model for tasks (empty = CLI default)"
+    )
+    review_command: str = Field(
+        default="", description="Review CLI command (empty = claude_command)"
+    )
+    review_model: str = Field(
+        default="", description="Review model (empty = claude_model)"
+    )
 
     def to_executor_config(self) -> dict[str, Any]:
         """Convert to executor.config.yaml format."""
@@ -1205,6 +1214,9 @@ class SpecRunnerConfig(BaseModel):
                 "task_timeout_minutes": self.task_timeout_minutes,
                 "claude_command": self.claude_command,
                 "auto_commit": self.auto_commit,
+                "claude_model": self.claude_model,
+                "review_command": self.review_command,
+                "review_model": self.review_model,
                 "spec_prefix": SPEC_PREFIX,
                 "hooks": {
                     "pre_start": {

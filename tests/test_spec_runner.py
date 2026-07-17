@@ -411,6 +411,27 @@ class TestSpecRunnerConfigContract:
         cfg = SpecRunnerConfig().to_executor_config()
         assert cfg["executor"]["spec_prefix"] == SPEC_PREFIX == "maestro-"
 
+    def test_model_fields_default_empty(self) -> None:
+        from maestro.models import SpecRunnerConfig
+
+        executor = SpecRunnerConfig().to_executor_config()["executor"]
+        assert executor["claude_model"] == ""
+        assert executor["review_command"] == ""
+        assert executor["review_model"] == ""
+
+    def test_model_fields_pass_through_explicit_values(self) -> None:
+        from maestro.models import SpecRunnerConfig
+
+        cfg = SpecRunnerConfig(
+            claude_model="claude-opus-4-8",
+            review_command="codex",
+            review_model="claude-sonnet-5",
+        )
+        executor = cfg.to_executor_config()["executor"]
+        assert executor["claude_model"] == "claude-opus-4-8"
+        assert executor["review_command"] == "codex"
+        assert executor["review_model"] == "claude-sonnet-5"
+
 
 # ---------------------------------------------------------------------------
 # Round-trip (mirrors spec-runner's own save-then-load invariant)
