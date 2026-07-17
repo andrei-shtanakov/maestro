@@ -317,6 +317,58 @@ class TestReadExecutorStateSQLite:
 
 
 # ---------------------------------------------------------------------------
+# _deep_merge helper
+# ---------------------------------------------------------------------------
+
+
+class TestDeepMerge:
+    """`_deep_merge` is the merge primitive behind `extra_executor_config`."""
+
+    def test_override_wins_on_scalar_conflict(self) -> None:
+        from maestro.models import _deep_merge
+
+        result = _deep_merge({"a": 1, "b": 2}, {"b": 3})
+        assert result == {"a": 1, "b": 3}
+
+    def test_recurses_into_nested_dicts(self) -> None:
+        from maestro.models import _deep_merge
+
+        base = {"executor": {"hooks": {"post_done": {"run_tests": True, "run_lint": True}}}}
+        override = {"executor": {"hooks": {"post_done": {"lint_blocking": True}}}}
+        result = _deep_merge(base, override)
+        assert result == {
+            "executor": {
+                "hooks": {
+                    "post_done": {
+                        "run_tests": True,
+                        "run_lint": True,
+                        "lint_blocking": True,
+                    },
+                },
+            },
+        }
+
+    def test_does_not_mutate_inputs(self) -> None:
+        from maestro.models import _deep_merge
+
+        base = {"executor": {"hooks": {"post_done": {"run_tests": True}}}}
+        override = {"executor": {"hooks": {"post_done": {"lint_blocking": True}}}}
+        base_copy = {"executor": {"hooks": {"post_done": {"run_tests": True}}}}
+        override_copy = {"executor": {"hooks": {"post_done": {"lint_blocking": True}}}}
+
+        _deep_merge(base, override)
+
+        assert base == base_copy
+        assert override == override_copy
+
+    def test_dict_override_replaces_non_dict_base(self) -> None:
+        from maestro.models import _deep_merge
+
+        result = _deep_merge({"a": 1}, {"a": {"nested": True}})
+        assert result == {"a": {"nested": True}}
+
+
+# ---------------------------------------------------------------------------
 # Maestro → spec-runner contract
 # ---------------------------------------------------------------------------
 
