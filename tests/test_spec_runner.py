@@ -333,7 +333,9 @@ class TestDeepMerge:
     def test_recurses_into_nested_dicts(self) -> None:
         from maestro.models import _deep_merge
 
-        base = {"executor": {"hooks": {"post_done": {"run_tests": True, "run_lint": True}}}}
+        base = {
+            "executor": {"hooks": {"post_done": {"run_tests": True, "run_lint": True}}}
+        }
         override = {"executor": {"hooks": {"post_done": {"lint_blocking": True}}}}
         result = _deep_merge(base, override)
         assert result == {
