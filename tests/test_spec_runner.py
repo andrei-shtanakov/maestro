@@ -432,6 +432,52 @@ class TestSpecRunnerConfigContract:
         assert executor["review_command"] == "codex"
         assert executor["review_model"] == "claude-sonnet-5"
 
+    def test_extra_executor_config_merges_nested_without_dropping_siblings(
+        self,
+    ) -> None:
+        from maestro.models import SpecRunnerConfig
+
+        cfg = SpecRunnerConfig(
+            extra_executor_config={
+                "executor": {"hooks": {"post_done": {"lint_blocking": True}}},
+            },
+        )
+        post_done = cfg.to_executor_config()["executor"]["hooks"]["post_done"]
+        assert post_done["lint_blocking"] is True
+        assert post_done["run_tests"] is True  # sibling key survives the merge
+        assert post_done["run_lint"] is True
+
+    def test_extra_executor_config_can_add_top_level_key(self) -> None:
+        """Merge-mechanics check: the overlay isn't confined to `executor`.
+
+        `metadata` is not a section spec-runner processes — this only proves
+        `_deep_merge` runs on the whole config document, not on `executor`
+        specifically.
+        """
+        from maestro.models import SpecRunnerConfig
+
+        cfg = SpecRunnerConfig(extra_executor_config={"metadata": {"owner": "team-x"}})
+        result = cfg.to_executor_config()
+        assert result["metadata"] == {"owner": "team-x"}
+        assert "executor" in result  # untouched sibling section survives
+
+    def test_extra_executor_config_wins_on_scalar_conflict(self) -> None:
+        from maestro.models import SpecRunnerConfig
+
+        cfg = SpecRunnerConfig(
+            claude_model="claude-sonnet-5",
+            extra_executor_config={"executor": {"claude_model": "claude-opus-4-8"}},
+        )
+        assert cfg.to_executor_config()["executor"]["claude_model"] == "claude-opus-4-8"
+
+    def test_extra_executor_config_none_is_noop(self) -> None:
+        from maestro.models import SpecRunnerConfig
+
+        assert (
+            SpecRunnerConfig().to_executor_config()
+            == SpecRunnerConfig(extra_executor_config=None).to_executor_config()
+        )
+
 
 # ---------------------------------------------------------------------------
 # Round-trip (mirrors spec-runner's own save-then-load invariant)
