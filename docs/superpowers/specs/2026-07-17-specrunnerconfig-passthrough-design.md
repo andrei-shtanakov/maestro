@@ -2,7 +2,7 @@
 
 ## Context
 
-`SpecRunnerConfig` (`maestro/models.py:1152`) is a hand-maintained subset of
+`SpecRunnerConfig` (`maestro/models.py`) is a hand-maintained subset of
 spec-runner's `ExecutorConfig` (`spec-runner/src/spec_runner/config.py`), with
 no drift check. Every new `ExecutorConfig` field is invisible to Maestro until
 someone manually mirrors it into `SpecRunnerConfig` and wires it into

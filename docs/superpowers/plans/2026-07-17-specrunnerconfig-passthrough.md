@@ -31,7 +31,7 @@
 ### Task 1: `_deep_merge()` helper
 
 **Files:**
-- Modify: `maestro/models.py` (add function above `class SpecRunnerConfig`, currently at `maestro/models.py:1152`)
+- Modify: `maestro/models.py` (add function above `class SpecRunnerConfig`)
 - Test: `tests/test_spec_runner.py`
 
 **Interfaces:**
@@ -96,7 +96,7 @@ Expected: FAIL with `ImportError: cannot import name '_deep_merge'`
 
 - [ ] **Step 3: Implement `_deep_merge`**
 
-Add to `maestro/models.py` directly above `class SpecRunnerConfig(BaseModel):` (currently `maestro/models.py:1152`):
+Add to `maestro/models.py` directly above `class SpecRunnerConfig(BaseModel):`:
 
 ```python
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -137,7 +137,7 @@ git commit -m "feat: add pure _deep_merge helper for executor-config overlays"
 ### Task 2: Typed `claude_model`/`review_command`/`review_model` fields
 
 **Files:**
-- Modify: `maestro/models.py:1152-1208` (`SpecRunnerConfig` class and `to_executor_config()`)
+- Modify: `maestro/models.py` (`SpecRunnerConfig` class and `to_executor_config()`)
 - Test: `tests/test_spec_runner.py`
 
 **Interfaces:**
