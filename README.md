@@ -117,6 +117,7 @@ Add an `arbiter:` section to your project YAML to delegate per-task agent select
 |-------|-----|-------|
 | Claude Code | `claude_code` | Default. Requires `claude` CLI |
 | Codex | `codex_cli` | Requires `codex` CLI |
+| OpenCode | `opencode` | Requires `opencode` CLI |
 | Aider | `aider` | Requires `aider` CLI |
 | Announce | `announce` | Dry-run mode — logs tasks without running an agent |
 
