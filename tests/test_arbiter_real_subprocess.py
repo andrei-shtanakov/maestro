@@ -90,7 +90,12 @@ async def real_arbiter_client(tmp_path):
 
 
 @real_arbiter_only
-@pytest.mark.anyio
+# NOTE: deliberately NOT @pytest.mark.anyio. The async fixture
+# real_arbiter_client is executed by pytest-asyncio (asyncio_mode=auto),
+# so the test must run on the same plugin/event loop. An anyio marker
+# makes ownership depend on plugin registration order (environment-
+# dependent: uv 0.11.29 flipped it in CI) and split fixture and test
+# across two event loops -> 'Future attached to a different loop'.
 async def test_route_task_response_contains_decision_id_i64(real_arbiter_client):
     """arbiter#9 fix: real arbiter must surface SQLite rowid as i64
     in `metadata.decision_id` so Maestro can persist it for stale-guard."""
@@ -117,7 +122,6 @@ async def test_route_task_response_contains_decision_id_i64(real_arbiter_client)
 
 
 @real_arbiter_only
-@pytest.mark.anyio
 async def test_maestro_extractor_coerces_real_decision_id_to_str(real_arbiter_client):
     """End-to-end contract: real arbiter int → Maestro `_extract_decision_id`
     → str ready for `arbiter_decision_id TEXT` column."""
@@ -138,7 +142,6 @@ async def test_maestro_extractor_coerces_real_decision_id_to_str(real_arbiter_cl
 
 
 @real_arbiter_only
-@pytest.mark.anyio
 async def test_route_then_report_outcome_round_trip(real_arbiter_client):
     """The full happy-path loop: route_task surfaces decision_id, Maestro
     passes it back to report_outcome, arbiter records the outcome linked
@@ -179,7 +182,6 @@ async def test_route_then_report_outcome_round_trip(real_arbiter_client):
 
 
 @real_arbiter_only
-@pytest.mark.anyio
 async def test_concurrent_routes_have_distinct_decision_ids(real_arbiter_client):
     """Each route_task call must mint a fresh SQLite rowid — otherwise
     Maestro's stale-guard collapses across retries."""

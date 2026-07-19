@@ -136,7 +136,12 @@ def _all_agents_spawner(exit_code: int) -> dict[str, MagicMock]:
 
 
 @real_arbiter_only
-@pytest.mark.anyio
+# NOTE: deliberately NOT @pytest.mark.anyio. The async fixtures here are
+# executed by pytest-asyncio (asyncio_mode=auto), so the tests must run
+# on the same plugin/event loop. An anyio marker makes ownership depend
+# on plugin registration order (environment-dependent: uv 0.11.29
+# flipped it in CI) and split fixture and test across two event loops
+# -> 'Future attached to a different loop'.
 async def test_real_arbiter_full_cycle_assign_to_done(tmp_path, real_arbiter_client):
     """Real arbiter ASSIGN → mock spawner exit 0 → outcome reported back to
     real arbiter → task DONE. The decision_id (real SQLite rowid as i64)
@@ -192,7 +197,6 @@ async def test_real_arbiter_full_cycle_assign_to_done(tmp_path, real_arbiter_cli
 
 
 @real_arbiter_only
-@pytest.mark.anyio
 async def test_real_arbiter_retry_mints_fresh_decision_id(
     tmp_path, real_arbiter_client
 ):
