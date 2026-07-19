@@ -40,7 +40,6 @@ from maestro import (
     load_config,
 )
 from maestro import merge_logs as _merge_logs
-from maestro._vendor.obs import init_logging
 from maestro.benchmark import (
     BenchmarkRunner,
     MaestroATPAdapter,
@@ -55,6 +54,7 @@ from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
 from maestro.decomposer import ProjectDecomposer
 from maestro.git import GitManager
+from maestro.logging_bridge import setup_logging
 from maestro.models import ArbiterMode, OrchestratorConfig, TaskStatus, WorkstreamStatus
 from maestro.orchestrator import Orchestrator
 from maestro.pr_manager import PRManager
@@ -823,7 +823,7 @@ def run_command(
         maestro run tasks.yaml --clean
         maestro run tasks.yaml --db /path/to/state.db
     """
-    init_logging("maestro")
+    setup_logging("maestro")
     db_path = db or DEFAULT_DB_PATH
 
     try:
@@ -1107,7 +1107,7 @@ def benchmark(
     --timeout. With MAESTRO_ARBITER_BIN set, the result is reported to the
     arbiter fire-and-forget (a report failure never fails the run).
     """
-    init_logging("maestro")
+    setup_logging("maestro")
     err = Console(stderr=True)
     # With --json, stdout must stay byte-for-byte JSON: ALL notes → stderr.
     notes = err if json_output else console
@@ -1438,7 +1438,7 @@ def orchestrate_command(
         maestro orchestrate project.yaml
         maestro orchestrate project.yaml --resume
     """
-    init_logging("maestro")
+    setup_logging("maestro")
     db_path = db or DEFAULT_DB_PATH
 
     try:
