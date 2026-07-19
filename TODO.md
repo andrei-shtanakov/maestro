@@ -128,6 +128,7 @@
 - [x] **M-obs stdlib bridge** (2026-07-19): все stdlib `logging` вызовы (~93 call-sites в ~16 модулях) маршрутизируются в obs OTel JSONL через `maestro/logging_bridge.py` (`ObsBridgeHandler` + `setup_logging` в cli.py); WARNING+ дублируются в stderr (замена lastResort). Vendored `_vendor/obs.py` не тронут.
 - [ ] **M3 — observability dashboards** (pending): separate project (backend/viz over the OTel JSONL or the existing `maestro/dashboard/` UI).
 - [ ] **M3 — W3C traceparent into the MCP JSON-RPC envelope** (the R-06b arbiter-trace follow-up): cross-boundary contract; correlates `benchmark.report.*` / routing with arbiter-side rows by trace_id.
+- [ ] **Single async pytest plugin** (follow-up к фиксу R-05 2026-07-19): в тестах конкурируют pytest-asyncio (`asyncio_mode=auto`) и anyio-плагин — владелец `@pytest.mark.anyio`-теста зависит от порядка регистрации плагинов (uv 0.11.29 флипнул порядок в CI → cross-loop падения real-subprocess тестов). Точечный фикс: маркеры сняты в 3 real-subprocess файлах. Системно: стандартизироваться на одном плагине (anyio, по конвенции) и убрать pytest-asyncio. Trigger: следующий флип порядка или новые async-фикстуры с loop-bound состоянием.
 
 ---
 

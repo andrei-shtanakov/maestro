@@ -127,7 +127,12 @@ def _build_result(run_id: str, per_task_n: int = 2) -> BenchmarkResult:
 
 
 @real_arbiter_only
-@pytest.mark.anyio
+# NOTE: deliberately NOT @pytest.mark.anyio. The async fixture
+# real_arbiter_client is executed by pytest-asyncio (asyncio_mode=auto),
+# so the test must run on the same plugin/event loop. An anyio marker
+# makes ownership depend on plugin registration order (environment-
+# dependent: uv 0.11.29 flipped it in CI) and split fixture and test
+# across two event loops -> 'Future attached to a different loop'.
 async def test_report_benchmark_created_end_to_end(
     real_arbiter_client: ArbiterClient, tmp_path: Path
 ) -> None:
@@ -167,7 +172,6 @@ async def test_report_benchmark_created_end_to_end(
 
 
 @real_arbiter_only
-@pytest.mark.anyio
 async def test_report_benchmark_duplicate_end_to_end(
     real_arbiter_client: ArbiterClient, tmp_path: Path
 ) -> None:
@@ -204,7 +208,6 @@ async def test_report_benchmark_duplicate_end_to_end(
 
 
 @real_arbiter_only
-@pytest.mark.anyio
 async def test_report_benchmark_contract_break_end_to_end(
     real_arbiter_client: ArbiterClient, tmp_path: Path
 ) -> None:
