@@ -103,7 +103,7 @@
 
 ### Follow-ups from R-06b M4
 
-- [ ] **M3-obs / arbiter trace**: W3C `traceparent` injection in MCP JSON-RPC envelope (spans all arbiter calls, not specific to M4). Trigger: when `benchmark.report.*` events need correlation with arbiter-side INSERT by `trace_id`. Severity: medium.
+- [x] **M3-obs / arbiter trace** (2026-07-19): W3C `traceparent` инжектится в `params._meta` каждого `tools/call` (`arbiter_client._call_tool_once`); пропуск при нулевом trace-id; e2e-тест подтверждает, что пинованный arbiter игнорирует `_meta`. Arbiter-side чтение `_meta.traceparent` — handoff в `prograph-vault/authored/notes/2026-07-19-arbiter-meta-traceparent-handoff.md`.
 - [ ] **R-06b M4b**: revisit `max_per_task=200` sampling for swe-bench-full (>1000 tasks). Trigger: first PROD swe-bench-full run.
 - [ ] **R-07 prereq (GIN index)**: GIN index on `benchmark_runs.per_task` jsonb. Trigger: when R-07 starts writing SQL filters on per_task.
 - [ ] **R-07 prereq (normalize)**: normalize `benchmark_task_results` table (migration from jsonb blob). Trigger: same as GIN — formal query demand.
@@ -127,7 +127,7 @@
 - [x] **M3 (runtime-decision instrumentation)** (closed by feat/observability-m3): `scheduler.tick` emit-on-change per poll cycle + `task.route` span around the routing decision (covers static + arbiter, records latency/decision_id; failure → `task.route.failed`).
 - [x] **M-obs stdlib bridge** (2026-07-19): все stdlib `logging` вызовы (~93 call-sites в ~16 модулях) маршрутизируются в obs OTel JSONL через `maestro/logging_bridge.py` (`ObsBridgeHandler` + `setup_logging` в cli.py); WARNING+ дублируются в stderr (замена lastResort). Vendored `_vendor/obs.py` не тронут.
 - [ ] **M3 — observability dashboards** (pending): separate project (backend/viz over the OTel JSONL or the existing `maestro/dashboard/` UI).
-- [ ] **M3 — W3C traceparent into the MCP JSON-RPC envelope** (the R-06b arbiter-trace follow-up): cross-boundary contract; correlates `benchmark.report.*` / routing with arbiter-side rows by trace_id.
+- [x] **M3 — W3C traceparent into the MCP JSON-RPC envelope** (2026-07-19, Maestro-side done): injection in `params._meta` on every `tools/call`; arbiter-side reading is the remaining half (handoff note in prograph-vault).
 - [ ] **Single async pytest plugin** (follow-up к фиксу R-05 2026-07-19): в тестах конкурируют pytest-asyncio (`asyncio_mode=auto`) и anyio-плагин — владелец `@pytest.mark.anyio`-теста зависит от порядка регистрации плагинов (uv 0.11.29 флипнул порядок в CI → cross-loop падения real-subprocess тестов). Точечный фикс: маркеры сняты в 3 real-subprocess файлах. Системно: стандартизироваться на одном плагине (anyio, по конвенции) и убрать pytest-asyncio. Trigger: следующий флип порядка или новые async-фикстуры с loop-bound состоянием.
 
 ---

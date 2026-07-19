@@ -200,3 +200,33 @@ async def test_concurrent_routes_have_distinct_decision_ids(real_arbiter_client)
     assert len(set(ids)) == len(ids), (
         f"decision_ids must be unique per route_task call; got {ids}"
     )
+
+
+@real_arbiter_only
+async def test_pinned_arbiter_tolerates_meta_traceparent(
+    real_arbiter_client, tmp_path, monkeypatch
+):
+    """M3-obs: params._meta must be ignored by the pinned arbiter build.
+
+    Routes a task with a live obs span so _call_tool_once injects
+    _meta.traceparent, and asserts the call still succeeds end-to-end.
+    """
+    from maestro._vendor import obs
+
+    monkeypatch.setenv("ORCHESTRA_LOG_DIR", str(tmp_path))
+    obs.init_logging("maestro")
+    with obs.span("task.route", task_id="r05-meta-1"):
+        raw = await real_arbiter_client.route_task(
+            "r05-meta-1",
+            {
+                "type": "bugfix",
+                "language": "python",
+                "complexity": "simple",
+                "priority": "normal",
+            },
+            {"authority_context": {"role": "implement", "phase": "execution"}},
+        )
+    metadata = raw.get("metadata") or {}
+    assert "decision_id" in metadata, (
+        f"route_task with _meta.traceparent must still succeed; raw={raw!r}"
+    )
