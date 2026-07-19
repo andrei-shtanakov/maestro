@@ -289,7 +289,8 @@ async def test_traceparent_correlates_maestro_and_arbiter_logs(tmp_path, monkeyp
         r for r in records if r.get("Attributes", {}).get("event") == "route.decision"
     ]
     assert decisions, f"route.decision record expected; events={events}"
-    assert decisions[-1]["TraceId"] == maestro_trace, (
+    arbiter_trace = decisions[-1].get("TraceId")
+    assert arbiter_trace == maestro_trace, (
         "arbiter's route.decision must carry Maestro's TraceId "
-        f"(maestro={maestro_trace}, arbiter={decisions[-1]['TraceId']})"
+        f"(maestro={maestro_trace}, arbiter={arbiter_trace})"
     )
