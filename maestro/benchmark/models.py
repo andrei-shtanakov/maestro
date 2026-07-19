@@ -4,7 +4,7 @@ The shapes are frozen at M1 so M2 (real spawner integration), M3 (live
 ATP + auth), and M4 (arbiter feedback wiring) can land independently
 without renegotiating the contract.
 
-See ``_cowork_output/decisions/2026-04-25-r06b-design.md`` for design
+See ``_cowork_output/decisions/2026-04-25-r06b-design.md`` for design  (gov:allow-cowork)
 context.
 """
 
