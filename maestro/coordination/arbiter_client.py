@@ -46,6 +46,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from maestro._vendor import obs
 from maestro.coordination.arbiter_errors import (
     ArbiterContractError,
     ArbiterStartupError,
@@ -54,6 +55,23 @@ from maestro.coordination.arbiter_errors import (
 
 
 logger = logging.getLogger(__name__)
+
+_ZERO_TRACE_ID = "0" * 32
+
+
+def _current_traceparent() -> str | None:
+    """W3C traceparent of the active obs span context, or None.
+
+    Returns None when there is no real trace context (obs not initialized
+    or zero trace-id — the W3C spec treats an all-zero trace-id as invalid),
+    so callers can skip injecting ``_meta`` entirely.
+    """
+    tp = obs.child_env().get("TRACEPARENT", "")
+    parts = tp.split("-")
+    if len(parts) != 4 or parts[1] == _ZERO_TRACE_ID:
+        return None
+    return tp
+
 
 ARBITER_MCP_REQUIRED_VERSION = "0.2.0"  # bumped for R-06b M4 (arbiter Phase 1)
 
@@ -586,10 +604,16 @@ class ArbiterClient:
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
         """Single attempt to call an MCP tool."""
-        raw = await self._send_request(
-            "tools/call",
-            {"name": name, "arguments": arguments},
-        )
+        params: dict[str, Any] = {"name": name, "arguments": arguments}
+        # M3-obs: carry the active W3C trace context in the MCP-sanctioned
+        # params._meta slot so arbiter-side records can correlate by
+        # trace_id. The pinned arbiter parses params as a raw Value and
+        # reads only name/arguments, so _meta is wire-compatible today and
+        # becomes useful once arbiter reads it.
+        traceparent = _current_traceparent()
+        if traceparent is not None:
+            params["_meta"] = {"traceparent": traceparent}
+        raw = await self._send_request("tools/call", params)
 
         # Extract inner JSON from MCP content wrapper
         if "content" in raw and isinstance(raw["content"], list):
