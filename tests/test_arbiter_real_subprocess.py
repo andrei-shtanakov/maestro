@@ -230,3 +230,66 @@ async def test_pinned_arbiter_tolerates_meta_traceparent(
     assert "decision_id" in metadata, (
         f"route_task with _meta.traceparent must still succeed; raw={raw!r}"
     )
+
+
+@real_arbiter_only
+async def test_traceparent_correlates_maestro_and_arbiter_logs(tmp_path, monkeypatch):
+    """M3-obs end-to-end: arbiter@e25ffed binds _meta.traceparent, so its
+    own JSONL records for the routed request carry Maestro's TraceId.
+
+    Spawns its own client (not the shared fixture) because ORCHESTRA_LOG_DIR
+    must be in the environment BEFORE the arbiter subprocess starts.
+    """
+    import json
+
+    from maestro._vendor import obs
+
+    monkeypatch.setenv("ORCHESTRA_LOG_DIR", str(tmp_path))
+    obs.init_logging("maestro")
+
+    root = _arbiter_repo_root()
+    cfg = ArbiterClientConfig(
+        binary_path=_arbiter_binary(),
+        tree_path=root / "models" / "agent_policy_tree.json",
+        config_dir=root / "config",
+        db_path=tmp_path / "arbiter-corr.db",
+        log_level="info",
+    )
+    client = ArbiterClient(cfg)
+    await client.start()
+    try:
+        with obs.span("task.route", task_id="r05-corr-1"):
+            maestro_trace = obs.current_trace_id()
+            raw = await client.route_task(
+                "r05-corr-1",
+                {
+                    "type": "bugfix",
+                    "language": "python",
+                    "complexity": "simple",
+                    "priority": "normal",
+                },
+                {"authority_context": {"role": "implement", "phase": "execution"}},
+            )
+    finally:
+        await client.stop()
+
+    assert raw.get("metadata"), "route must succeed"
+    assert maestro_trace is not None
+
+    arbiter_logs = list(tmp_path.glob("arbiter-*.jsonl"))
+    assert arbiter_logs, f"arbiter JSONL expected in {tmp_path}"
+    records = [
+        json.loads(line)
+        for log in arbiter_logs
+        for line in log.read_text().splitlines()
+        if line.strip()
+    ]
+    events = [r.get("Attributes", {}).get("event") for r in records]
+    decisions = [
+        r for r in records if r.get("Attributes", {}).get("event") == "route.decision"
+    ]
+    assert decisions, f"route.decision record expected; events={events}"
+    assert decisions[-1]["TraceId"] == maestro_trace, (
+        "arbiter's route.decision must carry Maestro's TraceId "
+        f"(maestro={maestro_trace}, arbiter={decisions[-1]['TraceId']})"
+    )

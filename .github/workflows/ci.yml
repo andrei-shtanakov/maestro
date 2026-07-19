@@ -13,7 +13,7 @@ env:
   # convention (arbiter#24). Must match ARBITER_VENDORED_FROM_SHA — the
   # "Verify vendored arbiter_client matches pinned SHA" step enforces it.
   # Bump when the Maestro↔arbiter contract evolves.
-  ARBITER_PINNED_SHA: f3c955cd152cab0293195b71bd7e602f00736354
+  ARBITER_PINNED_SHA: e25ffed64300f006a08bea03f1472d8b05a4946f
 
 jobs:
   lint:
