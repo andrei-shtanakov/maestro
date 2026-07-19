@@ -6,7 +6,7 @@
 
 **Architecture:** A `logging.Handler` bridge forwards every stdlib record into `obs.get_logger(...)`, so records flow through the existing structlog pipeline (contextvars merge → redaction → OTel reshape → JSONL file) and automatically pick up `TraceId`/`SpanId`/`pipeline_id`. A `setup_logging()` wrapper calls `obs.init_logging()` and attaches the bridge plus a WARNING+ stderr passthrough (preserving today's `logging.lastResort` operator visibility). The three `init_logging("maestro")` call sites in `cli.py` switch to `setup_logging("maestro")`.
 
-**Tech Stack:** Python 3.11+, stdlib `logging`, vendored structlog obs (`maestro/_vendor/obs.py` — DO NOT MODIFY, it is a pinned copy of the spec-runner contract), pytest.
+**Tech Stack:** Python 3.12+ (per `pyproject.toml` `requires-python = ">=3.12"`), stdlib `logging`, vendored structlog obs (`maestro/_vendor/obs.py` — DO NOT MODIFY, it is a pinned copy of the spec-runner contract), pytest.
 
 ## Global Constraints
 
