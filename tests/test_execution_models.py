@@ -60,3 +60,11 @@ def test_handle_ref_roundtrip():
     )
     assert ref.status_marker is None
     assert ref.workdir_mirror_path is None
+
+
+def test_protocols_importable():
+    from maestro.execution.backend import ExecutionBackend, TaskHandle
+
+    # Protocols are runtime-checkable enough to reference; just assert identity.
+    assert TaskHandle.__name__ == "TaskHandle"
+    assert ExecutionBackend.__name__ == "ExecutionBackend"
