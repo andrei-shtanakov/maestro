@@ -28,6 +28,7 @@ from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConf
 from maestro.coordination.routing import ArbiterRouting
 from maestro.dag import DAG
 from maestro.database import Database
+from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.models import (
     AgentType,
     ArbiterConfig,
@@ -39,6 +40,15 @@ from maestro.models import (
     TaskType,
 )
 from maestro.scheduler import Scheduler, SchedulerConfig
+from tests.fakes.fake_execution_backend import FakeExecutionBackend
+
+
+@pytest.fixture(autouse=True)
+def _fake_execution_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch Scheduler's LocalBackend so the MagicMock spawner here never
+    spawns a real subprocess. See tests/fakes/fake_execution_backend.py.
+    """
+    monkeypatch.setattr("maestro.scheduler.LocalBackend", FakeExecutionBackend)
 
 
 # ---------------------------------------------------------------------------
@@ -115,12 +125,24 @@ def _routing_cfg() -> ArbiterConfig:
 
 
 def _make_mock_spawner(exit_code: int, agent_type: str = "codex_cli") -> MagicMock:
+    """A MagicMock spawner wired for the ExecutionRequest/TaskHandle seam.
+
+    `build_request` returns a real `ExecutionRequest` whose `labels` encode
+    `exit_code` for `FakeExecutionBackend` (patched in via the module's
+    autouse fixture) to replay through a `FakeTaskHandle`.
+    """
     spawner = MagicMock()
-    proc = MagicMock()
-    proc.poll.return_value = exit_code
-    spawner.spawn.return_value = proc
-    spawner.is_available.return_value = True
     spawner.agent_type = agent_type
+    spawner.is_available.return_value = True
+    spawner.can_build_request.return_value = True
+    spawner.build_request.return_value = ExecutionRequest(
+        run_id="r",
+        argv=["true"],
+        workdir=Path("/tmp"),
+        log_path=Path("/tmp/fake-arbiter-real-subprocess.log"),
+        collect=CollectPolicy(mode="none"),
+        labels={"fake_return_code": str(exit_code)},
+    )
     return spawner
 
 

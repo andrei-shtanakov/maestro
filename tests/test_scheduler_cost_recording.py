@@ -61,7 +61,7 @@ async def test_success_records_cost_from_agent_log(tmp_path) -> None:
         proc.poll.return_value = 0
         running = RunningTask(
             task=task,
-            process=proc,
+            handle=proc,
             started_at=task.created_at,
             log_file=log_file,
         )
@@ -161,7 +161,7 @@ async def test_failure_path_records_cost_at_attempt_one(tmp_path) -> None:
         proc.poll.return_value = 1
         running = RunningTask(
             task=task,
-            process=proc,
+            handle=proc,
             started_at=task.created_at,
             log_file=log_file,
         )
@@ -313,7 +313,7 @@ async def test_record_cost_routed_task_uses_effective_harness(tmp_path) -> None:
         scheduler = _make_scheduler(db, tmp_path)
         running = RunningTask(
             task=task,
-            process=MagicMock(),
+            handle=MagicMock(),
             started_at=now,
             log_file=log_file,
         )
@@ -356,7 +356,7 @@ async def test_record_cost_declared_override_uses_routed_harness(tmp_path) -> No
 
         scheduler = _make_scheduler(db, tmp_path)
         running = RunningTask(
-            task=task, process=MagicMock(), started_at=now, log_file=log_file
+            task=task, handle=MagicMock(), started_at=now, log_file=log_file
         )
         await scheduler._record_cost(running)
 
@@ -395,7 +395,7 @@ async def test_record_cost_non_enum_routed_harness_falls_back(tmp_path) -> None:
 
         scheduler = _make_scheduler(db, tmp_path)
         running = RunningTask(
-            task=task, process=MagicMock(), started_at=now, log_file=log_file
+            task=task, handle=MagicMock(), started_at=now, log_file=log_file
         )
         await scheduler._record_cost(running)
 

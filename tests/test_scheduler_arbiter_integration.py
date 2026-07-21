@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from maestro.coordination.routing import ArbiterRouting
 from maestro.dag import DAG
 from maestro.database import Database
+from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.models import (
     AgentType,
     ArbiterConfig,
@@ -19,6 +21,16 @@ from maestro.models import (
 )
 from maestro.scheduler import Scheduler, SchedulerConfig
 from tests.fakes.fake_arbiter_client import FakeArbiterClient
+from tests.fakes.fake_execution_backend import FakeExecutionBackend
+
+
+@pytest.fixture(autouse=True)
+def _fake_execution_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch Scheduler's LocalBackend so MagicMock spawners here never spawn
+    a real subprocess. See tests/fakes/fake_execution_backend.py and the
+    identical fixture in tests/test_scheduler.py.
+    """
+    monkeypatch.setattr("maestro.scheduler.LocalBackend", FakeExecutionBackend)
 
 
 def _cfg() -> ArbiterConfig:
@@ -29,6 +41,29 @@ def _cfg() -> ArbiterConfig:
         config_dir="/fake",
         tree_path="/fake",
     )
+
+
+def _mock_spawner(exit_code: int = 0, agent_type: str = "codex_cli") -> MagicMock:
+    """A MagicMock spawner wired for the ExecutionRequest/TaskHandle seam.
+
+    `build_request` returns a real `ExecutionRequest` whose `labels` encode
+    `exit_code` for `FakeExecutionBackend` (patched in above) to replay
+    through a `FakeTaskHandle` — the MagicMock-based analogue of
+    `tests/test_scheduler.py`'s `MockSpawner`.
+    """
+    spawner = MagicMock()
+    spawner.agent_type = agent_type
+    spawner.is_available.return_value = True
+    spawner.can_build_request.return_value = True
+    spawner.build_request.return_value = ExecutionRequest(
+        run_id="r",
+        argv=["true"],
+        workdir=Path("/tmp"),
+        log_path=Path("/tmp/fake-arbiter-integration.log"),
+        collect=CollectPolicy(mode="none"),
+        labels={"fake_return_code": str(exit_code)},
+    )
+    return spawner
 
 
 @pytest.mark.anyio
@@ -60,12 +95,7 @@ async def test_assign_routes_and_persists_decision(tmp_path) -> None:
         )
         await db.create_task(task)
 
-        spawner = MagicMock()
-        proc = MagicMock()
-        proc.poll.return_value = 0
-        spawner.spawn.return_value = proc
-        spawner.is_available.return_value = True
-        spawner.agent_type = "codex_cli"
+        spawner = _mock_spawner(exit_code=0, agent_type="codex_cli")
 
         (tmp_path / "logs").mkdir(exist_ok=True)
         scheduler = Scheduler(
@@ -85,7 +115,7 @@ async def test_assign_routes_and_persists_decision(tmp_path) -> None:
         assert refetched.arbiter_decision_id == "dec-A"
         assert refetched.arbiter_route_reason == "dt"
 
-        spawner.spawn.assert_called_once()
+        spawner.build_request.assert_called_once()
     finally:
         await db.close()
 
@@ -124,12 +154,7 @@ async def test_assign_fused_agent_id_selects_harness_spawner(tmp_path) -> None:
         )
         await db.create_task(task)
 
-        spawner = MagicMock()
-        proc = MagicMock()
-        proc.poll.return_value = 0
-        spawner.spawn.return_value = proc
-        spawner.is_available.return_value = True
-        spawner.agent_type = "codex_cli"
+        spawner = _mock_spawner(exit_code=0, agent_type="codex_cli")
 
         (tmp_path / "logs").mkdir(exist_ok=True)
         scheduler = Scheduler(
@@ -150,7 +175,7 @@ async def test_assign_fused_agent_id_selects_harness_spawner(tmp_path) -> None:
         assert refetched.routed_agent_type == "codex_cli@gpt-5-codex"
 
         # Harness-keyed spawner was resolved and invoked.
-        spawner.spawn.assert_called_once()
+        spawner.build_request.assert_called_once()
     finally:
         await db.close()
 
@@ -294,12 +319,7 @@ async def _setup_task_and_scheduler(
     )
     await db.create_task(task)
 
-    spawner = MagicMock()
-    proc = MagicMock()
-    proc.poll.return_value = exit_code
-    spawner.spawn.return_value = proc
-    spawner.is_available.return_value = True
-    spawner.agent_type = "codex_cli"
+    spawner = _mock_spawner(exit_code=exit_code, agent_type="codex_cli")
 
     (tmp_path / "logs").mkdir(exist_ok=True)
     scheduler = Scheduler(
