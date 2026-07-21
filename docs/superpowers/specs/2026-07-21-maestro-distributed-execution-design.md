@@ -27,9 +27,9 @@ over SSH, (d) a remote container. This enables sandboxing, parallelism across
 machines, and running the Maestro "center" on a weak machine while executing on
 stronger executors.
 
-This design was reviewed read-only against the live `maestro` tree; the review
-(`_cowork_output/maestro-distributed-execution-design-review-2026-07-21.md`) is
-folded in here as amendments and the phasing below.
+This design incorporates two rounds of read-only review against the live
+`maestro` tree (2026-07-21), folded in as the amendments, contract, and phasing
+below.
 
 ## Goal
 
@@ -73,41 +73,56 @@ the executor.
 
 ```python
 class ExecutionRequest(BaseModel):
-    run_id: str                              # unique; names remote tmp + container
+    run_id: str                              # unique; names remote tmp + container + status marker
     argv: list[str]                          # ["spec-runner","run",...] | ["claude","-p",...]
     workdir: Path                            # local worktree (Mode 2) or shared dir (Mode 1)
     log_path: Path                           # where the CENTER writes merged stdout/stderr
     stdin: str | None = None
-    env: dict[str, str] = {}                 # explicit, non-secret
-    secret_env: list[str] = []               # allowlist of NAMES read from center env
-    inherit_env: bool = False                # True only meaningful for LocalBackend
+    env: dict[str, str] = Field(default_factory=dict)          # explicit, non-secret
+    secret_env: list[str] = Field(default_factory=list)        # allowlist of NAMES from center env
+    inherit_env: bool = False                # True honored only by LocalBackend
     timeout_seconds: int | None = None
-    collect: CollectPolicy
-    labels: dict[str, str] = {}              # maestro.run_id / backend_id / task_id
-    required_tools: list[str] = []           # probed on the executor (claude, spec-runner, python)
+    capture_output: bool = False             # also capture stdout/stderr tails into ExecutionResult
+    collect: CollectPolicy                   # terminal: apply remote file changes back (see §5)
+    progress_mirror: ProgressMirrorPolicy | None = None        # live, during-run mirror (see §11)
+    labels: dict[str, str] = Field(default_factory=dict)       # maestro.run_id / backend_id / task_id
+    required_tools: list[str] = Field(default_factory=list)    # probed on the executor
 
-class CollectPolicy(BaseModel):
-    mode: Literal["none", "whole_worktree", "scope_paths", "state_mirror"]
-    include: list[str] = []
-    exclude: list[str] = [".git/**", ".maestro/**"]
+class CollectPolicy(BaseModel):              # TERMINAL file application only
+    mode: Literal["none", "whole_worktree", "scope_paths", "patch"]
+    include: list[str] = Field(default_factory=list)
+    exclude: list[str] = Field(default_factory=lambda: [".git/**", ".maestro/**"])
     conflict_policy: Literal["fail", "overwrite"] = "fail"
     on_failure: Literal["collect", "skip"] = "collect"   # parity with local partial-change behavior
+
+class ProgressMirrorPolicy(BaseModel):       # LIVE, runs concurrently with the task (orthogonal to collect)
+    kind: Literal["spec_runner_sqlite"]
+    remote_globs: list[str]                  # .db, .db-wal, .db-shm (WAL-aware, §11)
+    local_dir: Path                          # mirror target; the existing SQLite reader points here
+    interval_seconds: float
+
+class ExecutionResult(BaseModel):
+    exit_code: int
+    stdout_tail: str = ""                    # populated iff capture_output (§9 validation retry context)
+    stderr_tail: str = ""
+    output_log_path: Path                    # always; full merged stream on the center
 
 class ExecutionHandleRef(BaseModel):         # persisted; survives center restart
     backend_id: str
     run_id: str
     transport_ref: str                       # local_pid | ssh_host+remote_pid | ssh_host+container_name
+    status_marker: str | None = None         # remote path of {pid,exit_code,completed_at} marker (§4)
     started_at: datetime
     workdir_mirror_path: Path | None = None
     state_mirror_path: Path | None = None
 
 class TaskHandle(Protocol):
     ref: ExecutionHandleRef
-    def poll(self) -> int | None: ...                 # non-blocking exit code (scheduler needs this)
-    async def wait(self) -> int: ...
+    def poll(self) -> int | None: ...        # SYNC, cached only — no network I/O (see §3 note below)
+    async def wait(self) -> ExecutionResult: ...
     async def terminate(self, grace_seconds: float) -> None: ...
     async def kill(self) -> None: ...
-    async def collect(self) -> CollectResult: ...     # explicit lifecycle phase (see §5)
+    async def collect(self) -> CollectResult: ...     # explicit terminal phase (see §5)
     async def cleanup(self) -> None: ...              # remove remote tmp / container / env-file
 
 class ExecutionBackend(Protocol):
@@ -120,6 +135,17 @@ class ExecutionBackend(Protocol):
 
 `TaskHandle` must replace **both** `Popen` (scheduler) and
 `asyncio.subprocess.Process` (orchestrator) — not merely wrap `run()`.
+
+**`poll()` is sync and cached-only.** The scheduler ticks `poll()` frequently
+and synchronously (`maestro/scheduler.py:1101`); it must never do SSH/probe
+network I/O. `SshBackend.run()` starts a local monitor task that tails the
+remote status marker (§4) and updates a cached status; `poll()` returns that
+cache. `LocalBackend.poll()` delegates to `Popen.poll()` as today.
+
+`collect` (terminal file application) and `progress_mirror` (live SQLite mirror)
+are **orthogonal** — Mode 2 SSH uses **both at once**: the mirror feeds live
+progress during the run, `collect` applies the final worktree changes before
+gates. They are not alternatives.
 
 ### 2. Backends and isolators
 
@@ -156,12 +182,25 @@ local binary.
 3. Secrets (`secrets_mode: injected`): write a `0600` env-file inside a `0700`
    dir on the executor (proctor pattern, §6), referenced via `--env-file` /
    `set -a; . envfile`. Never in argv, never logged.
-4. Isolator builds the command (`bare` vs `docker run`, §2).
-5. Stream stdout/stderr over the SSH channel into the center's `log_path`.
-6. Handle tracks `ExecutionHandleRef` (`ssh_host+remote_pid` or
-   `ssh_host+container_name`).
-7. `collect` (§5) and `cleanup` (`shred` env-file, `rm -rf` tmp, `docker rm` by
-   `run_id` label), the latter in a `finally`.
+4. Isolator builds the command (`bare` vs `docker run`, §2). It is wrapped in a
+   small remote shell that **decouples the job from the SSH channel**: the job
+   runs detached (`setsid`/`nohup` for bare; container id for docker), its PID is
+   written to `tmp/<run_id>.pid`, and on exit a status marker
+   `tmp/<run_id>.status` is written atomically as `{pid, exit_code,
+   completed_at}`. This survives a dropped SSH channel — the remote job keeps
+   running and the marker records its outcome.
+5. A local monitor task tails the job's output over SSH into the center's
+   `log_path` and polls the status marker to update the cached `poll()` status
+   (§3).
+6. Handle materializes `ExecutionHandleRef` with `transport_ref`
+   (`ssh_host+remote_pid` or `ssh_host+container_name`) and `status_marker`
+   (`host:tmp/<run_id>.status`). `probe(ref)` after a transport drop reads that
+   marker (or `docker inspect` by `run_id` label) to recover pid/exit-code
+   without a live channel.
+7. `collect` (§5), then `cleanup` in a `finally`: `rm -rf` tmp, `docker rm` by
+   `run_id` label, and best-effort secret removal — the env-file is created
+   `0600` in a `0700` dir and unlinked; use `shred`/secure-delete **when
+   available** but never depend on it (macOS/BSD/minimal images may lack it).
 
 SSH preconditions (ssh binary, key/agent, `known_hosts`, `BatchMode=yes`,
 `ConnectTimeout`, `StrictHostKeyChecking`) are part of `healthcheck`/fail-fast,
@@ -244,8 +283,16 @@ Post-task validation currently runs as a separate **local** subprocess
 needed that environment, local validation can miss dependencies or read
 pre-collect filesystem state. Task config gains
 `validation_backend: same | local | <backend>`, defaulting to **`same`** for
-non-local/container backends. Validation becomes a second `ExecutionRequest` on
-the chosen backend.
+non-local/container backends. Validation becomes a second `ExecutionRequest`
+with `capture_output=True` on the chosen backend.
+
+Output contract: `ValidationResult` today exposes `stdout`/`stderr`/`output` and
+the scheduler folds `validation_result.output` into the retry context
+(`maestro/validator.py:53`, `maestro/scheduler.py:1234`). The validation adapter
+must read `ExecutionResult.stdout_tail`/`stderr_tail` (populated because
+`capture_output=True`) into `ValidationResult`, so a task run through the
+execution layer does not lose retry feedback. Plain (non-validation) requests
+leave `capture_output=False` and only stream to `log_path`.
 
 ### 10. Env / secret contract
 
@@ -274,10 +321,13 @@ The reader opens `.executor-<prefix>state.db` read-only
 already cleans `.db`, `.db-wal`, `.db-shm`, `.json` (`maestro/workspace.py:196`).
 So remote polling must **not** mirror only `.db`. Options: rsync `.db` +
 `.db-wal` + `.db-shm` together; or run a SQLite checkpoint on the remote before
-mirroring; or read a consistent copy via a remote helper. `SshBackend`
-periodically mirrors the state files into a local mirror path; the existing
-reader points at the mirror (reader unchanged). Mirroring only `.db` risks
-stale/incomplete state or `sqlite3.DatabaseError`.
+mirroring; or read a consistent copy via a remote helper. This is driven by
+`ProgressMirrorPolicy(kind="spec_runner_sqlite", remote_globs=[".db",".db-wal",
+".db-shm"], local_dir=…, interval_seconds=…)` (§1): `SshBackend` periodically
+mirrors the state files into `local_dir`, and the existing reader points there
+(reader unchanged). This runs **during** the task, concurrently with — and
+independent of — the terminal `collect` (§5); a Mode 2 SSH run sets both.
+Mirroring only `.db` risks stale/incomplete state or `sqlite3.DatabaseError`.
 
 ### 12. Recovery for remote runs
 
@@ -337,6 +387,12 @@ tasks:
 
 No `execution` section → `local + bare`, old behavior. Routing: a
 workstream/task carries an optional `backend:`; otherwise `default_backend`.
+
+The `execution` block is added to **both** root config models — `ProjectConfig`
+(Mode 1) and `OrchestratorConfig` (Mode 2) — via a shared mixin. The example
+above combines `workstreams` (Mode 2) and `tasks` (Mode 1) in one document
+**only to show both routing surfaces**; in practice these live in separate
+config files and are not normally present together.
 
 ### 14. Observability
 
