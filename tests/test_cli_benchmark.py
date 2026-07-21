@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 import maestro.cli as cli_mod
 from maestro.benchmark.models import BenchmarkResult
 from maestro.cli import app
+from maestro.execution.models import ExecutionRequest
 from maestro.models import Task
 from maestro.spawners.base import AgentSpawner
 
@@ -88,6 +89,11 @@ class FakeBenchSpawner(AgentSpawner):
             encoding="utf-8",
         )
         return subprocess.Popen(["true"])
+
+    def build_request(
+        self, task, context, workdir, log_file, run_id, retry_context="", *, model=None
+    ) -> ExecutionRequest:
+        raise NotImplementedError
 
 
 @pytest.fixture(autouse=True)

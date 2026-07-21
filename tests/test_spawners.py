@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from maestro.execution.models import ExecutionRequest
 from maestro.models import AgentType, Task
 from maestro.spawners import (
     AgentSpawner,
@@ -551,6 +552,19 @@ class TestSpawnIntegration:
                 prompt = self.build_prompt(task, context, retry_context)
                 return _spawn_with_log_fd(["echo", prompt], workdir, log_file)
 
+            def build_request(
+                self,
+                task: Task,
+                context: str,
+                workdir: Path,
+                log_file: Path,
+                run_id: str,
+                retry_context: str = "",
+                *,
+                model: str | None = None,
+            ) -> ExecutionRequest:
+                raise NotImplementedError
+
         spawner = EchoSpawner()
         task = Task(
             id="echo-task",
@@ -610,6 +624,19 @@ class TestSpawnIntegration:
                     log_file,
                 )
 
+            def build_request(
+                self,
+                task: Task,
+                context: str,
+                workdir: Path,
+                log_file: Path,
+                run_id: str,
+                retry_context: str = "",
+                *,
+                model: str | None = None,
+            ) -> ExecutionRequest:
+                raise NotImplementedError
+
         spawner = StderrSpawner()
         task = Task(
             id="stderr-task",
@@ -655,6 +682,19 @@ class TestSpawnIntegration:
                     workdir,
                     log_file,
                 )
+
+            def build_request(
+                self,
+                task: Task,
+                context: str,
+                workdir: Path,
+                log_file: Path,
+                run_id: str,
+                retry_context: str = "",
+                *,
+                model: str | None = None,
+            ) -> ExecutionRequest:
+                raise NotImplementedError
 
         spawner = FailingSpawner()
         task = Task(
@@ -703,6 +743,19 @@ class TestSpawnerInheritance:
             ) -> subprocess.Popen[bytes]:
                 return MagicMock()
 
+            def build_request(
+                self,
+                task: Task,
+                context: str,
+                workdir: Path,
+                log_file: Path,
+                run_id: str,
+                retry_context: str = "",
+                *,
+                model: str | None = None,
+            ) -> ExecutionRequest:
+                raise NotImplementedError
+
         spawner = CustomSpawner()
         task = Task(
             id="test",
@@ -746,6 +799,19 @@ class TestSpawnerInheritance:
                 retry_context: str = "",
             ) -> str:
                 return f"CUSTOM: {task.title}"
+
+            def build_request(
+                self,
+                task: Task,
+                context: str,
+                workdir: Path,
+                log_file: Path,
+                run_id: str,
+                retry_context: str = "",
+                *,
+                model: str | None = None,
+            ) -> ExecutionRequest:
+                raise NotImplementedError
 
         spawner = CustomSpawner()
         task = Task(
@@ -1535,3 +1601,74 @@ class TestSpawnIntegrationAdditional:
         assert return_code == 0
         log_content = log_file.read_text()
         assert "Integration Announce" in log_content
+
+
+# =============================================================================
+# build_request() / can_build_request() golden-argv tests (Task 4)
+# =============================================================================
+
+
+def _mk_task() -> Task:
+    return Task(
+        id="t1",
+        title="T",
+        prompt="do it",
+        workdir="/tmp/wd",
+        agent_type=AgentType.CLAUDE_CODE,
+        scope=["a.py"],
+    )
+
+
+def test_claude_build_request_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MAESTRO_CLAUDE_MODEL", "claude-sonnet-5")
+    req = ClaudeCodeSpawner().build_request(
+        _mk_task(),
+        context="ctx",
+        workdir=Path("/tmp/wd"),
+        log_file=Path("/tmp/wd/t1.log"),
+        run_id="run-1",
+    )
+    assert isinstance(req, ExecutionRequest)
+    assert req.argv[0] == "claude"
+    assert req.argv[1:4] == ["--model", "claude-sonnet-5", "--print"]
+    assert req.argv[-2] == "-p"
+    assert req.argv[-1].startswith("Task: T")
+    assert req.inherit_env is True
+    assert req.capture_output is False
+    assert req.collect.mode == "none"
+    assert req.required_tools == ["claude"]
+    assert req.workdir == Path("/tmp/wd")
+    assert req.log_path == Path("/tmp/wd/t1.log")
+
+
+def test_announce_build_request_argv() -> None:
+    req = AnnounceSpawner().build_request(
+        _mk_task(),
+        context="ctx",
+        workdir=Path("/tmp/wd"),
+        log_file=Path("/tmp/wd/t1.log"),
+        run_id="run-1",
+    )
+    assert req.argv[0] == "echo"
+    assert req.argv[1].startswith("Task: T")
+    assert req.required_tools == []  # echo is a shell builtin/coreutil; no gate
+
+
+def test_aider_build_request_appends_scope() -> None:
+    req = AiderSpawner().build_request(
+        _mk_task(),
+        context="ctx",
+        workdir=Path("/tmp/wd"),
+        log_file=Path("/tmp/wd/t1.log"),
+        run_id="run-1",
+    )
+    assert req.argv[0] == "aider"
+    assert req.argv[-1] == "a.py"  # scope file appended last
+    assert req.required_tools == ["aider"]
+
+
+def test_can_build_request_true() -> None:
+    assert ClaudeCodeSpawner().can_build_request() is True
+    assert AnnounceSpawner().can_build_request() is True
+    assert CodexSpawner().can_build_request() is True
+    assert OpencodeSpawner().can_build_request() is True

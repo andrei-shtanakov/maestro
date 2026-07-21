@@ -20,6 +20,7 @@ from maestro.spawners.base import AgentSpawner
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from maestro.execution.models import ExecutionRequest
     from maestro.models import Task
 
 
@@ -96,6 +97,19 @@ class FakeSpawner(AgentSpawner):
         self.spawn_calls.append((task.id, task.prompt))
         log_file.write_text(self._log_content)
         return self._process
+
+    def build_request(
+        self,
+        task: Task,
+        context: str,
+        workdir: Path,
+        log_file: Path,
+        run_id: str,
+        retry_context: str = "",
+        *,
+        model: str | None = None,
+    ) -> ExecutionRequest:
+        raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------

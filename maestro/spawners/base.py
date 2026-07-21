@@ -11,6 +11,7 @@ from pathlib import Path
 from subprocess import Popen
 
 from maestro._vendor.obs import child_env
+from maestro.execution.models import ExecutionRequest
 from maestro.models import Task
 
 
@@ -81,6 +82,33 @@ class AgentSpawner(ABC):
             Subprocess handle for monitoring.
         """
         ...
+
+    @abstractmethod
+    def build_request(
+        self,
+        task: Task,
+        context: str,
+        workdir: Path,
+        log_file: Path,
+        run_id: str,
+        retry_context: str = "",
+        *,
+        model: str | None = None,
+    ) -> ExecutionRequest:
+        """Build a transport-agnostic ExecutionRequest ('what to run').
+
+        The backend (LocalBackend/SshBackend) owns spawning ('where/how').
+        """
+        ...
+
+    def can_build_request(self) -> bool:
+        """Whether this spawner can build a valid request locally.
+
+        Default True. Override for spawners with local config prerequisites.
+        This is NOT a tool-availability check — that is the backend's job
+        (`ExecutionBackend.can_run` probes required_tools on the executor).
+        """
+        return True
 
     def build_prompt(
         self,
