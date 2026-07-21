@@ -988,6 +988,50 @@ class Scheduler:
                 task, task.error_message
             )
 
+        # Build the request and probe tool availability BEFORE the
+        # READY->RUNNING transition/span below. This must gate up front so a
+        # missing tool fails fast exactly as the old is_available() check
+        # did: READY->FAILED, never READY->RUNNING->FAILED.
+        routed_model = (
+            model_of_agent_id(task.routed_agent_type)
+            if task.routed_agent_type
+            else None
+        )
+        # `routed_model is None` is the normal, expected case for a plain
+        # harness id with no "@" (static/advisory routing without a
+        # model). Only an explicit empty model after "@" (e.g.
+        # "claude_code@") is the degenerate case worth flagging.
+        if task.routed_agent_type and routed_model == "":
+            _obs_log.warning(
+                "agent.routed_model_empty",
+                task_id=task_id,
+                agent_id=task.routed_agent_type,
+            )
+        request = spawner.build_request(
+            task,
+            context,
+            workdir,
+            log_file,
+            task_id,
+            retry_context,
+            model=routed_model,
+        )
+
+        # Executor-side tool probe (replaces is_available()): checks the
+        # request's required_tools against the target executor. Fails
+        # fast with the same "not available" wording the old
+        # is_available() check used, so today's SchedulerError semantics
+        # hold even though the check now runs backend-side. Runs before any
+        # RUNNING transition/span so a missing tool never leaves the task
+        # observed as briefly RUNNING.
+        cap = await self._backend.can_run(request)
+        if not cap.ok:
+            msg = (
+                f"Agent '{spawner_key}' is not available on this system "
+                f"(missing tools: {cap.missing_tools})"
+            )
+            raise SchedulerError(msg)
+
         # Span scope covers the actual spawn so the spawner subprocess
         # inherits this span as TRACEPARENT (via spawner.child_env()),
         # giving cross-process trace continuity per the observability
@@ -1007,45 +1051,6 @@ class Scheduler:
             )
             self._report_status_change(task_id, "ready", "running")
             self._retry_ready_times.pop(task_id, None)
-
-            # Spawn the process with retry context
-            routed_model = (
-                model_of_agent_id(task.routed_agent_type)
-                if task.routed_agent_type
-                else None
-            )
-            # `routed_model is None` is the normal, expected case for a plain
-            # harness id with no "@" (static/advisory routing without a
-            # model). Only an explicit empty model after "@" (e.g.
-            # "claude_code@") is the degenerate case worth flagging.
-            if task.routed_agent_type and routed_model == "":
-                _obs_log.warning(
-                    "agent.routed_model_empty",
-                    task_id=task_id,
-                    agent_id=task.routed_agent_type,
-                )
-            request = spawner.build_request(
-                task,
-                context,
-                workdir,
-                log_file,
-                task_id,
-                retry_context,
-                model=routed_model,
-            )
-
-            # Executor-side tool probe (replaces is_available()): checks the
-            # request's required_tools against the target executor. Fails
-            # fast with the same "not available" wording the old
-            # is_available() check used, so today's SchedulerError semantics
-            # hold even though the check now runs backend-side.
-            cap = await self._backend.can_run(request)
-            if not cap.ok:
-                msg = (
-                    f"Agent '{spawner_key}' is not available on this system "
-                    f"(missing tools: {cap.missing_tools})"
-                )
-                raise SchedulerError(msg)
 
             handle = await self._backend.run(request)
 

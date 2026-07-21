@@ -1396,9 +1396,12 @@ class TestRunningTask:
             running = next(iter(scheduler._running_tasks.values()))
             assert hasattr(running, "handle")
             assert not hasattr(running, "process")
-            assert running.handle.poll() is None or isinstance(
-                running.handle.poll(), int
-            )
+            # `running.handle` must be the exact FakeTaskHandle the backend's
+            # `run()` created for this task — not just some object that
+            # happens to expose `.poll()`.
+            created = _fake_backend(scheduler).created_handles
+            assert len(created) == 1
+            assert running.handle is created[0]
         finally:
             await db.close()
 
@@ -1580,6 +1583,74 @@ class TestSpawnerErrorHandling:
             task = await db.get_task("unavailable-agent-task")
             assert task.status == TaskStatus.FAILED
             assert "not available" in (task.error_message or "")
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_unavailable_spawner_never_transitions_to_running(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """Regression: a missing required tool must fail READY->FAILED,
+        never READY->RUNNING->FAILED.
+
+        Locks the ordering fix in `_spawn_task`: `backend.can_run()` now
+        gates before the READY->RUNNING DB write and before `task.spawn`'s
+        span opens. Verifies via two independent signals that RUNNING was
+        never entered:
+        - no ("ready", "running") status-change callback fires
+        - `started_at` stays unset (it is only stamped on the RUNNING
+          transition, see `Task.with_status_update`)
+        """
+        configs = [
+            TaskConfig(
+                id="unavailable-agent-task",
+                title="Task with unavailable agent",
+                prompt="Test prompt",
+                agent_type=AgentType.CLAUDE_CODE,
+            )
+        ]
+
+        db = await create_database(temp_db_path)
+        try:
+            for config in configs:
+                task = Task.from_config(config, str(temp_dir))
+                await db.create_task(task)
+
+            changes: list[tuple[str, str, str]] = []
+
+            def on_status_change(task_id: str, old: str, new: str) -> None:
+                changes.append((task_id, old, new))
+
+            # Create spawner that reports unavailable (missing required tool)
+            mock_spawner = MockSpawner(available=False)
+            dag = DAG(configs)
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                log_dir=temp_dir / "logs",
+            )
+
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={"claude_code": mock_spawner},
+                config=scheduler_config,
+                on_status_change=on_status_change,
+            )
+
+            ready = scheduler._resolve_ready_tasks(set())
+            await scheduler._spawn_ready_tasks(ready)
+
+            task = await db.get_task("unavailable-agent-task")
+            assert task.status == TaskStatus.FAILED
+            assert task.started_at is None, (
+                "started_at must stay unset — it is only stamped on the "
+                "READY->RUNNING transition, which a missing tool must never "
+                "reach"
+            )
+            assert ("unavailable-agent-task", "ready", "running") not in changes
         finally:
             await db.close()
 
