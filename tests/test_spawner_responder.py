@@ -13,18 +13,30 @@ entirely inside ``TaskHandle.wait()``.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
 
 from maestro.benchmark import SpawnerResponder
-from maestro.execution.models import CollectPolicy, ExecutionRequest, ExecutionResult
+from maestro.execution.models import (
+    CollectPolicy,
+    CollectResult,
+    ExecutionHandleRef,
+    ExecutionRequest,
+    ExecutionResult,
+)
 from maestro.spawners.base import AgentSpawner
 
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from maestro.execution.models import (
+        BackendHealth,
+        CapabilityResult,
+        ProbeResult,
+    )
     from maestro.models import Task
 
 
@@ -44,6 +56,12 @@ class FakeTaskHandle:
     def __init__(self, req: ExecutionRequest) -> None:
         self._req = req
         self.killed = False
+        self.ref = ExecutionHandleRef(
+            backend_id="fake",
+            run_id=req.run_id,
+            transport_ref="fake:1",
+            started_at=datetime.now(UTC),
+        )
 
     @property
     def os_pid(self) -> int | None:
@@ -73,7 +91,7 @@ class FakeTaskHandle:
     async def kill(self) -> None:
         self.killed = True
 
-    async def collect(self):
+    async def collect(self) -> CollectResult:
         raise NotImplementedError("not exercised by responder tests")
 
     async def cleanup(self) -> None:
@@ -88,10 +106,10 @@ class FakeBackend:
     def __init__(self) -> None:
         self.created_handles: list[FakeTaskHandle] = []
 
-    async def healthcheck(self):
+    async def healthcheck(self) -> BackendHealth:
         raise NotImplementedError("not exercised by responder tests")
 
-    async def can_run(self, req: ExecutionRequest):
+    async def can_run(self, req: ExecutionRequest) -> CapabilityResult:
         raise NotImplementedError("not exercised by responder tests")
 
     async def run(self, req: ExecutionRequest) -> FakeTaskHandle:
@@ -99,7 +117,7 @@ class FakeBackend:
         self.created_handles.append(handle)
         return handle
 
-    async def probe(self, ref):
+    async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
         raise NotImplementedError("not exercised by responder tests")
 
 

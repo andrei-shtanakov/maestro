@@ -74,23 +74,6 @@ class SpawnerProtocol(Protocol):
         """Unique identifier for this agent type."""
         ...
 
-    def is_available(self) -> bool:
-        """Check if this agent is available."""
-        ...
-
-    def spawn(
-        self,
-        task: Task,
-        context: str,
-        workdir: Path,
-        log_file: Path,
-        retry_context: str = "",
-        *,
-        model: str | None = None,
-    ) -> Popen[bytes]:
-        """Spawn agent process."""
-        ...
-
     def build_request(
         self,
         task: Task,

@@ -670,13 +670,13 @@ class TestRegistryIntegration:
 
         spawners_dict = registry.to_dict()
 
-        # Verify dict structure matches what Scheduler expects
+        # Verify dict structure matches what Scheduler (SpawnerProtocol) expects
         assert isinstance(spawners_dict, dict)
         for agent_type, spawner in spawners_dict.items():
             assert isinstance(agent_type, str)
             assert hasattr(spawner, "agent_type")
-            assert hasattr(spawner, "is_available")
-            assert hasattr(spawner, "spawn")
+            assert hasattr(spawner, "build_request")
+            assert hasattr(spawner, "can_build_request")
 
     def test_registry_with_all_spawner_types(
         self,
