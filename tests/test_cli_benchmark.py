@@ -11,7 +11,6 @@ import maestro.cli as cli_mod
 from maestro.benchmark.models import BenchmarkResult
 from maestro.cli import app
 from maestro.execution.models import CollectPolicy, ExecutionRequest
-from maestro.models import Task
 from maestro.spawners.base import AgentSpawner
 
 
@@ -85,14 +84,6 @@ class FakeBenchSpawner(AgentSpawner):
     @property
     def agent_type(self) -> str:
         return self._agent_type
-
-    def is_available(self) -> bool:
-        return True
-
-    def spawn(
-        self, task: Task, context, workdir, log_file, retry_context="", *, model=None
-    ):
-        raise NotImplementedError("legacy path unused by the responder")
 
     def build_request(
         self, task, context, workdir, log_file, run_id, retry_context="", *, model=None
