@@ -29,10 +29,14 @@ not an executable invariant.
 
 Make scope containment a deterministic, always-on, executable gate:
 
-> A workstream's committed diff (`base..HEAD`, minus orchestrator-managed
-> artifacts) must touch only paths matched by its declared `scope`. Any escape
-> blocks the merge (exit≠0 / `NEEDS_REVIEW`), with a deliberate operator
-> override.
+> A workstream's own committed diff (from its branch-point,
+> `merge-base(base, HEAD)..HEAD`, minus orchestrator-managed artifacts) must
+> touch only paths matched by its declared `scope`. Any escape blocks the merge
+> (exit≠0 / `NEEDS_REVIEW`), with a deliberate operator override.
+
+The surface is the **branch-point** diff, not a two-dot `base..HEAD` tree
+delta — see §3.2 for why (a sibling workstream advancing `base` would otherwise
+inject false escapes).
 
 This is the codex-build `check_scope.py` philosophy: declared scope = allowlist,
 any path outside → hard fail — no LLM, no risk model, no human in the common
@@ -42,6 +46,12 @@ path.
 
 Three parts, split by responsibility so the matching logic is pure and
 transport-agnostic while the git dependency stays at the edge:
+
+Module split (keeps the git import out of the pure matcher):
+
+- `maestro/scope_gate.py` — the pure `find_escapes` core.
+- `maestro/changed_paths.py` — the git changed-paths source + the
+  orchestrator-managed filter.
 
 ### 3.1 Pure core — `maestro/scope_gate.py`
 
@@ -62,7 +72,7 @@ Fully unit-testable on lists of strings. Callers pass **already-normalized**
 paths and patterns; the core does not normalize, glob the filesystem, or shell
 out.
 
-### 3.2 Changed-paths source — git helper
+### 3.2 Changed-paths source — `maestro/changed_paths.py`
 
 Kept explicitly separate from the pure matcher:
 
@@ -70,17 +80,42 @@ Kept explicitly separate from the pure matcher:
 async def changed_paths_since(
     base_ref: str, head_ref: str, repo_root: Path
 ) -> list[str]:
-    """`git diff --name-only base_ref..head_ref`, orchestrator-managed
-    artifacts filtered out, normalized to repo-relative POSIX paths."""
+    """The workstream's OWN committed changes, from its branch-point.
+
+    merge_base = `git merge-base base_ref head_ref`
+    paths      = `git diff --no-renames --name-only <merge_base> <head_ref>`
+
+    Orchestrator-managed artifacts filtered out; normalized to repo-relative
+    POSIX paths.
+    """
 ```
+
+Two git decisions, both load-bearing for an always-on gate:
+
+- **Branch-point, not two-dot `base..HEAD`.** `git diff A..B` is
+  `diff(tree_A, tree_B)`, not a range. Once a sibling workstream merges into
+  `base` (`_merge_into_base` advances it mid-run), `diff(base_tip, head)` would
+  surface that sibling's out-of-scope paths as a reverse-diff and flag them as
+  *this* workstream's escapes. Diffing from `merge-base(base, HEAD)` isolates
+  exactly the workstream's own commits.
+- **`--no-renames`.** Not passing `-M` is insufficient: a user's
+  `diff.renames=true` git config re-enables rename detection. Force
+  `--no-renames` so a rename is always reported as delete(old)+add(new) on every
+  machine (see §4).
 
 The `git diff --name-only` + `_orchestrator_managed` filter logic currently
 lives inside `GateKeeper` (`gates.py::_git_diff_paths`, `_orchestrator_managed`).
-Extract it into a shared location so both the always-on scope-gate and
-`GateKeeper` use one implementation — the scope-gate must **not** depend on a
-`GateKeeper` instance existing (it only exists when steward gates are
-configured). This is a targeted, non-speculative refactor: no behavior change to
-`GateKeeper`, one source of truth for "what did this workstream change".
+Move it here so both the always-on scope-gate and `GateKeeper` use one
+implementation — the scope-gate must **not** depend on a `GateKeeper` instance
+existing (it only exists when steward gates are configured).
+`GateKeeper.evaluate_ex_post()` delegates to `changed_paths_since` and drops its
+own `_git_diff_paths`.
+
+**Behavior change (intentional):** `GateKeeper`'s ex-post surface shifts from
+two-dot to branch-point + `--no-renames`. This is a correctness fix — the
+steward ex-post gate has the same false-escape-after-base-advances latent bug —
+and is covered by a regression test (§9). One source of truth for "what did this
+workstream change".
 
 **Transport seam (Phase 1+):** for remote/Docker backends the changed-path
 source moves to the execution-layer `collect` step (`CollectPolicy`,
@@ -118,11 +153,12 @@ normalized input on both sides.
 empty scope would be a breaking always-on failure, and preflight already emits a
 `scope-empty` warning for it.
 
-**Renames:** the source does **not** pass `-M`, so `--name-only` reports a
-rename as a delete (old path) + add (new path). The gate checks *every* affected
-repo-relative path independently — it does not try to understand rename
-semantics. Stricter, simpler, and correct for containment: if either endpoint of
-a rename is outside scope, that endpoint is an escape.
+**Renames:** the source explicitly passes `--no-renames` (§3.2), so
+`--name-only` reports a rename as a delete (old path) + add (new path) on every
+machine, regardless of the user's `diff.renames` git config. The gate checks
+*every* affected repo-relative path independently — it does not try to
+understand rename semantics. Stricter, simpler, and correct for containment: if
+either endpoint of a rename is outside scope, that endpoint is an escape.
 
 ## 5. Orchestrator integration
 
@@ -161,37 +197,44 @@ only exists under `GateKeeper`.
 Check the approval **before** computing the diff:
 
 ```
+approvals = await db.list_gate_approvals(workstream_id)  # per-workstream set
 sha = worktree HEAD
 if (phase="ex_post", sha) in approvals:   # operator already waived this sha
     skip scope-gate  ->  proceed
 else:
-    paths = changed_paths_since(base, HEAD, worktree)
+    paths = await changed_paths_since(base, HEAD, worktree)
     escapes = find_escapes(paths, scope)
     if escapes: block -> NEEDS_REVIEW
 ```
 
-This avoids a wasted `git diff` on every H-6 resume.
+This avoids a wasted `git diff` on every H-6 resume. `list_gate_approvals` is
+already scoped per workstream (§6), so `(phase, sha)` is checked *within that
+namespace* — never globally.
 
 ## 6. Override & recovery
 
 Reuse the existing gate-approval + H-6 machinery — no new tables, no
 reason-specific approvals in this PR:
 
-- `maestro workstream-approve <ws>` records an approval in `gate_approvals`,
-  keyed `(phase="ex_post", sha)`.
-- A single approval clears the ex-post edge **regardless of cause** — a
-  deterministic scope escape and/or a steward tier. Approvals key on
-  `(phase, sha)`, not on the reason.
+- `maestro workstream-approve <ws>` records an approval in `gate_approvals`.
+  **DB key is `(workstream_id, phase, sha)`** (`UNIQUE` constraint); the gate
+  receives a per-workstream set via `list_gate_approvals(workstream_id)` and
+  checks `(phase, sha)` *inside that per-workstream namespace*. An approval for
+  workstream A therefore never waives workstream B, even at the same HEAD sha.
+- A single approval clears the ex-post edge for its workstream **regardless of
+  cause** — a deterministic scope escape and/or a steward tier. Within the
+  per-workstream set, approvals key on `(phase, sha)`, not on the reason.
 - Re-queue → `_try_resume_ex_post` (H-6): if the worktree HEAD still equals the
   approved sha → `RUNNING` → `_handle_success` re-runs → the scope-gate sees the
   approval (§5.2) and skips → steward gate (if any) sees it too → `MERGING` →
   merge → `DONE`.
-- **Requirement:** the scope-gate MUST honor `(ex_post, sha) in approvals` and
-  skip; otherwise the resume loops forever.
+- **Requirement:** the scope-gate MUST honor `(phase="ex_post", sha)` within the
+  per-workstream approvals set and skip; otherwise the resume loops forever.
 
 ## 7. CLI — `maestro check-scope <workstream-id>`
 
-Mirrors exactly what the gate computes; for operator inspection and CI.
+**Raw containment check** — it reports the containment *fact*, not the gate's
+*effective policy decision*. For operator inspection and CI.
 
 ```
 maestro check-scope <workstream-id> --db maestro.db
@@ -199,6 +242,12 @@ maestro check-scope <workstream-id> --db maestro.db
 
 - Resolves the workstream's `scope` (DB) and worktree, computes
   `changed_paths_since` + `find_escapes`, prints escaping paths.
+- **Approval does not change the exit code.** The name `check-scope` and the CI
+  use-case mean "did this stay in scope?", not "would the gate let it merge?".
+  If an `(ex_post, sha)` approval exists for this workstream, print an
+  informational `note: approved (ex_post, <sha>)` line — but escapes still exit
+  `1`. An `--effective` mode (approval → exit `0`) is a possible later addition,
+  not this PR.
 
 **Exit codes:**
 
@@ -223,21 +272,33 @@ enforcement is a deterministic safety invariant, not an option. Fewer surfaces.
   in a parent dir; empty scope → `[]`; deleted-path string (not on FS) still
   matched.
 
-**Rename cases** (delete+add via `--name-only`, no `-M`):
+**Rename cases** (delete+add via `--no-renames --name-only`):
 
 - inside-scope file renamed outside → escape includes the dest; source clean.
 - outside file renamed inside → escape includes the source.
 - outside → outside by a scoped workstream → both endpoints escape.
 - inside → inside → clean.
 
-**Source helper (`changed_paths_since`)** — on a temp repo: added / deleted /
-renamed file, orchestrator-managed filter.
+**Source helper (`changed_paths_since`)** — on a temp repo:
+
+- added / deleted / renamed file, orchestrator-managed filter.
+- **branch-point isolation:** `base` advanced by another workstream's
+  out-of-scope commit → this workstream's diff (in scope) stays clean, no false
+  escape (Finding 1 regression).
+- **`--no-renames` under hostile config:** temp repo with
+  `git config diff.renames true` → the helper still returns both rename
+  endpoints as delete+add (Finding 2 regression).
 
 **Integration:**
 
 - escape → `NEEDS_REVIEW` + worktree intact; `stats.failed` incremented.
 - approve → resume → `DONE` (H-6), no redundant diff on resume (§5.2).
 - always-on when `config.gates is None`.
+- **per-workstream approval isolation:** an `(ex_post, sha)` approval for
+  workstream A does not waive workstream B at the same HEAD sha (Finding 3
+  regression).
+- `GateKeeper.evaluate_ex_post` still passes after delegating to
+  `changed_paths_since` (branch-point + `--no-renames` shift, §3.2).
 
 **Regression:** a clean workstream (all changes in scope) passes unchanged.
 
@@ -249,5 +310,5 @@ renamed file, orchestrator-managed filter.
   briefs).
 - Remote/Docker changed-path source (Phase 1+ execution `collect`).
 - `maestro check-scope --json`.
-- Uncommitted-change enforcement (only committed `base..HEAD` merges, so the
-  committed diff is the complete and correct surface).
+- Uncommitted-change enforcement (only committed changes merge, so the
+  branch-point committed diff is the complete and correct surface).
