@@ -34,6 +34,7 @@ uv run maestro approve <task-id> --db maestro.db  # Approve an AWAITING_APPROVAL
 uv run maestro orchestrate <project.yaml>   # Run orchestrator
 uv run maestro workstreams --db maestro.db       # Show workstreams status
 uv run maestro workstream-approve <workstream-id> --db maestro.db  # Approve a NEEDS_REVIEW workstream — records the durable gate approval (phase+sha) and re-queues
+uv run maestro check-scope <workstream-id> --base <base-branch> --db maestro.db  # deterministic scope containment (exit 1 on escape)
 uv run maestro workspaces <project.yaml>     # List active worktrees
 
 # === Mode-2 config authoring ===
@@ -86,7 +87,7 @@ uv add --dev <package>
 - **database.py**: SQLite layer with async CRUD, WAL mode (tasks + workstreams tables)
 - **dag.py**: DAG building, cycle detection, topological sort, scope overlap warnings
 - **git.py**: Git operations (branch, rebase, push, worktree, merge)
-- **cli.py**: Typer CLI (run, status, retry, stop, approve, orchestrate, workstreams, workspaces, merge-logs, models)
+- **cli.py**: Typer CLI (run, status, retry, stop, approve, orchestrate, workstreams, workstream-approve, check-scope, workspaces, merge-logs, models)
 - **scheduler.py**: Main scheduler loop — polls DAG, spawns agents, monitors completion
 - **validator.py**: Post-task validation (run validation_cmd)
 - **retry.py**: Exponential backoff retry logic with jitter

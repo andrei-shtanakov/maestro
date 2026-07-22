@@ -1569,6 +1569,80 @@ def workstream_approve_command(
     )
 
 
+@app.command("check-scope")
+def check_scope_command(
+    workstream_id: Annotated[str, typer.Argument(help="Workstream ID to check")],
+    base: Annotated[
+        str, typer.Option("--base", "-b", help="Base branch to diff against")
+    ],
+    db: Annotated[
+        Path | None, typer.Option("--db", "-d", help="Path to SQLite database file")
+    ] = None,
+) -> None:
+    """Raw scope-containment check for a workstream's worktree.
+
+    Exit 0 = clean or empty scope; 1 = escapes found; 2 = invalid input.
+    An existing approval prints an informational note but never changes the
+    exit code (this reports the containment fact, not the gate's policy).
+
+    Examples:
+        maestro check-scope my-ws --base main --db run/maestro.db
+    """
+    from maestro.changed_paths import changed_paths_since
+    from maestro.database import Database, WorkstreamNotFoundError
+    from maestro.scope_gate import find_escapes, normalize
+
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> int:
+        database = Database(db_path)
+        await database.connect()
+        try:
+            try:
+                ws = await database.get_workstream(workstream_id)
+            except WorkstreamNotFoundError:
+                console.print(f"[red]workstream '{workstream_id}' not found[/red]")
+                return 2
+            if not ws.workspace_path:
+                console.print(
+                    f"[red]workstream '{workstream_id}' has no worktree[/red]"
+                )
+                return 2
+            worktree = Path(ws.workspace_path)
+            # Path.exists() is fast sync I/O, acceptable in async context
+            if not worktree.exists():  # noqa: ASYNC240
+                console.print(f"[red]worktree missing: {worktree}[/red]")
+                return 2
+            if not ws.scope:
+                console.print("[dim]empty scope — nothing to enforce.[/dim]")
+                return 0
+            try:
+                paths = await changed_paths_since(base, "HEAD", worktree)
+            except RuntimeError as exc:
+                console.print(f"[red]git error: {exc}[/red]")
+                return 2
+            escapes = find_escapes(normalize(paths), normalize(ws.scope))
+            if not escapes:
+                console.print("[green]in scope — no escapes.[/green]")
+                return 0
+            console.print("[red]scope escape:[/red]")
+            for p in escapes:
+                console.print(f"  {p}")
+            # Raw check: an existing ex_post approval is informational only and
+            # does NOT change the exit code (spec §7). Any recorded ex_post
+            # approval for this workstream is enough to print the note.
+            approvals = await database.list_gate_approvals(workstream_id)
+            for phase, sha in approvals:
+                if phase == "ex_post":
+                    console.print(f"[dim]note: approved (ex_post, {sha[:12]})[/dim]")
+                    break
+            return 1
+        finally:
+            await database.close()
+
+    raise typer.Exit(asyncio.run(_run()))
+
+
 @app.command("workspaces")
 def workspaces_command(
     workspace_base: Annotated[

@@ -272,6 +272,92 @@ async def test_ex_post_scope_violation_blocks(
     assert not decision.allow
 
 
+async def test_evaluate_ex_post_uses_branch_point_no_false_escape(tmp_path):
+    """Base advanced by a sibling commit must not appear in ex-post diff paths."""
+    import asyncio
+
+    from maestro.changed_paths import changed_paths_since
+
+    async def g(repo, *a):
+        p = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(repo),
+            *a,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        o, e = await p.communicate()
+        assert p.returncode == 0, e.decode()
+        return o.decode()
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    await g(repo, "init", "-b", "main")
+    await g(repo, "config", "user.email", "t@t.t")
+    await g(repo, "config", "user.name", "t")
+    (repo / "a.py").write_text("1\n")
+    await g(repo, "add", "-A")
+    await g(repo, "commit", "-m", "0")
+    await g(repo, "checkout", "-b", "feature")
+    (repo / "mine.py").write_text("m\n")
+    await g(repo, "add", "-A")
+    await g(repo, "commit", "-m", "f")
+    await g(repo, "checkout", "main")
+    (repo / "sibling.py").write_text("s\n")
+    await g(repo, "add", "-A")
+    await g(repo, "commit", "-m", "s")
+    assert await changed_paths_since("main", "feature", repo) == ["mine.py"]
+
+
+async def test_evaluate_ex_post_ignores_advanced_base_no_false_scope_violation(
+    fake_steward: Path, repo: Path, tmp_path: Path
+) -> None:
+    """Regression (final review Important #1): pin the branch-point delegation
+    at gates.py:180 THROUGH the public `evaluate_ex_post` method, not just via
+    `changed_paths_since` directly (see the test above) — every other ex-post
+    test uses a single commit off base, where two-dot `base..HEAD` happens to
+    equal the branch-point diff, so a revert to that two-dot form would keep
+    the rest of the suite green.
+    """
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), *args], check=True, capture_output=True, env=env
+        )
+
+    # In-scope commit on feature/ws-1, branched off master.
+    workspace = _branch_with_change(repo, "src/a.py", "x = 3\n")
+    # Base branch advances AFTER the branch point with an out-of-scope change.
+    git("checkout", "master")
+    (repo / "docs").mkdir()
+    (repo / "docs" / "evil.md").write_text("evil\n")
+    git("add", "-A")
+    git("commit", "-m", "docs: sibling change")
+    # Back on the feature branch, so HEAD is the workstream's own commit —
+    # mirrors a real worktree, which stays checked out on the feature branch.
+    git("checkout", "feature/ws-1")
+
+    keeper = _keeper(fake_steward, repo, tmp_path)
+    decision = await keeper.evaluate_ex_post(
+        "ws-1", ["src/**"], workspace=workspace, approvals=set()
+    )
+    # Under the two-dot bug, docs/evil.md would leak into the diff paths and
+    # the fake steward would flag scope_violation -> allow is False.
+    assert decision.allow is True, (
+        decision.reason,
+        [r.note for r in decision.records],
+    )
+    assert not any("scope_violation" in (r.note or "") for r in decision.records)
+
+
 def _branch_with_change(repo: Path, rel: str, content: str) -> Path:
     env = {
         **os.environ,
@@ -676,7 +762,12 @@ def test_workstream_approve_takes_effect_in_next_gate_evaluation(
 
 
 class TestOrchestratorManagedNarrowing:
-    """gates v1.2 (H-7): only maestro-namespaced artifacts are infra."""
+    """gates v1.2 (H-7): only maestro-namespaced artifacts are infra.
+
+    `_orchestrator_managed` moved to `maestro.changed_paths` (Task 4) — this
+    class now exercises it there, since `changed_paths_since` is the sole
+    caller after `GateKeeper.evaluate_ex_post` was rewired to delegate to it.
+    """
 
     @pytest.mark.parametrize(
         "path",
@@ -691,7 +782,7 @@ class TestOrchestratorManagedNarrowing:
         ],
     )
     def test_harness_paths_excluded(self, path: str) -> None:
-        from maestro.gates import _orchestrator_managed
+        from maestro.changed_paths import _orchestrator_managed
 
         assert _orchestrator_managed(path) is True
 
@@ -706,7 +797,7 @@ class TestOrchestratorManagedNarrowing:
         ],
     )
     def test_target_repo_paths_visible(self, path: str) -> None:
-        from maestro.gates import _orchestrator_managed
+        from maestro.changed_paths import _orchestrator_managed
 
         assert _orchestrator_managed(path) is False
 

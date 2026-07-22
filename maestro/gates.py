@@ -32,7 +32,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,7 +40,15 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from maestro._vendor.obs import current_pipeline_id
-from maestro.models import SPEC_PREFIX
+from maestro.changed_paths import changed_paths_since
+from maestro.gate_approvals import (
+    APPROVAL_MARKER_PREFIX,
+    BLOCK_REASON_PREFIX,
+    ApprovalMarker,
+    build_approval_marker,
+    parse_approval_marker,
+    preserve_approval_marker,
+)
 
 
 if TYPE_CHECKING:
@@ -59,81 +66,6 @@ __all__ = [
     "pipeline_log_dir",
     "preserve_approval_marker",
 ]
-
-APPROVAL_MARKER_PREFIX = "gates:approval-required"
-BLOCK_REASON_PREFIX = "gates: human.owner_approval required"
-
-_MARKER_RE = re.compile(
-    re.escape(APPROVAL_MARKER_PREFIX)
-    + r" phase=(ex_ante|ex_post) sha=([0-9a-fA-F]{7,64})"
-)
-
-
-class ApprovalMarker(BaseModel):
-    """Parsed `gates:approval-required phase=<p> sha=<sha>` marker (H-6)."""
-
-    model_config = ConfigDict(frozen=True)
-
-    phase: Literal["ex_ante", "ex_post"]
-    sha: str
-
-
-def parse_approval_marker(error_message: str | None) -> ApprovalMarker | None:
-    """Extract the gates approval marker from a stored block reason.
-
-    Returns None when the message is empty or carries no well-formed
-    marker. The marker is the durable half of the approval memory: it
-    lives in the workstream row and survives orchestrator restarts,
-    unlike the verdict store bound to one run's logs/<ULID>/ directory.
-    """
-    if not error_message:
-        return None
-    match = _MARKER_RE.search(error_message)
-    if match is None:
-        return None
-    phase = match.group(1)
-    assert phase in ("ex_ante", "ex_post")  # regex guarantees; narrows type
-    return ApprovalMarker(phase=phase, sha=match.group(2))
-
-
-def preserve_approval_marker(new_message: str, prior: str | None) -> str:
-    """Carry an approval marker from a prior error_message into a new one.
-
-    H-6 position retention (NOT authority — that lives in gate_approvals):
-    losing the marker to a failure/shutdown message costs a wasteful full
-    respawn. Idempotent: extracts the first marker from `prior` and appends
-    it once; a marker already present in `new_message` is never duplicated.
-    """
-    if not prior:
-        return new_message
-    match = _MARKER_RE.search(prior)
-    if match is None:
-        return new_message
-    marker = match.group(0)
-    if marker in new_message:
-        return new_message
-    return f"{new_message} | {marker}"
-
-
-# Paths Maestro itself materializes in the worktree (spec generation +
-# executor runtime state); they are infra, not the agent's change —
-# excluded from ex-post classification and the declared-scope check
-# (H-4, narrowed in gates v1.2/H-7). Deliberately NOT excluded:
-# `spec-runner.config.yaml` — in a repo that tracks its own config,
-# Maestro's overwrite must surface as a scope violation (fail-closed
-# backstop); in a repo without one the file is untracked+ignored and
-# never enters the diff. `spec/.{prefix}` covers the dot-before-prefix
-# harness files (task-history, spec lock) spec-runner writes (H-8).
-_ORCHESTRATOR_MANAGED = (
-    f"spec/{SPEC_PREFIX}",
-    f"spec/.{SPEC_PREFIX}",
-    "spec/.executor-",
-)
-
-
-def _orchestrator_managed(path: str) -> bool:
-    return path.startswith(_ORCHESTRATOR_MANAGED)
-
 
 _STEWARD_ENV = "MAESTRO_STEWARD_BIN"
 
@@ -245,11 +177,7 @@ class GateKeeper:
     ) -> GateDecision:
         """Guard for RUNNING -> MERGING: classify the actual diff vs base."""
         sha = await self._git_sha(workspace)
-        paths = [
-            p
-            for p in await self._git_diff_paths(workspace)
-            if not _orchestrator_managed(p)
-        ]
+        paths = await changed_paths_since(self._base_branch, "HEAD", workspace)
         payload = {
             "project": self._project,
             "sha": sha,
@@ -353,7 +281,7 @@ class GateKeeper:
             tier in self._config.approval_tiers or "scope_violation" in flags
         )
         if needs_approval:
-            marker = f"{APPROVAL_MARKER_PREFIX} phase={phase} sha={sha}"
+            marker = build_approval_marker(phase, sha)
             # gates v1.3 (H-9): the DB approvals set is the single authority;
             # the marker in the block message is operator UX + the H-6
             # position signal, never authorization.
@@ -449,10 +377,6 @@ class GateKeeper:
     async def _git_sha(self, repo: Path) -> str:
         out = await self._git(repo, "rev-parse", "HEAD")
         return out.strip()
-
-    async def _git_diff_paths(self, repo: Path) -> list[str]:
-        out = await self._git(repo, "diff", "--name-only", f"{self._base_branch}..HEAD")
-        return [line for line in out.splitlines() if line]
 
     @staticmethod
     async def _git(repo: Path, *args: str) -> str:
