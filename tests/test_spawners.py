@@ -336,6 +336,139 @@ class TestCodexSpawner:
         """Test that agent_type returns correct value."""
         assert codex_spawner.agent_type == "codex_cli"
 
+    def test_build_request_uses_catalog_default(
+        self,
+        codex_spawner: CodexSpawner,
+        catalog_env: Path,
+    ) -> None:
+        """Catalog default resolves onto the -m argv element."""
+        from maestro.catalog import load_catalog
+
+        req = codex_spawner.build_request(
+            _mk_task(),
+            context="ctx",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
+        cat = load_catalog()
+        assert cat is not None
+        expected = cat.default_model_for_harness("codex_cli")
+        assert req.argv[0] == "codex"
+        assert req.argv[1] == "exec"
+        assert req.argv[req.argv.index("-m") + 1] == expected
+        assert "--sandbox" in req.argv
+        assert req.argv[req.argv.index("--sandbox") + 1] == "workspace-write"
+        assert "--skip-git-repo-check" in req.argv
+        assert req.required_tools == ["codex"]
+
+    def test_build_request_model_override_from_env(
+        self,
+        codex_spawner: CodexSpawner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """MAESTRO_CODEX_MODEL overrides the default model passed to -m."""
+        monkeypatch.setenv("MAESTRO_CODEX_MODEL", "gpt-5-codex")
+        req = codex_spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
+        assert req.argv[req.argv.index("-m") + 1] == "gpt-5-codex"
+
+    def test_build_request_routed_model_beats_env(
+        self,
+        codex_spawner: CodexSpawner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Precedence routed > env: routed model overrides MAESTRO_CODEX_MODEL."""
+        monkeypatch.setenv("MAESTRO_CODEX_MODEL", "env-model")
+        req = codex_spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+            model="routed-model",
+        )
+        assert req.argv[req.argv.index("-m") + 1] == "routed-model"
+
+    def test_build_request_emits_model_resolved_source(
+        self,
+        codex_spawner: CodexSpawner,
+        catalog_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """agent.model_resolved reports the correct source for each origin."""
+        from structlog.testing import capture_logs
+
+        from maestro.catalog import load_catalog
+
+        with capture_logs() as logs:
+            codex_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+                model="routed-x",
+            )
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "routed"
+        assert ev["model"] == "routed-x"
+        assert ev["harness"] == "codex_cli"
+
+        monkeypatch.setenv("MAESTRO_CODEX_MODEL", "env-y")
+        with capture_logs() as logs:
+            codex_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+            )
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "env"
+        assert ev["model"] == "env-y"
+
+        monkeypatch.delenv("MAESTRO_CODEX_MODEL", raising=False)
+        with capture_logs() as logs:
+            codex_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+            )
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "catalog"
+        cat = load_catalog()
+        assert cat is not None
+        assert ev["model"] == cat.default_model_for_harness("codex_cli")
+
+    def test_build_request_routed_model_halts_on_malformed_catalog(
+        self,
+        codex_spawner: CodexSpawner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A routed model can't dodge a malformed catalog (halt is global)."""
+        from maestro.catalog import CatalogMalformed
+
+        fixture = Path(__file__).parent / "fixtures" / "agents-catalog-malformed.toml"
+        monkeypatch.setenv("ATP_CATALOG", str(fixture))
+
+        with pytest.raises(CatalogMalformed):
+            codex_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+                model="routed-x",
+            )
+
 
 # =============================================================================
 # Unit Tests: _qualify (opencode model prefix)
@@ -363,6 +496,152 @@ class TestOpencodeSpawner:
     def test_agent_type(self, opencode_spawner: OpencodeSpawner) -> None:
         """Test that agent_type returns correct value."""
         assert opencode_spawner.agent_type == "opencode"
+
+    def test_build_request_uses_catalog_default_qualified(
+        self,
+        opencode_spawner: OpencodeSpawner,
+        catalog_env: Path,
+    ) -> None:
+        """Catalog default resolves and is provider-qualified on the argv."""
+        req = opencode_spawner.build_request(
+            _mk_task(),
+            context="ctx",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
+        assert req.argv[0] == "opencode"
+        assert req.argv[1] == "run"
+        assert "--format" in req.argv
+        assert req.argv[req.argv.index("--format") + 1] == "json"
+        # Fixture catalog default glm-5.1, prefixed for the CLI:
+        assert req.argv[req.argv.index("-m") + 1] == "opencode/glm-5.1"
+        assert req.required_tools == ["opencode"]
+
+    def test_build_request_model_override_from_env(
+        self,
+        opencode_spawner: OpencodeSpawner,
+        catalog_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """MAESTRO_OPENCODE_MODEL overrides the catalog default."""
+        monkeypatch.setenv("MAESTRO_OPENCODE_MODEL", "qwen3.6")
+        req = opencode_spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
+        assert req.argv[req.argv.index("-m") + 1] == "opencode/qwen3.6"
+
+    def test_build_request_routed_model_beats_env(
+        self,
+        opencode_spawner: OpencodeSpawner,
+        catalog_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Precedence routed > env: routed model overrides MAESTRO_OPENCODE_MODEL."""
+        monkeypatch.setenv("MAESTRO_OPENCODE_MODEL", "env-model")
+        req = opencode_spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+            model="glm-5.1",
+        )
+        assert req.argv[req.argv.index("-m") + 1] == "opencode/glm-5.1"
+
+    def test_build_request_provider_qualified_routed_model_not_double_prefixed(
+        self,
+        opencode_spawner: OpencodeSpawner,
+        catalog_env: Path,
+    ) -> None:
+        """A routed 'provider/model' id passes through _qualify unchanged."""
+        req = opencode_spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+            model="zai/glm-5.1",
+        )
+        assert req.argv[req.argv.index("-m") + 1] == "zai/glm-5.1"
+
+    def test_build_request_emits_model_resolved_source(
+        self,
+        opencode_spawner: OpencodeSpawner,
+        catalog_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """agent.model_resolved reports the correct source for each origin."""
+        from structlog.testing import capture_logs
+
+        from maestro.catalog import load_catalog
+
+        with capture_logs() as logs:
+            opencode_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+                model="routed-x",
+            )
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "routed"
+        assert ev["model"] == "routed-x"
+        assert ev["harness"] == "opencode"
+
+        monkeypatch.setenv("MAESTRO_OPENCODE_MODEL", "env-y")
+        with capture_logs() as logs:
+            opencode_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+            )
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "env"
+        assert ev["model"] == "env-y"
+
+        monkeypatch.delenv("MAESTRO_OPENCODE_MODEL", raising=False)
+        with capture_logs() as logs:
+            opencode_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+            )
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "catalog"
+        cat = load_catalog()
+        assert cat is not None
+        assert ev["model"] == cat.default_model_for_harness("opencode")
+
+    def test_build_request_routed_model_halts_on_malformed_catalog(
+        self,
+        opencode_spawner: OpencodeSpawner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A routed model can't dodge a malformed catalog (halt is global)."""
+        from maestro.catalog import CatalogMalformed
+
+        fixture = Path(__file__).parent / "fixtures" / "agents-catalog-malformed.toml"
+        monkeypatch.setenv("ATP_CATALOG", str(fixture))
+
+        with pytest.raises(CatalogMalformed):
+            opencode_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+                model="routed-x",
+            )
 
 
 # =============================================================================
@@ -427,6 +706,100 @@ def test_claude_build_request_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     assert req.required_tools == ["claude"]
     assert req.workdir == Path("/tmp/wd")
     assert req.log_path == Path("/tmp/wd/t1.log")
+
+
+def test_claude_build_request_routed_model_beats_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Precedence routed > env: routed model overrides MAESTRO_CLAUDE_MODEL."""
+    monkeypatch.setenv("MAESTRO_CLAUDE_MODEL", "env-model")
+    req = ClaudeCodeSpawner().build_request(
+        _mk_task(),
+        context="",
+        workdir=Path("/tmp/wd"),
+        log_file=Path("/tmp/wd/t1.log"),
+        run_id="run-1",
+        model="routed-model",
+    )
+    assert req.argv[req.argv.index("--model") + 1] == "routed-model"
+
+
+def test_claude_build_request_emits_model_resolved_source(
+    catalog_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """agent.model_resolved reports the correct source for each origin."""
+    from structlog.testing import capture_logs
+
+    from maestro.catalog import load_catalog
+
+    spawner = ClaudeCodeSpawner()
+
+    with capture_logs() as logs:
+        spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+            model="routed-x",
+        )
+    ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+    assert ev["source"] == "routed"
+    assert ev["model"] == "routed-x"
+    assert ev["harness"] == "claude_code"
+
+    monkeypatch.setenv("MAESTRO_CLAUDE_MODEL", "env-y")
+    with capture_logs() as logs:
+        spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
+    ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+    assert ev["source"] == "env"
+    assert ev["model"] == "env-y"
+
+    monkeypatch.delenv("MAESTRO_CLAUDE_MODEL", raising=False)
+    with capture_logs() as logs:
+        spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
+    ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+    assert ev["source"] == "catalog"
+    cat = load_catalog()
+    assert cat is not None
+    assert ev["model"] == cat.default_model_for_harness("claude_code")
+
+
+def test_claude_build_request_routed_model_halts_on_malformed_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routed model can't dodge a malformed catalog.
+
+    load_catalog() runs before resolve_model() in build_request(), so even a
+    routed task halts when $ATP_CATALOG points at a malformed file.
+    """
+    from maestro.catalog import CatalogMalformed
+
+    fixture = Path(__file__).parent / "fixtures" / "agents-catalog-malformed.toml"
+    monkeypatch.setenv("ATP_CATALOG", str(fixture))
+
+    with pytest.raises(CatalogMalformed):
+        ClaudeCodeSpawner().build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+            model="routed-x",
+        )
 
 
 def test_announce_build_request_argv() -> None:
