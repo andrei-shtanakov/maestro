@@ -10,6 +10,7 @@ from maestro.coordination.arbiter_client import (
     _current_traceparent,
 )
 
+
 _TRACEPARENT_RE = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
 
 

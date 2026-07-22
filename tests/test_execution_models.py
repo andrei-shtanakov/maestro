@@ -3,9 +3,9 @@ from pathlib import Path
 
 from maestro.execution.models import (
     CollectPolicy,
+    ExecutionHandleRef,
     ExecutionRequest,
     ExecutionResult,
-    ExecutionHandleRef,
 )
 
 

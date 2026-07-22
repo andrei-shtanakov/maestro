@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 from maestro.execution.local import LocalBackend, build_local_env
