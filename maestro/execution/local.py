@@ -150,6 +150,14 @@ class LocalBackend:
             if log_fd is not None:
                 os.close(log_fd)
             raise
+        if log_fd is not None:
+            # The child inherited its own dup of the fd when spawned above;
+            # the parent's copy must be closed here or it leaks (the
+            # scheduler's normal completion path never calls
+            # wait()/terminate()/kill()/cleanup()). Matches the old
+            # spawn()'s `finally: os.close(fd)` behavior.
+            os.close(log_fd)
+            log_fd = None
         if req.stdin is not None and proc.stdin is not None:
             proc.stdin.write(req.stdin.encode("utf-8"))
             proc.stdin.close()

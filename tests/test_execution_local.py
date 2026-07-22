@@ -1,7 +1,19 @@
+import asyncio
 from pathlib import Path
+
+import pytest
 
 from maestro.execution.local import LocalBackend, build_local_env
 from maestro.execution.models import CollectPolicy, ExecutionRequest
+
+
+def _open_fd_count() -> int | None:
+    """Return the current process's open fd count, or None if unsupported."""
+    for fd_dir in ("/dev/fd", "/proc/self/fd"):
+        path = Path(fd_dir)
+        if path.is_dir():
+            return len(list(path.iterdir()))
+    return None
 
 
 def _req(tmp_path: Path, argv: list[str], **kw) -> ExecutionRequest:
@@ -31,6 +43,42 @@ async def test_run_nonzero_exit(tmp_path):
     handle = await backend.run(_req(tmp_path, ["sh", "-c", "exit 3"]))
     result = await handle.wait()
     assert result.exit_code == 3
+
+
+async def test_run_completion_does_not_leak_parent_log_fd(tmp_path):
+    """Regression test for the Mode 1 fd leak (final-review blocking bug).
+
+    The scheduler's normal completion path only does:
+        handle = await backend.run(req)
+        ... poll handle.poll() until it is not None ...
+    It never calls wait()/terminate()/kill()/cleanup(). Before the fix,
+    LocalBackend.run() kept the parent's copy of the log fd open on the
+    non-capture path, and only _close_log() (invoked from those other
+    methods) ever closed it — so every completed task leaked one fd.
+    """
+    if _open_fd_count() is None:
+        pytest.skip("no /dev/fd or /proc/self/fd on this platform")
+
+    backend = LocalBackend()
+    before = _open_fd_count()
+    assert before is not None
+    num_tasks = 15
+    for i in range(num_tasks):
+        req = _req(tmp_path, ["sh", "-c", f"echo task-{i}; exit 0"])
+        handle = await backend.run(req)
+        # Poll (scheduler style) until the process has exited, without ever
+        # calling wait()/cleanup()/kill()/terminate().
+        for _ in range(200):
+            if handle.poll() is not None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("subprocess did not exit in time")
+    after = _open_fd_count()
+    assert after is not None
+
+    # Allow a tiny slack for loop/watcher fds; pre-fix this leaked ~15.
+    assert after <= before + 1, f"fd leak detected: before={before} after={after}"
 
 
 async def test_capture_output_populates_tails(tmp_path):
