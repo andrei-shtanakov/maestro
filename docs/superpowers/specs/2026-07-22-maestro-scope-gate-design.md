@@ -83,10 +83,12 @@ async def changed_paths_since(
     """The workstream's OWN committed changes, from its branch-point.
 
     merge_base = `git merge-base base_ref head_ref`
-    paths      = `git diff --no-renames --name-only <merge_base> <head_ref>`
+    paths      = `git diff --no-renames -z --name-only <merge_base> <head_ref>`
 
     Orchestrator-managed artifacts filtered out; normalized to repo-relative
-    POSIX paths.
+    POSIX paths. Output is NUL-split (`-z`) rather than line-split, so paths
+    containing newlines/control chars parse correctly (cheap robustness; not a
+    scenario current scopes rely on).
     """
 ```
 
@@ -171,21 +173,37 @@ from `GateKeeper`, which is opt-in. It is an intentional behavior change:
 workstreams whose committed diff escapes their declared scope now block by
 default. Workstreams with correct/loose scopes are unaffected.
 
-**On escape:** `RUNNING → NEEDS_REVIEW`, worktree left **intact** for
-inspection, `error_message = "scope escape: <paths>"` (see §5.1). Stats mirror
-the existing ex-post block path (`stats.failed += 1`).
+**On escape:** `RUNNING → FAILED → NEEDS_REVIEW` — the same two-step arc the
+existing ex-post block path uses (`_gate_ex_post` writes `FAILED` then
+`NEEDS_REVIEW`), so recovery and stats behave identically (`stats.failed += 1`).
+The worktree is left **intact** for inspection. The `error_message` MUST carry
+the approval marker (see §5.1) — without it the override cannot be recorded.
 
 The steward ex-post gate is untouched; its own risk-model `scope_violation` flag
 now sits above a deterministic floor. Independent sources — acceptable
 redundancy.
 
-### 5.1 Message length
+### 5.1 Block reason & approval marker
 
-The `error_message` is truncated for readability:
+The block reason is **marker-bearing**. `maestro workstream-approve` records a
+durable approval only when `error_message` contains the marker parsed by
+`gates.parse_approval_marker()` — format
+`gates:approval-required phase=<phase> sha=<sha>` (`APPROVAL_MARKER_PREFIX`).
+Without it, approval is a plain requeue that records nothing, and the H-6 resume
+loops forever on the same escape. So the scope-gate emits:
 
 ```
-scope escape: a.py, b.py, c.py, ... (+N more)
+scope escape: a.py, b.py, c.py, ... (+N more); re-queue to approve. gates:approval-required phase=ex_post sha=<worktree-head-sha>
 ```
+
+- **Truncation applies to the path list only, never the marker** — the marker
+  is mandatory and always complete. `N` counts the omitted paths.
+- Marker construction/parsing is **shared with `GateKeeper`**, not a second
+  format: reuse `APPROVAL_MARKER_PREFIX` / `parse_approval_marker` (moving the
+  marker helpers to a neutral module, e.g. `maestro/gate_approvals.py`, is
+  acceptable if it avoids a `scope_gate → gates` import edge).
+- The `sha` is the worktree HEAD, matching the `(ex_post, sha)` key the resume
+  check (§5.2) and the approval store use.
 
 The **full** escape list is emitted via the orchestrator's structured logger
 (always available, independent of whether `GateKeeper`/steward is configured),
@@ -204,7 +222,7 @@ if (phase="ex_post", sha) in approvals:   # operator already waived this sha
 else:
     paths = await changed_paths_since(base, HEAD, worktree)
     escapes = find_escapes(paths, scope)
-    if escapes: block -> NEEDS_REVIEW
+    if escapes: block (FAILED -> NEEDS_REVIEW, marker-bearing reason)
 ```
 
 This avoids a wasted `git diff` on every H-6 resume. `list_gate_approvals` is
@@ -216,7 +234,11 @@ namespace* — never globally.
 Reuse the existing gate-approval + H-6 machinery — no new tables, no
 reason-specific approvals in this PR:
 
-- `maestro workstream-approve <ws>` records an approval in `gate_approvals`.
+- `maestro workstream-approve <ws>` records an approval in `gate_approvals`
+  **only when the stored `error_message` carries the approval marker** (§5.1);
+  `parse_approval_marker` supplies the `(phase, sha)` written. This is why the
+  scope-gate block reason must embed the marker — otherwise approval is a plain
+  requeue that records nothing.
   **DB key is `(workstream_id, phase, sha)`** (`UNIQUE` constraint); the gate
   receives a per-workstream set via `list_gate_approvals(workstream_id)` and
   checks `(phase, sha)` *inside that per-workstream namespace*. An approval for
@@ -291,7 +313,12 @@ enforcement is a deterministic safety invariant, not an option. Fewer surfaces.
 
 **Integration:**
 
-- escape → `NEEDS_REVIEW` + worktree intact; `stats.failed` incremented.
+- escape → `FAILED → NEEDS_REVIEW` + worktree intact; `stats.failed`
+  incremented.
+- **marker round-trip (blocker regression):** on escape, `error_message`
+  contains a well-formed `gates:approval-required phase=ex_post sha=<sha>`
+  marker; `maestro workstream-approve` then records `{("ex_post", sha)}` in
+  `gate_approvals`; the resume skips the scope-gate and reaches `DONE`.
 - approve → resume → `DONE` (H-6), no redundant diff on resume (§5.2).
 - always-on when `config.gates is None`.
 - **per-workstream approval isolation:** an `(ex_post, sha)` approval for
