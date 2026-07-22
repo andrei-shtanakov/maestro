@@ -91,7 +91,7 @@ class SpawnerResponder:
         request = self._spawner.build_request(
             task, "", self._workdir, log_file, task_id
         )
-        request = request.model_copy(update={"timeout_seconds": int(self._timeout)})
+        request = request.model_copy(update={"timeout_seconds": self._timeout})
 
         handle = await self._backend.run(request)
         result = await handle.wait()

@@ -380,3 +380,62 @@ async def test_responder_unknown_agent_type_short_circuits(tmp_path) -> None:
     assert response.error is not None
     assert "unknown agent_type" in response.error
     assert spawner.build_request_calls == []  # never reached build_request
+
+
+class _RealArgvSpawner(AgentSpawner):
+    """Builds a request with a real (non-labels-encoded) argv, so it can be
+    driven by the real ``LocalBackend`` instead of ``FakeBackend`` — needed
+    to exercise the genuine ``asyncio.wait_for`` timeout path.
+    """
+
+    @property
+    def agent_type(self) -> str:
+        return "claude_code"
+
+    def build_request(
+        self,
+        task: Task,
+        context: str,
+        workdir: Path,
+        log_file: Path,
+        run_id: str,
+        retry_context: str = "",
+        *,
+        model: str | None = None,
+    ) -> ExecutionRequest:
+        return ExecutionRequest(
+            run_id=run_id,
+            argv=["sh", "-c", "sleep 0.05; echo done"],
+            workdir=workdir,
+            log_path=log_file,
+            collect=CollectPolicy(mode="none"),
+        )
+
+
+@pytest.mark.anyio
+async def test_responder_preserves_fractional_timeout_end_to_end(tmp_path) -> None:
+    """A sub-second fractional ``--timeout`` must survive to
+    ``ExecutionRequest.timeout_seconds`` without truncating to 0.
+
+    Regression for a bug where the responder did
+    ``model_copy(update={"timeout_seconds": int(self._timeout)})``: a
+    fractional timeout like 0.3s truncated to ``0``, and
+    ``asyncio.wait_for(coro, timeout=0)`` fires (almost) immediately —
+    so a task that actually finishes in ~50ms would incorrectly come
+    back as ``error="timeout"``. With the fix (no truncation), the task
+    finishes well within the 0.3s budget and reports success.
+    """
+    from maestro.execution.local import LocalBackend
+
+    responder = SpawnerResponder(
+        spawner=_RealArgvSpawner(),
+        workdir=tmp_path,
+        log_dir=tmp_path,
+        timeout_seconds=0.3,
+        backend=LocalBackend(),
+    )
+
+    response = await responder.respond("irrelevant prompt")
+
+    assert response.error is None
+    assert "done" in response.text
