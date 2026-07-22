@@ -907,55 +907,11 @@ class Orchestrator:
         await self._handle_success(workstream.id, workspace)
         return True
 
-    async def _gate_scope(
-        self,
-        workstream_id: str,
-        workstream: Workstream,
-        workspace_path: Path,
-    ) -> bool:
-        """Deterministic always-on scope containment (ex-post edge).
+    async def _route_scope_block(self, workstream_id: str, reason: str) -> bool:
+        """Fail-closed RUNNING -> FAILED -> NEEDS_REVIEW for the scope gate.
 
-        The workstream's own committed diff must touch only paths matched by
-        its declared scope. Escapes block RUNNING -> FAILED -> NEEDS_REVIEW
-        with a marker-bearing reason. Empty scope skips.
+        The worktree is left intact for inspection. Returns False (blocked).
         """
-        scope = workstream.scope
-        if not scope:
-            return True
-        head = await self._workspace_head(workspace_path)
-        if head is None:
-            reason = "scope-gate: cannot read worktree HEAD"
-            self._logger.warning("%s for '%s'", reason, workstream_id)
-            await self._db.update_workstream_status(
-                workstream_id,
-                WorkstreamStatus.FAILED,
-                expected_status=WorkstreamStatus.RUNNING,
-                error_message=reason,
-            )
-            await self._db.update_workstream_status(
-                workstream_id,
-                WorkstreamStatus.NEEDS_REVIEW,
-                expected_status=WorkstreamStatus.FAILED,
-                error_message=reason,
-            )
-            self._stats.failed += 1
-            return False
-        approvals = await self._db.list_gate_approvals(workstream_id)
-        if ("ex_post", head) in approvals:
-            return True
-        paths = await changed_paths_since(
-            self._config.base_branch, "HEAD", workspace_path
-        )
-        escapes = find_escapes(normalize(paths), normalize(scope))
-        if not escapes:
-            return True
-        self._logger.warning(
-            "scope escape in '%s' (%d paths): %s",
-            workstream_id,
-            len(escapes),
-            escapes,  # FULL list to structured log
-        )
-        reason = build_scope_escape_reason(escapes, head)
         await self._db.update_workstream_status(
             workstream_id,
             WorkstreamStatus.FAILED,
@@ -970,6 +926,54 @@ class Orchestrator:
         )
         self._stats.failed += 1
         return False
+
+    async def _gate_scope(
+        self,
+        workstream_id: str,
+        workstream: Workstream,
+        workspace_path: Path,
+    ) -> bool:
+        """Deterministic always-on scope containment (ex-post edge).
+
+        The workstream's own committed diff must touch only paths matched by
+        its declared scope. Escapes block RUNNING -> FAILED -> NEEDS_REVIEW
+        with a marker-bearing reason. Empty scope skips. Infrastructure
+        failures (unreadable HEAD, a git error computing the diff) fail closed
+        to NEEDS_REVIEW with a marker-less reason -- containment could not be
+        evaluated, so the operator must fix the worktree rather than approve.
+        """
+        scope = workstream.scope
+        if not scope:
+            return True
+        head = await self._workspace_head(workspace_path)
+        if head is None:
+            reason = "scope-gate: cannot read worktree HEAD"
+            self._logger.warning("%s for '%s'", reason, workstream_id)
+            return await self._route_scope_block(workstream_id, reason)
+        approvals = await self._db.list_gate_approvals(workstream_id)
+        if ("ex_post", head) in approvals:
+            return True
+        try:
+            paths = await changed_paths_since(
+                self._config.base_branch, "HEAD", workspace_path
+            )
+        except RuntimeError as exc:
+            reason = f"scope-gate: cannot compute changed paths: {exc}"
+            self._logger.warning("%s for '%s'", reason, workstream_id)
+            return await self._route_scope_block(workstream_id, reason)
+        # changed_paths_since already returns normalized paths; only the
+        # declared scope patterns still need normalizing.
+        escapes = find_escapes(paths, normalize(scope))
+        if not escapes:
+            return True
+        self._logger.warning(
+            "scope escape in '%s' (%d paths): %s",
+            workstream_id,
+            len(escapes),
+            escapes,  # FULL list to structured log
+        )
+        reason = build_scope_escape_reason(escapes, head)
+        return await self._route_scope_block(workstream_id, reason)
 
     async def _gate_ex_post(
         self,

@@ -323,6 +323,44 @@ async def test_existing_approval_skips_without_diffing(
 
 
 @pytest.mark.anyio
+async def test_git_error_fails_closed_to_needs_review(
+    tmp_path: Path,
+    mock_workspace_mgr: MagicMock,
+    mock_decomposer: MagicMock,
+    mock_pr_manager: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A git failure computing the diff fails closed to NEEDS_REVIEW, never
+    bubbles out to crash the orchestrator loop."""
+    orch, db, ws_id, worktree = await _build_single(
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        scope=["src/**"],
+        changed=["src/a.py"],
+    )
+    try:
+        import maestro.orchestrator as om
+
+        async def boom(*args: object, **kwargs: object) -> list[str]:
+            raise RuntimeError("git merge-base failed: bad ref")
+
+        monkeypatch.setattr(om, "changed_paths_since", boom)
+
+        ok = await orch._gate_scope(ws_id, await db.get_workstream(ws_id), worktree)
+        assert ok is False
+        ws = await db.get_workstream(ws_id)
+        assert ws.status == WorkstreamStatus.NEEDS_REVIEW
+        assert ws.error_message is not None
+        assert "cannot compute changed paths" in ws.error_message
+        assert orch._stats.failed == 1
+        assert worktree.exists()  # worktree intact for inspection
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
 async def test_approval_for_ws_a_does_not_waive_ws_b(
     tmp_path: Path,
     mock_workspace_mgr: MagicMock,

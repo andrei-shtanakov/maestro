@@ -40,8 +40,12 @@ class ApprovalMarker(BaseModel):
     sha: str
 
 
-def build_approval_marker(phase: str, sha: str) -> str:
-    """Render the durable approval marker embedded in a block reason."""
+def build_approval_marker(phase: Literal["ex_ante", "ex_post"], sha: str) -> str:
+    """Render the durable approval marker embedded in a block reason.
+
+    ``phase`` is constrained to the two parseable values so type-checking
+    rejects a marker that ``parse_approval_marker`` could never match.
+    """
     return f"{APPROVAL_MARKER_PREFIX} phase={phase} sha={sha}"
 
 
