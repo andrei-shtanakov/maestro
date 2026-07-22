@@ -1,4 +1,32 @@
-from maestro.scope_gate import find_escapes, normalize
+from maestro.gate_approvals import parse_approval_marker
+from maestro.scope_gate import build_scope_escape_reason, find_escapes, normalize
+
+
+def test_reason_is_parseable_by_approval_marker():
+    reason = build_scope_escape_reason(["a.py", "b.py"], "deadbeef")
+    marker = parse_approval_marker(reason)
+    assert marker is not None
+    assert marker.phase == "ex_post"
+    assert marker.sha == "deadbeef"
+
+
+def test_reason_truncates_paths_but_keeps_marker():
+    reason = build_scope_escape_reason(
+        ["a.py", "b.py", "c.py", "d.py", "e.py"], "cafe1234", max_paths=3
+    )
+    assert "a.py, b.py, c.py" in reason
+    assert "(+2 more)" in reason
+    assert "d.py" not in reason
+    # marker survives truncation intact
+    marker = parse_approval_marker(reason)
+    assert marker is not None
+    assert marker.sha == "cafe1234"
+
+
+def test_reason_without_truncation_lists_all():
+    reason = build_scope_escape_reason(["a.py"], "sha1")
+    assert "(+0 more)" not in reason
+    assert "more)" not in reason
 
 
 def test_exact_match_is_in_scope():

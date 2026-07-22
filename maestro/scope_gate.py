@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import re
 
+from maestro.gate_approvals import build_approval_marker
+
 
 def normalize(paths: list[str]) -> list[str]:
     """Normalize to repo-relative POSIX form: backslash->slash, strip './'."""
@@ -62,3 +64,19 @@ def find_escapes(changed_paths: list[str], scope: list[str]) -> list[str]:
         return []
     matchers = [_glob_to_regex(p) for p in scope]
     return [path for path in changed_paths if not any(m.match(path) for m in matchers)]
+
+
+def build_scope_escape_reason(
+    escapes: list[str], sha: str, *, max_paths: int = 3
+) -> str:
+    """Marker-bearing block reason for a scope escape.
+
+    Truncates only the path list (never the marker), so
+    `workstream-approve` can always record the `(ex_post, sha)` approval.
+    """
+    shown = escapes[:max_paths]
+    listing = ", ".join(shown)
+    if len(escapes) > max_paths:
+        listing += f", ... (+{len(escapes) - max_paths} more)"
+    marker = build_approval_marker("ex_post", sha)
+    return f"scope escape: {listing}; re-queue to approve. {marker}"
