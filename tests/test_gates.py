@@ -272,6 +272,44 @@ async def test_ex_post_scope_violation_blocks(
     assert not decision.allow
 
 
+async def test_evaluate_ex_post_uses_branch_point_no_false_escape(tmp_path):
+    """Base advanced by a sibling commit must not appear in ex-post diff paths."""
+    import asyncio
+
+    from maestro.changed_paths import changed_paths_since
+
+    async def g(repo, *a):
+        p = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(repo),
+            *a,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        o, e = await p.communicate()
+        assert p.returncode == 0, e.decode()
+        return o.decode()
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    await g(repo, "init", "-b", "main")
+    await g(repo, "config", "user.email", "t@t.t")
+    await g(repo, "config", "user.name", "t")
+    (repo / "a.py").write_text("1\n")
+    await g(repo, "add", "-A")
+    await g(repo, "commit", "-m", "0")
+    await g(repo, "checkout", "-b", "feature")
+    (repo / "mine.py").write_text("m\n")
+    await g(repo, "add", "-A")
+    await g(repo, "commit", "-m", "f")
+    await g(repo, "checkout", "main")
+    (repo / "sibling.py").write_text("s\n")
+    await g(repo, "add", "-A")
+    await g(repo, "commit", "-m", "s")
+    assert await changed_paths_since("main", "feature", repo) == ["mine.py"]
+
+
 def _branch_with_change(repo: Path, rel: str, content: str) -> Path:
     env = {
         **os.environ,
@@ -676,7 +714,12 @@ def test_workstream_approve_takes_effect_in_next_gate_evaluation(
 
 
 class TestOrchestratorManagedNarrowing:
-    """gates v1.2 (H-7): only maestro-namespaced artifacts are infra."""
+    """gates v1.2 (H-7): only maestro-namespaced artifacts are infra.
+
+    `_orchestrator_managed` moved to `maestro.changed_paths` (Task 4) — this
+    class now exercises it there, since `changed_paths_since` is the sole
+    caller after `GateKeeper.evaluate_ex_post` was rewired to delegate to it.
+    """
 
     @pytest.mark.parametrize(
         "path",
@@ -691,7 +734,7 @@ class TestOrchestratorManagedNarrowing:
         ],
     )
     def test_harness_paths_excluded(self, path: str) -> None:
-        from maestro.gates import _orchestrator_managed
+        from maestro.changed_paths import _orchestrator_managed
 
         assert _orchestrator_managed(path) is True
 
@@ -706,7 +749,7 @@ class TestOrchestratorManagedNarrowing:
         ],
     )
     def test_target_repo_paths_visible(self, path: str) -> None:
-        from maestro.gates import _orchestrator_managed
+        from maestro.changed_paths import _orchestrator_managed
 
         assert _orchestrator_managed(path) is False
 

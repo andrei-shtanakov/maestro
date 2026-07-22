@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from maestro._vendor.obs import current_pipeline_id
+from maestro.changed_paths import changed_paths_since
 from maestro.gate_approvals import (
     APPROVAL_MARKER_PREFIX,
     BLOCK_REASON_PREFIX,
@@ -48,7 +49,6 @@ from maestro.gate_approvals import (
     parse_approval_marker,
     preserve_approval_marker,
 )
-from maestro.models import SPEC_PREFIX
 
 
 if TYPE_CHECKING:
@@ -66,26 +66,6 @@ __all__ = [
     "pipeline_log_dir",
     "preserve_approval_marker",
 ]
-
-# Paths Maestro itself materializes in the worktree (spec generation +
-# executor runtime state); they are infra, not the agent's change —
-# excluded from ex-post classification and the declared-scope check
-# (H-4, narrowed in gates v1.2/H-7). Deliberately NOT excluded:
-# `spec-runner.config.yaml` — in a repo that tracks its own config,
-# Maestro's overwrite must surface as a scope violation (fail-closed
-# backstop); in a repo without one the file is untracked+ignored and
-# never enters the diff. `spec/.{prefix}` covers the dot-before-prefix
-# harness files (task-history, spec lock) spec-runner writes (H-8).
-_ORCHESTRATOR_MANAGED = (
-    f"spec/{SPEC_PREFIX}",
-    f"spec/.{SPEC_PREFIX}",
-    "spec/.executor-",
-)
-
-
-def _orchestrator_managed(path: str) -> bool:
-    return path.startswith(_ORCHESTRATOR_MANAGED)
-
 
 _STEWARD_ENV = "MAESTRO_STEWARD_BIN"
 
@@ -197,11 +177,7 @@ class GateKeeper:
     ) -> GateDecision:
         """Guard for RUNNING -> MERGING: classify the actual diff vs base."""
         sha = await self._git_sha(workspace)
-        paths = [
-            p
-            for p in await self._git_diff_paths(workspace)
-            if not _orchestrator_managed(p)
-        ]
+        paths = await changed_paths_since(self._base_branch, "HEAD", workspace)
         payload = {
             "project": self._project,
             "sha": sha,
@@ -401,10 +377,6 @@ class GateKeeper:
     async def _git_sha(self, repo: Path) -> str:
         out = await self._git(repo, "rev-parse", "HEAD")
         return out.strip()
-
-    async def _git_diff_paths(self, repo: Path) -> list[str]:
-        out = await self._git(repo, "diff", "--name-only", f"{self._base_branch}..HEAD")
-        return [line for line in out.splitlines() if line]
 
     @staticmethod
     async def _git(repo: Path, *args: str) -> str:
