@@ -201,7 +201,7 @@ class ExecutionRequest(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     secret_env: list[str] = Field(default_factory=list)
     inherit_env: bool = False
-    timeout_seconds: int | None = None
+    timeout_seconds: float | None = None
     capture_output: bool = False
     collect: CollectPolicy
     progress_mirror: ProgressMirrorPolicy | None = None

@@ -81,7 +81,7 @@ class ExecutionRequest(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)          # explicit, non-secret
     secret_env: list[str] = Field(default_factory=list)        # allowlist of NAMES from center env
     inherit_env: bool = False                # True honored only by LocalBackend
-    timeout_seconds: int | None = None
+    timeout_seconds: float | None = None     # seconds; float preserves sub-second timeouts
     capture_output: bool = False             # also capture stdout/stderr tails into ExecutionResult
     collect: CollectPolicy                   # terminal: apply remote file changes back (see §5)
     progress_mirror: ProgressMirrorPolicy | None = None        # live, during-run mirror (see §11)
@@ -102,10 +102,12 @@ class ProgressMirrorPolicy(BaseModel):       # LIVE, runs concurrently with the 
     interval_seconds: float
 
 class ExecutionResult(BaseModel):
-    exit_code: int
+    exit_code: int | None                    # None on timeout / failure-to-start
     stdout_tail: str = ""                    # populated iff capture_output (§9 validation retry context)
     stderr_tail: str = ""
     output_log_path: Path                    # always; full merged stream on the center
+    timed_out: bool = False
+    error_message: str | None = None
 
 class ExecutionHandleRef(BaseModel):         # persisted; survives center restart
     backend_id: str

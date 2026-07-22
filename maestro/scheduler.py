@@ -1015,9 +1015,10 @@ class Scheduler:
             )
             raise SchedulerError(msg)
 
-        # Span scope covers the actual spawn so the spawner subprocess
-        # inherits this span as TRACEPARENT (via spawner.child_env()),
-        # giving cross-process trace continuity per the observability
+        # Span scope covers the actual spawn so the backend subprocess
+        # inherits this span as TRACEPARENT (via the execution backend's
+        # build_local_env()/child_env()), giving cross-process trace
+        # continuity per the observability
         # contract. Earlier returns (HOLD/REJECT/etc.) intentionally
         # stay outside the span — they don't launch a subprocess.
         with obs.span(
