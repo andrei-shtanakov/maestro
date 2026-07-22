@@ -2252,7 +2252,11 @@ class TestHandleSuccessMergeGating:
             id=zid,
             title=zid,
             description="d",
-            scope=["s"],
+            # Empty scope: these tests exercise merge gating with a
+            # MagicMock() workspace_path (no real worktree), so the new
+            # always-on `_gate_scope` (which needs a real `git` HEAD to
+            # diff) must skip rather than block on an unreadable HEAD.
+            scope=[],
             branch=f"feature/{zid}",
             status=WorkstreamStatus.RUNNING,
         )
@@ -2469,7 +2473,11 @@ class TestExPostResume:
             id=zid,
             title=zid,
             description="d",
-            scope=["s"],
+            # Empty scope: these resume tests use a mocked workspace_mgr
+            # path (no real worktree to diff), so the always-on
+            # `_gate_scope` must skip rather than fail trying to run `git`
+            # against a nonexistent directory.
+            scope=[],
             branch=f"feature/{zid}",
             status=WorkstreamStatus.READY,
             error_message=_ex_post_marker(sha),

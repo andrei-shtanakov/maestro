@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from maestro._vendor.obs import child_env, current_pipeline_id, span
+from maestro.changed_paths import changed_paths_since
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
 from maestro.execution.backend import TaskHandle
@@ -41,6 +42,7 @@ from maestro.models import (
     WorkstreamStatus,
 )
 from maestro.pr_manager import PRManager, PRManagerError
+from maestro.scope_gate import build_scope_escape_reason, find_escapes, normalize
 from maestro.spec_runner import read_executor_state
 from maestro.workspace import WorkspaceManager, ensure_harness_excludes
 
@@ -905,6 +907,70 @@ class Orchestrator:
         await self._handle_success(workstream.id, workspace)
         return True
 
+    async def _gate_scope(
+        self,
+        workstream_id: str,
+        workstream: Workstream,
+        workspace_path: Path,
+    ) -> bool:
+        """Deterministic always-on scope containment (ex-post edge).
+
+        The workstream's own committed diff must touch only paths matched by
+        its declared scope. Escapes block RUNNING -> FAILED -> NEEDS_REVIEW
+        with a marker-bearing reason. Empty scope skips.
+        """
+        scope = workstream.scope
+        if not scope:
+            return True
+        head = await self._workspace_head(workspace_path)
+        if head is None:
+            reason = "scope-gate: cannot read worktree HEAD"
+            self._logger.warning("%s for '%s'", reason, workstream_id)
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.FAILED,
+                expected_status=WorkstreamStatus.RUNNING,
+                error_message=reason,
+            )
+            await self._db.update_workstream_status(
+                workstream_id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=WorkstreamStatus.FAILED,
+                error_message=reason,
+            )
+            self._stats.failed += 1
+            return False
+        approvals = await self._db.list_gate_approvals(workstream_id)
+        if ("ex_post", head) in approvals:
+            return True
+        paths = await changed_paths_since(
+            self._config.base_branch, "HEAD", workspace_path
+        )
+        escapes = find_escapes(normalize(paths), normalize(scope))
+        if not escapes:
+            return True
+        self._logger.warning(
+            "scope escape in '%s' (%d paths): %s",
+            workstream_id,
+            len(escapes),
+            escapes,  # FULL list to structured log
+        )
+        reason = build_scope_escape_reason(escapes, head)
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.FAILED,
+            expected_status=WorkstreamStatus.RUNNING,
+            error_message=reason,
+        )
+        await self._db.update_workstream_status(
+            workstream_id,
+            WorkstreamStatus.NEEDS_REVIEW,
+            expected_status=WorkstreamStatus.FAILED,
+            error_message=reason,
+        )
+        self._stats.failed += 1
+        return False
+
     async def _gate_ex_post(
         self,
         workstream_id: str,
@@ -987,6 +1053,11 @@ class Orchestrator:
         Push branch, create PR, cleanup workspace.
         """
         workstream = await self._db.get_workstream(workstream_id)
+
+        # Deterministic scope containment (always-on, before the optional
+        # steward risk gate). Fail-fast on out-of-scope commits.
+        if not await self._gate_scope(workstream_id, workstream, workspace_path):
+            return
 
         # Gates (WS-006): ex-post guard over the actual diff (catches scope
         # violations and tier escalations the declared scope did not show).
