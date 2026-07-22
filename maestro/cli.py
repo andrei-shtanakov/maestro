@@ -112,6 +112,16 @@ _BENCH_CLI_BY_AGENT: dict[str, str] = {
 }
 
 
+def _agent_cli_available(agent: str) -> bool:
+    """Whether the agent's CLI binary is on PATH.
+
+    Mirrors the removed spawner ``is_available()``. Kept as a
+    module-level seam so tests can monkeypatch availability without
+    requiring the real CLI binary on PATH.
+    """
+    return shutil.which(_BENCH_CLI_BY_AGENT[agent]) is not None
+
+
 def _bench_spawner_for(agent: str) -> AgentSpawner:
     """Fresh spawner for a benchmark run. Module-level for test monkeypatching."""
     from maestro.spawners import (
@@ -1147,7 +1157,7 @@ def benchmark(
         raise typer.Exit(2)
 
     spawner = _bench_spawner_for(agent)
-    if shutil.which(_BENCH_CLI_BY_AGENT[agent]) is None:
+    if not _agent_cli_available(agent):
         err.print(f"[red]agent CLI '{escape(agent)}' not found in PATH[/red]")
         raise typer.Exit(1)
 

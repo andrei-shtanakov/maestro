@@ -1,5 +1,6 @@
 """Tests for `maestro benchmark` (R-06b M5)."""
 
+import shutil
 import sys
 from pathlib import Path
 from typing import ClassVar
@@ -104,6 +105,7 @@ def _reset_fakes(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         cli_mod, "_bench_spawner_for", lambda agent: FakeBenchSpawner(agent)
     )
+    monkeypatch.setattr(cli_mod, "_agent_cli_available", lambda _agent: True)
     monkeypatch.delenv("MAESTRO_ARBITER_BIN", raising=False)
     monkeypatch.delenv("MAESTRO_ATP_BASE_URL", raising=False)
 
@@ -134,6 +136,14 @@ class TestAgentValidation:
             cli_mod._BENCH_CLI_BY_AGENT,
             "claude_code",
             "definitely-not-a-real-cli-xyz",
+        )
+        # Override the autouse fixture's blanket True so this test genuinely
+        # exercises the real `shutil.which` PATH lookup (against a binary
+        # name that cannot exist) rather than the faked-available default.
+        monkeypatch.setattr(
+            cli_mod,
+            "_agent_cli_available",
+            lambda agent: shutil.which(cli_mod._BENCH_CLI_BY_AGENT[agent]) is not None,
         )
         result = runner.invoke(app, ["benchmark", "b1", "--agent", "claude_code"])
         assert result.exit_code == 1
