@@ -5,10 +5,9 @@ that logs the task details without running any AI agent. Useful for
 milestone markers, manual tasks, or notification-only entries in the DAG.
 """
 
-import os
-import subprocess
 from pathlib import Path
 
+from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.models import Task
 from maestro.spawners.base import AgentSpawner
 
@@ -27,51 +26,41 @@ class AnnounceSpawner(AgentSpawner):
         """Return the agent type identifier."""
         return "announce"
 
-    def is_available(self) -> bool:
-        """Always available since no external tool is required.
-
-        Returns:
-            Always True.
-        """
-        return True
-
-    def spawn(
+    def build_request(
         self,
         task: Task,
         context: str,
         workdir: Path,
         log_file: Path,
+        run_id: str,
         retry_context: str = "",
         *,
         model: str | None = None,  # noqa: ARG002 - kept for API consistency
-    ) -> subprocess.Popen[bytes]:
-        """Spawn a process that writes announcement to log and exits.
+    ) -> ExecutionRequest:
+        """Build a transport-agnostic ExecutionRequest for announcements.
 
-        Writes the built prompt (task details + context) to the log file
-        using echo, then exits with code 0.
+        Mirrors the argv built by ``spawn()``; the backend opens the log
+        file and spawns the process. ``echo`` is a shell builtin/coreutil
+        so it is not listed in ``required_tools``.
 
         Args:
             task: Task to announce.
             context: Context from completed dependencies.
             workdir: Working directory for the process.
             log_file: Path to write announcement output.
+            run_id: Unique identifier for this run.
             retry_context: Error context from previous failed attempt.
             model: Accepted for interface parity; unused (no model concept).
 
         Returns:
-            Subprocess handle for monitoring.
+            Transport-agnostic execution request.
         """
         prompt = self.build_prompt(task, context, retry_context)
-
-        fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-        try:
-            process = subprocess.Popen(
-                ["echo", prompt],
-                cwd=workdir,
-                stdout=fd,
-                stderr=subprocess.STDOUT,
-            )
-        finally:
-            os.close(fd)
-
-        return process
+        return ExecutionRequest(
+            run_id=run_id,
+            argv=["echo", prompt],
+            workdir=workdir,
+            log_path=log_file,
+            inherit_env=True,
+            collect=CollectPolicy(mode="none"),
+        )

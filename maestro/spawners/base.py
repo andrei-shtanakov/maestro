@@ -5,23 +5,11 @@ New agent types can be added by subclassing AgentSpawner and implementing
 the required methods.
 """
 
-import os
 from abc import ABC, abstractmethod
 from pathlib import Path
-from subprocess import Popen
 
-from maestro._vendor.obs import child_env
+from maestro.execution.models import ExecutionRequest
 from maestro.models import Task
-
-
-def spawn_env() -> dict[str, str]:
-    """Environment for a spawned agent subprocess.
-
-    Merges the current process environment with observability propagation
-    (`TRACEPARENT`, `ORCHESTRA_PIPELINE_ID`, `ORCHESTRA_LOG_DIR`) so the
-    child joins the pipeline trace if it initialises obs.
-    """
-    return {**os.environ, **child_env()}
 
 
 class AgentSpawner(ABC):
@@ -29,9 +17,8 @@ class AgentSpawner(ABC):
 
     All agent spawners must inherit from this class and implement
     the required abstract methods. The spawner is responsible for:
-    - Checking if the agent is available on the system
     - Building prompts with task details and context
-    - Spawning the agent process
+    - Building a transport-agnostic ExecutionRequest for the run
     """
 
     @property
@@ -45,42 +32,31 @@ class AgentSpawner(ABC):
         ...
 
     @abstractmethod
-    def is_available(self) -> bool:
-        """Check if this agent is installed and available.
-
-        Returns:
-            True if the agent executable is available, False otherwise.
-        """
-        ...
-
-    @abstractmethod
-    def spawn(
+    def build_request(
         self,
         task: Task,
         context: str,
         workdir: Path,
         log_file: Path,
+        run_id: str,
         retry_context: str = "",
         *,
         model: str | None = None,
-    ) -> Popen[bytes]:
-        """Spawn agent process.
+    ) -> ExecutionRequest:
+        """Build a transport-agnostic ExecutionRequest ('what to run').
 
-        Args:
-            task: Task to execute.
-            context: Context from completed dependencies.
-            workdir: Working directory for the process.
-            log_file: Path to write process output.
-            retry_context: Error context from previous failed attempt.
-            model: Routed model from the arbiter (``model_of_agent_id`` of
-                ``routed_agent_type``). ``None`` in scheduler mode; model-aware
-                spawners then fall back to env/default. Ignored by spawners with
-                no model concept (aider, announce).
-
-        Returns:
-            Subprocess handle for monitoring.
+        The backend (LocalBackend/SshBackend) owns spawning ('where/how').
         """
         ...
+
+    def can_build_request(self) -> bool:
+        """Whether this spawner can build a valid request locally.
+
+        Default True. Override for spawners with local config prerequisites.
+        This is NOT a tool-availability check — that is the backend's job
+        (`ExecutionBackend.can_run` probes required_tools on the executor).
+        """
+        return True
 
     def build_prompt(
         self,

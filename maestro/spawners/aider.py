@@ -4,13 +4,11 @@ This module provides the AiderSpawner for running the Aider AI pair
 programming tool in non-interactive mode.
 """
 
-import os
-import shutil
-import subprocess
 from pathlib import Path
 
+from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.models import Task
-from maestro.spawners.base import AgentSpawner, spawn_env
+from maestro.spawners.base import AgentSpawner
 
 
 class AiderSpawner(AgentSpawner):
@@ -25,65 +23,53 @@ class AiderSpawner(AgentSpawner):
         """Return the agent type identifier."""
         return "aider"
 
-    def is_available(self) -> bool:
-        """Check if Aider CLI is installed.
-
-        Returns:
-            True if 'aider' command is available in PATH.
-        """
-        return shutil.which("aider") is not None
-
-    def spawn(
+    def build_request(
         self,
         task: Task,
         context: str,
         workdir: Path,
         log_file: Path,
+        run_id: str,
         retry_context: str = "",
         *,
         model: str | None = None,  # noqa: ARG002 - kept for API consistency
-    ) -> subprocess.Popen[bytes]:
-        """Spawn Aider process.
+    ) -> ExecutionRequest:
+        """Build a transport-agnostic ExecutionRequest for Aider.
 
-        Runs Aider in yes-always mode with auto-commits disabled.
-        Scope files are passed as positional arguments so Aider
-        knows which files to edit. Output is captured to the log file.
+        Mirrors the argv built by ``spawn()``; the backend opens the log
+        file and spawns the process. Scope files are appended so Aider
+        knows which files to edit.
 
         Args:
             task: Task to execute.
             context: Context from completed dependencies.
             workdir: Working directory for the process.
             log_file: Path to write process output.
+            run_id: Unique identifier for this run.
             retry_context: Error context from previous failed attempt.
             model: Accepted for interface parity; unused (no model concept).
 
         Returns:
-            Subprocess handle for monitoring.
+            Transport-agnostic execution request.
         """
         prompt = self.build_prompt(task, context, retry_context)
 
-        cmd: list[str] = [
+        argv: list[str] = [
             "aider",
             "--yes-always",
             "--no-auto-commits",
             "--message",
             prompt,
         ]
-
-        # Pass scope files so Aider knows which files to work on
         if task.scope:
-            cmd.extend(task.scope)
+            argv.extend(task.scope)
 
-        fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-        try:
-            process = subprocess.Popen(
-                cmd,
-                cwd=workdir,
-                env=spawn_env(),
-                stdout=fd,
-                stderr=subprocess.STDOUT,
-            )
-        finally:
-            os.close(fd)
-
-        return process
+        return ExecutionRequest(
+            run_id=run_id,
+            argv=argv,
+            workdir=workdir,
+            log_path=log_file,
+            inherit_env=True,
+            collect=CollectPolicy(mode="none"),
+            required_tools=["aider"],
+        )

@@ -7,10 +7,18 @@ PR body formatting, and shutdown behavior.
 
 import contextlib
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
+from maestro.execution.models import (
+    BackendHealth,
+    CapabilityResult,
+    ExecutionHandleRef,
+    ExecutionRequest,
+    ProbeResult,
+)
 from maestro.models import (
     OrchestratorConfig,
     Workstream,
@@ -18,6 +26,72 @@ from maestro.models import (
     WorkstreamStatus,
 )
 from maestro.orchestrator import Orchestrator, OrchestratorError
+from tests.fakes.fake_execution_backend import FakeTaskHandle
+
+
+if TYPE_CHECKING:
+    from maestro.execution.local import LocalBackend
+
+
+class FakeOrchestratorBackend:
+    """ExecutionBackend double for orchestrator tests.
+
+    Orchestrator's `ExecutionRequest` (unlike the scheduler's) carries no
+    `fake_pid`/`fake_return_code` labels, so pid/exit-code are configured
+    directly on the backend instance instead of decoded from
+    `req.labels` (contrast with `FakeExecutionBackend` in
+    tests/fakes/fake_execution_backend.py, used by the scheduler tests).
+    Reuses `FakeTaskHandle` (the Task 5 handle shape) so `.terminate()` /
+    `.poll()` / `.os_pid` behave identically to the scheduler fakes.
+    """
+
+    id = "fake"
+
+    def __init__(self, pid: int = 1, exit_code: int = 0) -> None:
+        self.pid = pid
+        self.exit_code = exit_code
+        self.created_handles: list[FakeTaskHandle] = []
+        self.requests: list[ExecutionRequest] = []
+
+    async def healthcheck(self) -> BackendHealth:
+        return BackendHealth(reachable=True)
+
+    async def can_run(self, req: ExecutionRequest) -> CapabilityResult:
+        del req
+        return CapabilityResult(ok=True)
+
+    async def run(self, req: ExecutionRequest) -> FakeTaskHandle:
+        self.requests.append(req)
+        handle = FakeTaskHandle(exit_code=self.exit_code, pid=self.pid)
+        self.created_handles.append(handle)
+        return handle
+
+    async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
+        raise NotImplementedError("not exercised by orchestrator tests")
+
+
+@pytest.fixture(autouse=True)
+def _fake_execution_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch every Orchestrator's `LocalBackend` with a fake for this module.
+
+    Mirrors the scheduler test pattern (Task 5, see test_scheduler.py):
+    `Orchestrator.__init__` does `self._backend = LocalBackend()`; patching
+    the name in `maestro.orchestrator` makes every orchestrator built in
+    this file use `FakeOrchestratorBackend` instead, so `_spawn_workstream`
+    never spawns a real `spec-runner` subprocess.
+    """
+    monkeypatch.setattr("maestro.orchestrator.LocalBackend", FakeOrchestratorBackend)
+
+
+def _set_fake_backend(orch: Orchestrator, backend: FakeOrchestratorBackend) -> None:
+    """Type-narrowing assignment of `orch._backend` in tests.
+
+    Statically typed as `LocalBackend` on `Orchestrator`; the autouse fixture
+    above already swaps in a `FakeOrchestratorBackend` at construction time,
+    but a handful of tests need a *specific* pid/exit_code, so they build
+    their own instance and assign it here instead of relying on the default.
+    """
+    orch._backend = cast("LocalBackend", backend)
 
 
 # =============================================================================
@@ -115,6 +189,15 @@ def orchestrator(
         config=orch_config,
         log_dir=Path("/tmp/test-logs"),
     )
+
+
+@pytest.fixture
+def orchestrator_with_fake_backend(orchestrator: Orchestrator) -> Orchestrator:
+    """Alias for readability in tests that spawn a workstream and inspect
+    `.handle`. The autouse `_fake_execution_backend` fixture above already
+    wires `orchestrator._backend` to a `FakeOrchestratorBackend`.
+    """
+    return orchestrator
 
 
 def _make_workstream(
@@ -889,6 +972,31 @@ class TestBackgroundGeneration:
         assert any(WorkstreamStatus.READY in c for c in calls)
 
     @pytest.mark.anyio
+    async def test_running_workstream_holds_handle(
+        self, orchestrator_with_fake_backend, mock_db, tmp_path
+    ) -> None:
+        """`RunningWorkstream` exposes `.handle: TaskHandle` (not
+        `.process: asyncio.subprocess.Process`) after a successful spawn,
+        and `handle.os_pid` carries the pid for DB-based recovery."""
+        orch = orchestrator_with_fake_backend
+        orch._log_dir = tmp_path
+        workspace = tmp_path / "ws-z1"
+        workspace.mkdir()
+        orch._workspace_mgr.workspace_exists = MagicMock(return_value=True)
+        orch._workspace_mgr.get_workspace_path = MagicMock(return_value=workspace)
+        mock_db.get_workstream = AsyncMock(
+            return_value=_ws("z1", WorkstreamStatus.READY)
+        )
+
+        await orch._spawn_ready(["z1"])
+        await orch._generating["z1"]
+
+        running = next(iter(orch._running.values()))
+        assert hasattr(running, "handle")
+        assert not hasattr(running, "process")
+        assert running.handle.os_pid is not None
+
+    @pytest.mark.anyio
     async def test_happy_path_registers_in_running_before_pid_update(
         self, orchestrator, mock_db, mock_decomposer, tmp_path
     ) -> None:
@@ -904,8 +1012,6 @@ class TestBackgroundGeneration:
         that ordering (see `test_shutdown_cancels_generation_back_to_ready`
         for the cancellation side of the invariant).
         """
-        from unittest.mock import patch
-
         # Route log file + workspace through a real tmp dir so os.open()
         # and the (mocked-out) commit step don't touch the repo.
         orchestrator._log_dir = tmp_path
@@ -920,19 +1026,16 @@ class TestBackgroundGeneration:
             return_value=_ws("z1", WorkstreamStatus.READY)
         )
 
-        fake_process = MagicMock()
-        fake_process.pid = 4242
+        fake_backend = FakeOrchestratorBackend(pid=4242)
+        _set_fake_backend(orchestrator, fake_backend)
 
-        with patch(
-            "maestro.orchestrator.asyncio.create_subprocess_exec",
-            AsyncMock(return_value=fake_process),
-        ):
-            await orchestrator._spawn_ready(["z1"])
-            await orchestrator._generating["z1"]
+        await orchestrator._spawn_ready(["z1"])
+        await orchestrator._generating["z1"]
 
         assert "z1" not in orchestrator._generating
         assert "z1" in orchestrator._running
-        assert orchestrator._running["z1"].process is fake_process
+        assert orchestrator._running["z1"].handle is fake_backend.created_handles[0]
+        assert orchestrator._running["z1"].handle.os_pid == 4242
 
     @pytest.mark.anyio
     async def test_cleanup_terminates_process_when_cancel_hits_pid_update(
@@ -949,7 +1052,6 @@ class TestBackgroundGeneration:
         survive as an orphan.
         """
         import asyncio
-        from unittest.mock import patch
 
         orchestrator._log_dir = tmp_path
         orchestrator._shutdown_grace_seconds = 0  # no 5s sleep in _cleanup
@@ -963,14 +1065,10 @@ class TestBackgroundGeneration:
             return_value=_ws("z1", WorkstreamStatus.READY)
         )
 
-        # Fake process mirroring how _cleanup drives it:
-        # terminate() -> sleep(grace) -> returncode check -> wait().
-        fake_process = MagicMock()
-        fake_process.pid = 4242
-        fake_process.returncode = 0  # already exited: skip kill()
-        fake_process.terminate = MagicMock()
-        fake_process.kill = MagicMock()
-        fake_process.wait = AsyncMock(return_value=0)
+        # Fake handle mirroring how _cleanup drives it: a single
+        # `terminate(grace_seconds)` call (already exited, so no kill()).
+        fake_backend = FakeOrchestratorBackend(pid=4242, exit_code=0)
+        _set_fake_backend(orchestrator, fake_backend)
 
         # Suspend on the RUNNING+pid update (fired right after registration),
         # signalling `reached` so the test can proceed to shutdown. The
@@ -982,26 +1080,22 @@ class TestBackgroundGeneration:
         reached = asyncio.Event()
 
         async def hang_on_pid(*args, **kwargs):
-            if kwargs.get("process_pid") == fake_process.pid:
+            if kwargs.get("process_pid") == fake_backend.pid:
                 reached.set()
                 await asyncio.sleep(3600)  # hang here until cancelled
             return None
 
         mock_db.update_workstream_status = AsyncMock(side_effect=hang_on_pid)
 
-        with patch(
-            "maestro.orchestrator.asyncio.create_subprocess_exec",
-            AsyncMock(return_value=fake_process),
-        ):
-            await orchestrator._spawn_ready(["z1"])
-            await reached.wait()  # generation is now parked on the pid update
-            # Process is spawned + registered but the pid-update await is
-            # still pending — the exact orphan window.
-            assert "z1" in orchestrator._running
-            await orchestrator._cleanup()
+        await orchestrator._spawn_ready(["z1"])
+        await reached.wait()  # generation is now parked on the pid update
+        # Process is spawned + registered but the pid-update await is
+        # still pending — the exact orphan window.
+        assert "z1" in orchestrator._running
+        await orchestrator._cleanup()
 
-        # _cleanup found the process in _running and terminated it.
-        fake_process.terminate.assert_called_once()
+        # _cleanup found the handle in _running and terminated it.
+        assert fake_backend.created_handles[0].terminate_called
         assert "z1" not in orchestrator._running
 
     @pytest.mark.anyio
@@ -1135,13 +1229,9 @@ class TestGenerationPidLifecycle:
             # otherwise touch the real filesystem/subprocess so the happy
             # path can reach a clean end: the `spec-runner run --all`
             # process spawn.
-            fake_process = MagicMock(pid=12345)
+            _set_fake_backend(orch, FakeOrchestratorBackend(pid=12345))
             pid_calls = self._spy_generation_pid_writes(db)
-            with patch(
-                "maestro.orchestrator.asyncio.create_subprocess_exec",
-                new=AsyncMock(return_value=fake_process),
-            ):
-                await orch._generate_and_launch("a")
+            await orch._generate_and_launch("a")
 
             # entry write: the first DECOMPOSING transition overwrites the
             # stale pid up front with the spawning sentinel (Task 3), not
@@ -1300,12 +1390,8 @@ class TestSpawnWritesSentinel:
             # Stub the downstream step that would otherwise touch the real
             # filesystem/subprocess, as TestGenerationPidLifecycle does, so
             # the flow reaches the RUNNING spawn.
-            fake_process = MagicMock(pid=12345)
-            with patch(
-                "maestro.orchestrator.asyncio.create_subprocess_exec",
-                new=AsyncMock(return_value=fake_process),
-            ):
-                await orch._generate_and_launch("a")
+            _set_fake_backend(orch, FakeOrchestratorBackend(pid=12345))
+            await orch._generate_and_launch("a")
 
             dec = [c for c in calls if c["status"] == WorkstreamStatus.DECOMPOSING]
             assert dec and dec[0].get("generation_pid") == orch_mod._SPAWNING_SENTINEL
@@ -2321,14 +2407,9 @@ class TestSpawnHarnessIsolation:
                     status=WorkstreamStatus.READY,
                 )
             )
-            fake_process = MagicMock(pid=12345)
-            with (
-                patch(
-                    "maestro.orchestrator.asyncio.create_subprocess_exec",
-                    new=AsyncMock(return_value=fake_process),
-                ) as spawn,
-                patch("maestro.orchestrator.ensure_harness_excludes") as excludes,
-            ):
+            fake_backend = FakeOrchestratorBackend(pid=12345)
+            _set_fake_backend(orch, fake_backend)
+            with patch("maestro.orchestrator.ensure_harness_excludes") as excludes:
                 await orch._generate_and_launch("a")
 
             # Config is written BEFORE spec generation (prefix must be
@@ -2339,7 +2420,7 @@ class TestSpawnHarnessIsolation:
             # The spec-commit is gone.
             assert not hasattr(orch, "_commit_spec_in_workspace")
             # run --all carries the prefix.
-            argv = spawn.call_args.args
+            argv = fake_backend.requests[0].argv
             assert "--spec-prefix" in argv
             assert argv[argv.index("--spec-prefix") + 1] == SPEC_PREFIX
         finally:
@@ -2587,19 +2668,12 @@ class TestExPostResume:
             )
             await db.create_workstream(w)
             orch._try_resume_ex_post = AsyncMock()
-            fake_process = MagicMock(pid=1)
             mock_decomposer.generate_spec = AsyncMock()
             # _spawn_workstream's full-respawn path opens a log file under
             # self._log_dir; unlike orch.run(), this direct unit-test call
             # never creates it.
             orch._log_dir.mkdir(parents=True, exist_ok=True)
-            with (
-                patch(
-                    "maestro.orchestrator.asyncio.create_subprocess_exec",
-                    new=AsyncMock(return_value=fake_process),
-                ),
-                patch("maestro.orchestrator.ensure_harness_excludes"),
-            ):
+            with patch("maestro.orchestrator.ensure_harness_excludes"):
                 await orch._spawn_workstream("z4")
             orch._try_resume_ex_post.assert_not_awaited()
         finally:

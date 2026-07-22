@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from maestro.execution.models import ExecutionRequest
 from maestro.models import Task
 from maestro.spawners import (
     AgentSpawner,
@@ -52,6 +53,19 @@ class MockSpawner(AgentSpawner):
     ) -> subprocess.Popen[bytes]:
         return MagicMock()
 
+    def build_request(
+        self,
+        task: Task,
+        context: str,
+        workdir: Path,
+        log_file: Path,
+        run_id: str,
+        retry_context: str = "",
+        *,
+        model: str | None = None,
+    ) -> ExecutionRequest:
+        raise NotImplementedError
+
 
 class AnotherMockSpawner(AgentSpawner):
     """Another mock spawner for testing."""
@@ -74,6 +88,19 @@ class AnotherMockSpawner(AgentSpawner):
         model: str | None = None,
     ) -> subprocess.Popen[bytes]:
         return MagicMock()
+
+    def build_request(
+        self,
+        task: Task,
+        context: str,
+        workdir: Path,
+        log_file: Path,
+        run_id: str,
+        retry_context: str = "",
+        *,
+        model: str | None = None,
+    ) -> ExecutionRequest:
+        raise NotImplementedError
 
 
 @pytest.fixture
@@ -643,13 +670,13 @@ class TestRegistryIntegration:
 
         spawners_dict = registry.to_dict()
 
-        # Verify dict structure matches what Scheduler expects
+        # Verify dict structure matches what Scheduler (SpawnerProtocol) expects
         assert isinstance(spawners_dict, dict)
         for agent_type, spawner in spawners_dict.items():
             assert isinstance(agent_type, str)
             assert hasattr(spawner, "agent_type")
-            assert hasattr(spawner, "is_available")
-            assert hasattr(spawner, "spawn")
+            assert hasattr(spawner, "build_request")
+            assert hasattr(spawner, "can_build_request")
 
     def test_registry_with_all_spawner_types(
         self,

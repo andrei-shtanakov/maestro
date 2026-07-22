@@ -36,6 +36,9 @@ from maestro.cost_tracker import effective_cost, parse_and_create_cost
 from maestro.dag import DAG
 from maestro.database import Database
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
+from maestro.execution.backend import TaskHandle
+from maestro.execution.local import LocalBackend
+from maestro.execution.models import ExecutionRequest
 from maestro.models import (
     AgentType,
     ArbiterMode,
@@ -71,21 +74,22 @@ class SpawnerProtocol(Protocol):
         """Unique identifier for this agent type."""
         ...
 
-    def is_available(self) -> bool:
-        """Check if this agent is available."""
-        ...
-
-    def spawn(
+    def build_request(
         self,
         task: Task,
         context: str,
         workdir: Path,
         log_file: Path,
+        run_id: str,
         retry_context: str = "",
         *,
         model: str | None = None,
-    ) -> Popen[bytes]:
-        """Spawn agent process."""
+    ) -> ExecutionRequest:
+        """Build a transport-agnostic ExecutionRequest ('what to run')."""
+        ...
+
+    def can_build_request(self) -> bool:
+        """Whether this spawner can build a valid request locally."""
         ...
 
 
@@ -110,6 +114,13 @@ class BaseSpawner(ABC):
 
         Returns:
             True if agent is available.
+        """
+        return True
+
+    def can_build_request(self) -> bool:
+        """Whether this spawner can build a valid request locally.
+
+        Default True, mirroring ``AgentSpawner.can_build_request``.
         """
         return True
 
@@ -139,17 +150,17 @@ class BaseSpawner(ABC):
 
 @dataclass
 class RunningTask:
-    """Represents a currently running task with its process.
+    """Represents a currently running task with its execution handle.
 
     Attributes:
         task: The task being executed.
-        process: Subprocess handle.
+        handle: Execution handle (poll/wait/terminate/kill/collect/cleanup).
         started_at: When the task started.
         log_file: Path to the log file.
     """
 
     task: Task
-    process: Popen[bytes]
+    handle: TaskHandle
     started_at: datetime
     log_file: Path
 
@@ -238,6 +249,7 @@ class Scheduler:
         self._arbiter_mode: ArbiterMode = arbiter_mode
         self._hold_throttle: HoldThrottle = HoldThrottle()
         self._abandon_outcome_after_s: int = 300
+        self._backend = LocalBackend()
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._last_tick: tuple[int, int, int] | None = None
@@ -919,9 +931,12 @@ class Scheduler:
             msg = f"No spawner available for agent type '{spawner_key}'"
             raise SchedulerError(msg)
 
-        # Check if spawner is available
-        if not spawner.is_available():
-            msg = f"Agent '{spawner_key}' is not available on this system"
+        # Check if spawner can build a request at all (local config prereqs).
+        # Tool availability (the old is_available() check) is now probed via
+        # the backend against the built request's required_tools, right
+        # before running it — see the `backend.can_run` check below.
+        if not spawner.can_build_request():
+            msg = f"Agent '{spawner_key}' cannot build a request (local config)"
             raise SchedulerError(msg)
 
         # Apply retry backoff without blocking scheduler loop
@@ -956,9 +971,54 @@ class Scheduler:
                 task, task.error_message
             )
 
-        # Span scope covers the actual spawn so the spawner subprocess
-        # inherits this span as TRACEPARENT (via spawner.child_env()),
-        # giving cross-process trace continuity per the observability
+        # Build the request and probe tool availability BEFORE the
+        # READY->RUNNING transition/span below. This must gate up front so a
+        # missing tool fails fast exactly as the old is_available() check
+        # did: READY->FAILED, never READY->RUNNING->FAILED.
+        routed_model = (
+            model_of_agent_id(task.routed_agent_type)
+            if task.routed_agent_type
+            else None
+        )
+        # `routed_model is None` is the normal, expected case for a plain
+        # harness id with no "@" (static/advisory routing without a
+        # model). Only an explicit empty model after "@" (e.g.
+        # "claude_code@") is the degenerate case worth flagging.
+        if task.routed_agent_type and routed_model == "":
+            _obs_log.warning(
+                "agent.routed_model_empty",
+                task_id=task_id,
+                agent_id=task.routed_agent_type,
+            )
+        request = spawner.build_request(
+            task,
+            context,
+            workdir,
+            log_file,
+            task_id,
+            retry_context,
+            model=routed_model,
+        )
+
+        # Executor-side tool probe (replaces is_available()): checks the
+        # request's required_tools against the target executor. Fails
+        # fast with the same "not available" wording the old
+        # is_available() check used, so today's SchedulerError semantics
+        # hold even though the check now runs backend-side. Runs before any
+        # RUNNING transition/span so a missing tool never leaves the task
+        # observed as briefly RUNNING.
+        cap = await self._backend.can_run(request)
+        if not cap.ok:
+            msg = (
+                f"Agent '{spawner_key}' is not available on this system "
+                f"(missing tools: {cap.missing_tools})"
+            )
+            raise SchedulerError(msg)
+
+        # Span scope covers the actual spawn so the backend subprocess
+        # inherits this span as TRACEPARENT (via the execution backend's
+        # build_local_env()/child_env()), giving cross-process trace
+        # continuity per the observability
         # contract. Earlier returns (HOLD/REJECT/etc.) intentionally
         # stay outside the span — they don't launch a subprocess.
         with obs.span(
@@ -976,30 +1036,12 @@ class Scheduler:
             self._report_status_change(task_id, "ready", "running")
             self._retry_ready_times.pop(task_id, None)
 
-            # Spawn the process with retry context
-            routed_model = (
-                model_of_agent_id(task.routed_agent_type)
-                if task.routed_agent_type
-                else None
-            )
-            # `routed_model is None` is the normal, expected case for a plain
-            # harness id with no "@" (static/advisory routing without a
-            # model). Only an explicit empty model after "@" (e.g.
-            # "claude_code@") is the degenerate case worth flagging.
-            if task.routed_agent_type and routed_model == "":
-                _obs_log.warning(
-                    "agent.routed_model_empty",
-                    task_id=task_id,
-                    agent_id=task.routed_agent_type,
-                )
-            process = spawner.spawn(
-                task, context, workdir, log_file, retry_context, model=routed_model
-            )
+            handle = await self._backend.run(request)
 
             # Track running task
             self._running_tasks[task_id] = RunningTask(
                 task=task,
-                process=process,
+                handle=handle,
                 started_at=datetime.now(UTC),
                 log_file=log_file,
             )
@@ -1098,7 +1140,7 @@ class Scheduler:
 
         for task_id, running_task in self._running_tasks.items():
             # Check if process has finished
-            return_code = running_task.process.poll()
+            return_code = running_task.handle.poll()
 
             if return_code is not None:
                 # Process finished
@@ -1437,15 +1479,7 @@ class Scheduler:
         """
         # Kill the process
         try:
-            running_task.process.terminate()
-            # Give it a moment to terminate gracefully
-            await asyncio.sleep(self._config.shutdown_grace_seconds)
-            if running_task.process.poll() is None:
-                running_task.process.kill()
-            # Reap the child process to avoid zombies
-            await asyncio.get_event_loop().run_in_executor(
-                None, running_task.process.wait
-            )
+            await running_task.handle.terminate(self._config.shutdown_grace_seconds)
         except OSError as e:
             logger.debug(
                 "Failed to terminate timed-out process for task %s: %s",
@@ -1539,15 +1573,7 @@ class Scheduler:
         # Create a copy to avoid modifying dict during iteration
         for task_id, running_task in list(self._running_tasks.items()):
             try:
-                running_task.process.terminate()
-                # Give processes time to terminate gracefully
-                await asyncio.sleep(self._config.shutdown_grace_seconds)
-                if running_task.process.poll() is None:
-                    running_task.process.kill()
-                # Reap the child process to avoid zombies
-                await asyncio.get_event_loop().run_in_executor(
-                    None, running_task.process.wait
-                )
+                await running_task.handle.terminate(self._config.shutdown_grace_seconds)
             except OSError as e:
                 logger.debug(
                     "Failed to terminate process for task %s during cleanup: %s",

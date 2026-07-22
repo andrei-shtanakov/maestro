@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import fcntl
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -99,6 +100,26 @@ app.add_typer(models_app, name="models")
 
 # Benchmark constants and helpers
 _ALLOWED_BENCH_AGENTS = ("claude_code", "codex_cli", "aider", "opencode")
+
+# Mirrors each spawner's (now-removed) `is_available()`: `shutil.which(cli)
+# is not None`. Kept here so the CLI can probe PATH directly without an
+# async ExecutionBackend.can_run() round-trip inside a sync command.
+_BENCH_CLI_BY_AGENT: dict[str, str] = {
+    "claude_code": "claude",
+    "codex_cli": "codex",
+    "aider": "aider",
+    "opencode": "opencode",
+}
+
+
+def _agent_cli_available(agent: str) -> bool:
+    """Whether the agent's CLI binary is on PATH.
+
+    Mirrors the removed spawner ``is_available()``. Kept as a
+    module-level seam so tests can monkeypatch availability without
+    requiring the real CLI binary on PATH.
+    """
+    return shutil.which(_BENCH_CLI_BY_AGENT[agent]) is not None
 
 
 def _bench_spawner_for(agent: str) -> AgentSpawner:
@@ -1136,7 +1157,7 @@ def benchmark(
         raise typer.Exit(2)
 
     spawner = _bench_spawner_for(agent)
-    if not spawner.is_available():
+    if not _agent_cli_available(agent):
         err.print(f"[red]agent CLI '{escape(agent)}' not found in PATH[/red]")
         raise typer.Exit(1)
 

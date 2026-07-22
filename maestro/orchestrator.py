@@ -19,6 +19,9 @@ from pathlib import Path
 from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
+from maestro.execution.backend import TaskHandle
+from maestro.execution.local import LocalBackend
+from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.gates import (
     BLOCK_REASON_PREFIX,
     ApprovalMarker,
@@ -94,10 +97,10 @@ _STRANDED_INFLIGHT = (
 
 @dataclass
 class RunningWorkstream:
-    """Represents a currently running workstream process."""
+    """Represents a currently running workstream execution."""
 
     workstream: Workstream
-    process: asyncio.subprocess.Process
+    handle: TaskHandle
     started_at: datetime
     workspace_path: Path
     log_file: Path
@@ -160,6 +163,7 @@ class Orchestrator:
                 log_dir=pipeline_log_dir(),
             )
 
+        self._backend = LocalBackend()
         self._running: dict[str, RunningWorkstream] = {}
         self._generating: dict[str, asyncio.Task[None]] = {}
         self._shutdown_grace_seconds: float = 5.0
@@ -656,19 +660,17 @@ class Orchestrator:
         if self._config.callback_url:
             cmd.extend(["--callback-url", self._config.callback_url])
 
-        log_fd = os.open(str(log_file), os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-        try:
-            with span("task.execute", task_id=workstream_id):
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    cwd=workspace,
-                    env={**os.environ, **child_env()},
-                    stdout=log_fd,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-        except BaseException:
-            os.close(log_fd)
-            raise
+        request = ExecutionRequest(
+            run_id=workstream_id,
+            argv=cmd,
+            workdir=workspace,
+            log_path=log_file,
+            inherit_env=True,
+            collect=CollectPolicy(mode="none"),
+            required_tools=["spec-runner"],
+        )
+        with span("task.execute", task_id=workstream_id):
+            handle = await self._backend.run(request)
 
         # Register in _running BEFORE any further await, so a shutdown
         # cancellation can never orphan the spawned process: once it's
@@ -681,7 +683,7 @@ class Orchestrator:
                     "workspace_path": str(workspace),
                 }
             ),
-            process=process,
+            handle=handle,
             started_at=datetime.now(UTC),
             workspace_path=workspace,
             log_file=log_file,
@@ -691,13 +693,13 @@ class Orchestrator:
         await self._db.update_workstream_status(
             workstream_id,
             WorkstreamStatus.RUNNING,
-            process_pid=process.pid,
+            process_pid=handle.os_pid,
         )
 
         self._logger.info(
-            "Spawned spec-runner for '%s' (PID %d) in %s",
+            "Spawned spec-runner for '%s' (PID %s) in %s",
             workstream_id,
-            process.pid,
+            handle.os_pid,
             workspace,
         )
 
@@ -788,7 +790,7 @@ class Orchestrator:
             await self._update_progress(zid, running)
 
             # Check if process finished (returncode is None while running)
-            return_code = running.process.returncode
+            return_code = running.handle.poll()
 
             if return_code is not None:
                 await self._handle_completion(zid, running, return_code)
@@ -1189,11 +1191,7 @@ class Orchestrator:
 
         for zid, running in list(self._running.items()):
             try:
-                running.process.terminate()
-                await asyncio.sleep(self._shutdown_grace_seconds)
-                if running.process.returncode is None:
-                    running.process.kill()
-                await running.process.wait()
+                await running.handle.terminate(self._shutdown_grace_seconds)
             except OSError as e:
                 self._logger.debug(
                     "Failed to terminate process for workstream %s during cleanup: %s",

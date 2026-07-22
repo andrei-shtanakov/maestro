@@ -1,12 +1,10 @@
 """Tests for the Agent Spawner module."""
 
-import os
-import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
+from maestro.execution.models import ExecutionRequest
 from maestro.models import AgentType, Task
 from maestro.spawners import (
     AgentSpawner,
@@ -60,7 +58,13 @@ def claude_spawner() -> ClaudeCodeSpawner:
 
 
 class TestAgentSpawnerABC:
-    """Tests for the AgentSpawner abstract base class."""
+    """Tests for the AgentSpawner abstract base class.
+
+    Only ``agent_type`` and ``build_request`` are abstract post-Task-7;
+    the legacy ``spawn``/``is_available`` pair was removed once the
+    scheduler, orchestrator, and benchmark responder all migrated onto
+    ``build_request``/``ExecutionBackend``.
+    """
 
     def test_cannot_instantiate_abc(self) -> None:
         """Test that AgentSpawner cannot be instantiated directly."""
@@ -71,60 +75,55 @@ class TestAgentSpawnerABC:
         """Test that concrete spawners must implement agent_type."""
 
         class IncompleteSpawner(AgentSpawner):
-            def is_available(self) -> bool:
-                return True
-
-            def spawn(
+            def build_request(
                 self,
                 task: Task,
                 context: str,
                 workdir: Path,
                 log_file: Path,
+                run_id: str,
                 retry_context: str = "",
                 *,
                 model: str | None = None,
-            ) -> subprocess.Popen[bytes]:
-                return MagicMock()
+            ) -> ExecutionRequest:
+                raise NotImplementedError
 
         with pytest.raises(TypeError, match="agent_type"):
             IncompleteSpawner()  # type: ignore[abstract]
 
-    def test_concrete_spawner_must_implement_is_available(self) -> None:
-        """Test that concrete spawners must implement is_available."""
+    def test_concrete_spawner_must_implement_build_request(self) -> None:
+        """Test that concrete spawners must implement build_request."""
 
         class IncompleteSpawner(AgentSpawner):
             @property
             def agent_type(self) -> str:
                 return "test"
 
-            def spawn(
+        with pytest.raises(TypeError, match="build_request"):
+            IncompleteSpawner()  # type: ignore[abstract]
+
+    def test_can_build_request_defaults_true(self) -> None:
+        """can_build_request() defaults to True when not overridden."""
+
+        class MinimalSpawner(AgentSpawner):
+            @property
+            def agent_type(self) -> str:
+                return "minimal"
+
+            def build_request(
                 self,
                 task: Task,
                 context: str,
                 workdir: Path,
                 log_file: Path,
+                run_id: str,
                 retry_context: str = "",
                 *,
                 model: str | None = None,
-            ) -> subprocess.Popen[bytes]:
-                return MagicMock()
+            ) -> ExecutionRequest:
+                raise NotImplementedError
 
-        with pytest.raises(TypeError, match="is_available"):
-            IncompleteSpawner()  # type: ignore[abstract]
-
-    def test_concrete_spawner_must_implement_spawn(self) -> None:
-        """Test that concrete spawners must implement spawn."""
-
-        class IncompleteSpawner(AgentSpawner):
-            @property
-            def agent_type(self) -> str:
-                return "test"
-
-            def is_available(self) -> bool:
-                return True
-
-        with pytest.raises(TypeError, match="spawn"):
-            IncompleteSpawner()  # type: ignore[abstract]
+        assert MinimalSpawner().can_build_request() is True
 
 
 # =============================================================================
@@ -201,31 +200,6 @@ class TestPromptBuilding:
 
 
 # =============================================================================
-# Unit Tests: is_available Check
-# =============================================================================
-
-
-class TestIsAvailable:
-    """Tests for is_available functionality."""
-
-    def test_claude_available_when_in_path(
-        self,
-        claude_spawner: ClaudeCodeSpawner,
-    ) -> None:
-        """Test is_available returns True when claude is in PATH."""
-        with patch("shutil.which", return_value="/usr/local/bin/claude"):
-            assert claude_spawner.is_available() is True
-
-    def test_claude_unavailable_when_not_in_path(
-        self,
-        claude_spawner: ClaudeCodeSpawner,
-    ) -> None:
-        """Test is_available returns False when claude is not in PATH."""
-        with patch("shutil.which", return_value=None):
-            assert claude_spawner.is_available() is False
-
-
-# =============================================================================
 # Unit Tests: ClaudeCodeSpawner
 # =============================================================================
 
@@ -236,440 +210,6 @@ class TestClaudeCodeSpawner:
     def test_agent_type(self, claude_spawner: ClaudeCodeSpawner) -> None:
         """Test that agent_type returns correct value."""
         assert claude_spawner.agent_type == "claude_code"
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_creates_process_with_correct_args(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        claude_spawner: ClaudeCodeSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-        catalog_env: Path,
-    ) -> None:
-        """Test that spawn creates process with correct arguments."""
-        from maestro.catalog import load_catalog
-
-        mock_process = MagicMock()
-        mock_popen.return_value = mock_process
-        mock_os_open.return_value = 42  # Mock file descriptor
-
-        log_file = temp_dir / "task.log"
-        context = "Some context"
-        workdir = Path(sample_task.workdir)
-
-        # Create log file parent directory
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-
-        result = claude_spawner.spawn(sample_task, context, workdir, log_file)
-
-        # Verify os.open was called with correct flags
-        mock_os_open.assert_called_once()
-        open_call = mock_os_open.call_args
-        assert str(log_file) in open_call[0]
-
-        # Verify Popen was called
-        mock_popen.assert_called_once()
-        call_args = mock_popen.call_args
-
-        # Verify command structure
-        cmd = call_args[0][0]
-        cat = load_catalog()
-        assert cat is not None
-        expected = cat.default_model_for_harness("claude_code")
-        assert cmd[0] == "claude"
-        assert "--model" in cmd
-        assert cmd[cmd.index("--model") + 1] == expected
-        assert "--print" in cmd
-        assert "--output-format" in cmd
-        assert "json" in cmd
-        assert "-p" in cmd
-
-        # Verify workdir
-        assert call_args[1]["cwd"] == workdir
-
-        # Verify stdout is the fd
-        assert call_args[1]["stdout"] == 42
-
-        # Verify stderr redirected to stdout
-        assert call_args[1]["stderr"] == subprocess.STDOUT
-
-        # Verify fd was closed
-        mock_os_close.assert_called_once_with(42)
-
-        # Verify return value
-        assert result == mock_process
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_model_override_from_env(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        claude_spawner: ClaudeCodeSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-    ) -> None:
-        """MAESTRO_CLAUDE_MODEL overrides the default model passed to --model."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-
-        log_file = temp_dir / "task.log"
-        workdir = Path(sample_task.workdir)
-
-        with patch.dict(os.environ, {"MAESTRO_CLAUDE_MODEL": "claude-opus-4-8"}):
-            claude_spawner.spawn(sample_task, "", workdir, log_file)
-
-        cmd = mock_popen.call_args[0][0]
-        assert cmd[cmd.index("--model") + 1] == "claude-opus-4-8"
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_uses_routed_model(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        claude_spawner: ClaudeCodeSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-    ) -> None:
-        """An explicit routed model wins and reaches --model."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-        workdir = Path(sample_task.workdir)
-
-        claude_spawner.spawn(
-            sample_task, "", workdir, temp_dir / "t.log", model="claude-opus-4-8"
-        )
-
-        cmd = mock_popen.call_args[0][0]
-        assert cmd[cmd.index("--model") + 1] == "claude-opus-4-8"
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_routed_model_beats_env(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        claude_spawner: ClaudeCodeSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-    ) -> None:
-        """Precedence routed > env: routed model overrides MAESTRO_CLAUDE_MODEL."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-        workdir = Path(sample_task.workdir)
-
-        with patch.dict(os.environ, {"MAESTRO_CLAUDE_MODEL": "env-model"}):
-            claude_spawner.spawn(
-                sample_task, "", workdir, temp_dir / "t.log", model="routed-model"
-            )
-
-        cmd = mock_popen.call_args[0][0]
-        assert cmd[cmd.index("--model") + 1] == "routed-model"
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_emits_model_resolved_source(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        claude_spawner: ClaudeCodeSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-        catalog_env: Path,
-    ) -> None:
-        """agent.model_resolved reports the correct source for each origin."""
-        from structlog.testing import capture_logs
-
-        from maestro.catalog import load_catalog
-
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-        workdir = Path(sample_task.workdir)
-
-        with capture_logs() as logs:
-            claude_spawner.spawn(
-                sample_task, "", workdir, temp_dir / "t.log", model="routed-x"
-            )
-        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
-        assert ev["source"] == "routed"
-        assert ev["model"] == "routed-x"
-
-        with (
-            capture_logs() as logs,
-            patch.dict(os.environ, {"MAESTRO_CLAUDE_MODEL": "env-y"}),
-        ):
-            claude_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
-        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
-        assert ev["source"] == "env"
-        assert ev["model"] == "env-y"
-
-        with capture_logs() as logs, patch.dict(os.environ, {}, clear=True):
-            os.environ["ATP_CATALOG"] = str(catalog_env)
-            claude_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
-        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
-        assert ev["source"] == "catalog"
-        cat = load_catalog()
-        assert cat is not None
-        assert ev["model"] == cat.default_model_for_harness("claude_code")
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_routed_model_halts_on_malformed_catalog(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        claude_spawner: ClaudeCodeSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """A routed model can't dodge a malformed catalog.
-
-        load_catalog() runs before resolve_model() in spawn(), so even a
-        routed task halts when $ATP_CATALOG points at a malformed file.
-        """
-        from maestro.catalog import CatalogMalformed
-
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-        workdir = Path(sample_task.workdir)
-
-        fixture = Path(__file__).parent / "fixtures" / "agents-catalog-malformed.toml"
-        monkeypatch.setenv("ATP_CATALOG", str(fixture))
-
-        with pytest.raises(CatalogMalformed):
-            claude_spawner.spawn(
-                sample_task, "", workdir, temp_dir / "t.log", model="routed-x"
-            )
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_prompt_contains_task_info(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        claude_spawner: ClaudeCodeSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-        catalog_env: Path,
-    ) -> None:
-        """Test that spawn passes prompt with task information."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-
-        log_file = temp_dir / "task.log"
-        context = "Previous task completed"
-        workdir = Path(sample_task.workdir)
-
-        # Create log file parent directory
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-
-        claude_spawner.spawn(sample_task, context, workdir, log_file)
-
-        # Get the prompt from call args
-        call_args = mock_popen.call_args
-        cmd = call_args[0][0]
-
-        # Find -p argument and get the prompt
-        p_index = cmd.index("-p")
-        prompt = cmd[p_index + 1]
-
-        # Verify prompt content
-        assert sample_task.title in prompt
-        assert sample_task.prompt in prompt
-        assert context in prompt
-
-
-# =============================================================================
-# Integration Tests: Spawn with Mock (Echo)
-# =============================================================================
-
-
-def _spawn_with_log_fd(
-    cmd: list[str],
-    workdir: Path,
-    log_file: Path,
-) -> subprocess.Popen[bytes]:
-    """Helper to spawn process with proper fd management."""
-    fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-    try:
-        process = subprocess.Popen(
-            cmd,
-            cwd=workdir,
-            stdout=fd,
-            stderr=subprocess.STDOUT,
-        )
-    finally:
-        os.close(fd)
-    return process
-
-
-class TestSpawnIntegration:
-    """Integration tests for spawning with real subprocess."""
-
-    @pytest.mark.integration
-    def test_spawn_with_echo_command(self, temp_dir: Path) -> None:
-        """Test spawning using echo as a mock command."""
-
-        class EchoSpawner(AgentSpawner):
-            """Test spawner that uses echo instead of claude."""
-
-            @property
-            def agent_type(self) -> str:
-                return "echo_test"
-
-            def is_available(self) -> bool:
-                return True
-
-            def spawn(
-                self,
-                task: Task,
-                context: str,
-                workdir: Path,
-                log_file: Path,
-                retry_context: str = "",
-                *,
-                model: str | None = None,
-            ) -> subprocess.Popen[bytes]:
-                prompt = self.build_prompt(task, context, retry_context)
-                return _spawn_with_log_fd(["echo", prompt], workdir, log_file)
-
-        spawner = EchoSpawner()
-        task = Task(
-            id="echo-task",
-            title="Echo Test",
-            prompt="Test prompt content",
-            workdir=str(temp_dir),
-            agent_type=AgentType.CLAUDE_CODE,
-            scope=["file1.py"],
-        )
-
-        log_file = temp_dir / "echo.log"
-        context = "Context from dependency"
-
-        # Spawn the process
-        process = spawner.spawn(task, context, temp_dir, log_file)
-
-        # Wait for completion
-        return_code = process.wait()
-
-        # Verify success
-        assert return_code == 0
-
-        # Verify log file content
-        log_content = log_file.read_text()
-        assert task.title in log_content
-        assert task.prompt in log_content
-        assert context in log_content
-        assert "file1.py" in log_content
-
-    @pytest.mark.integration
-    def test_spawn_captures_stderr(self, temp_dir: Path) -> None:
-        """Test that stderr is captured in log file."""
-
-        class StderrSpawner(AgentSpawner):
-            """Test spawner that writes to stderr."""
-
-            @property
-            def agent_type(self) -> str:
-                return "stderr_test"
-
-            def is_available(self) -> bool:
-                return True
-
-            def spawn(
-                self,
-                task: Task,
-                context: str,
-                workdir: Path,
-                log_file: Path,
-                retry_context: str = "",
-                *,
-                model: str | None = None,
-            ) -> subprocess.Popen[bytes]:
-                return _spawn_with_log_fd(
-                    ["sh", "-c", "echo 'error message' >&2"],
-                    workdir,
-                    log_file,
-                )
-
-        spawner = StderrSpawner()
-        task = Task(
-            id="stderr-task",
-            title="Stderr Test",
-            prompt="Test",
-            workdir=str(temp_dir),
-        )
-
-        log_file = temp_dir / "stderr.log"
-
-        process = spawner.spawn(task, "", temp_dir, log_file)
-        process.wait()
-
-        log_content = log_file.read_text()
-        assert "error message" in log_content
-
-    @pytest.mark.integration
-    def test_spawn_returns_exit_code(self, temp_dir: Path) -> None:
-        """Test that spawn returns correct exit code."""
-
-        class FailingSpawner(AgentSpawner):
-            """Test spawner that returns non-zero exit code."""
-
-            @property
-            def agent_type(self) -> str:
-                return "failing_test"
-
-            def is_available(self) -> bool:
-                return True
-
-            def spawn(
-                self,
-                task: Task,
-                context: str,
-                workdir: Path,
-                log_file: Path,
-                retry_context: str = "",
-                *,
-                model: str | None = None,
-            ) -> subprocess.Popen[bytes]:
-                return _spawn_with_log_fd(
-                    ["sh", "-c", "exit 42"],
-                    workdir,
-                    log_file,
-                )
-
-        spawner = FailingSpawner()
-        task = Task(
-            id="fail-task",
-            title="Fail Test",
-            prompt="Test",
-            workdir=str(temp_dir),
-        )
-
-        log_file = temp_dir / "fail.log"
-
-        process = spawner.spawn(task, "", temp_dir, log_file)
-        return_code = process.wait()
-
-        assert return_code == 42
 
 
 # =============================================================================
@@ -688,20 +228,18 @@ class TestSpawnerInheritance:
             def agent_type(self) -> str:
                 return "custom"
 
-            def is_available(self) -> bool:
-                return True
-
-            def spawn(
+            def build_request(
                 self,
                 task: Task,
                 context: str,
                 workdir: Path,
                 log_file: Path,
+                run_id: str,
                 retry_context: str = "",
                 *,
                 model: str | None = None,
-            ) -> subprocess.Popen[bytes]:
-                return MagicMock()
+            ) -> ExecutionRequest:
+                raise NotImplementedError
 
         spawner = CustomSpawner()
         task = Task(
@@ -724,21 +262,6 @@ class TestSpawnerInheritance:
             def agent_type(self) -> str:
                 return "custom"
 
-            def is_available(self) -> bool:
-                return True
-
-            def spawn(
-                self,
-                task: Task,
-                context: str,
-                workdir: Path,
-                log_file: Path,
-                retry_context: str = "",
-                *,
-                model: str | None = None,
-            ) -> subprocess.Popen[bytes]:
-                return MagicMock()
-
             def build_prompt(
                 self,
                 task: Task,
@@ -746,6 +269,19 @@ class TestSpawnerInheritance:
                 retry_context: str = "",
             ) -> str:
                 return f"CUSTOM: {task.title}"
+
+            def build_request(
+                self,
+                task: Task,
+                context: str,
+                workdir: Path,
+                log_file: Path,
+                run_id: str,
+                retry_context: str = "",
+                *,
+                model: str | None = None,
+            ) -> ExecutionRequest:
+                raise NotImplementedError
 
         spawner = CustomSpawner()
         task = Task(
@@ -800,203 +336,138 @@ class TestCodexSpawner:
         """Test that agent_type returns correct value."""
         assert codex_spawner.agent_type == "codex_cli"
 
-    def test_codex_available_when_in_path(
+    def test_build_request_uses_catalog_default(
         self,
         codex_spawner: CodexSpawner,
-    ) -> None:
-        """Test is_available returns True when codex is in PATH."""
-        with patch(
-            "maestro.spawners.codex.shutil.which",
-            return_value="/usr/local/bin/codex",
-        ):
-            assert codex_spawner.is_available() is True
-
-    def test_codex_unavailable_when_not_in_path(
-        self,
-        codex_spawner: CodexSpawner,
-    ) -> None:
-        """Test is_available returns False when codex is not in PATH."""
-        with patch(
-            "maestro.spawners.codex.shutil.which",
-            return_value=None,
-        ):
-            assert codex_spawner.is_available() is False
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_creates_process_with_correct_args(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        codex_spawner: CodexSpawner,
-        sample_task: Task,
-        temp_dir: Path,
         catalog_env: Path,
     ) -> None:
-        """Test that spawn creates process with correct arguments."""
+        """Catalog default resolves onto the -m argv element."""
         from maestro.catalog import load_catalog
 
-        mock_process = MagicMock()
-        mock_popen.return_value = mock_process
-        mock_os_open.return_value = 42
-
-        log_file = temp_dir / "task.log"
-        context = "Some context"
-        workdir = Path(sample_task.workdir)
-
-        result = codex_spawner.spawn(sample_task, context, workdir, log_file)
-
-        mock_popen.assert_called_once()
-        call_args = mock_popen.call_args
-        cmd = call_args[0][0]
-
+        req = codex_spawner.build_request(
+            _mk_task(),
+            context="ctx",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
         cat = load_catalog()
         assert cat is not None
         expected = cat.default_model_for_harness("codex_cli")
-        assert cmd[0] == "codex"
-        assert cmd[1] == "exec"
-        assert "-m" in cmd
-        assert cmd[cmd.index("-m") + 1] == expected
-        assert "--sandbox" in cmd
-        assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
-        assert "--skip-git-repo-check" in cmd
-        assert call_args[1]["cwd"] == workdir
-        assert call_args[1]["stdout"] == 42
-        assert call_args[1]["stderr"] == subprocess.STDOUT
-        mock_os_close.assert_called_once_with(42)
-        assert result == mock_process
+        assert req.argv[0] == "codex"
+        assert req.argv[1] == "exec"
+        assert req.argv[req.argv.index("-m") + 1] == expected
+        assert "--sandbox" in req.argv
+        assert req.argv[req.argv.index("--sandbox") + 1] == "workspace-write"
+        assert "--skip-git-repo-check" in req.argv
+        assert req.required_tools == ["codex"]
 
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_model_override_from_env(
+    def test_build_request_model_override_from_env(
         self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
         codex_spawner: CodexSpawner,
-        sample_task: Task,
-        temp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """MAESTRO_CODEX_MODEL overrides the default model passed to -m."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
+        monkeypatch.setenv("MAESTRO_CODEX_MODEL", "gpt-5-codex")
+        req = codex_spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
+        assert req.argv[req.argv.index("-m") + 1] == "gpt-5-codex"
 
-        log_file = temp_dir / "task.log"
-        workdir = Path(sample_task.workdir)
-
-        with patch.dict(os.environ, {"MAESTRO_CODEX_MODEL": "gpt-5-codex"}):
-            codex_spawner.spawn(sample_task, "", workdir, log_file)
-
-        cmd = mock_popen.call_args[0][0]
-        assert cmd[cmd.index("-m") + 1] == "gpt-5-codex"
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_routed_model_beats_env(
+    def test_build_request_routed_model_beats_env(
         self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
         codex_spawner: CodexSpawner,
-        sample_task: Task,
-        temp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Precedence routed > env: routed model overrides MAESTRO_CODEX_MODEL."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-        workdir = Path(sample_task.workdir)
+        monkeypatch.setenv("MAESTRO_CODEX_MODEL", "env-model")
+        req = codex_spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+            model="routed-model",
+        )
+        assert req.argv[req.argv.index("-m") + 1] == "routed-model"
 
-        with patch.dict(os.environ, {"MAESTRO_CODEX_MODEL": "env-model"}):
-            codex_spawner.spawn(
-                sample_task, "", workdir, temp_dir / "t.log", model="routed-model"
-            )
-
-        cmd = mock_popen.call_args[0][0]
-        assert cmd[cmd.index("-m") + 1] == "routed-model"
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_emits_model_resolved_source(
+    def test_build_request_emits_model_resolved_source(
         self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
         codex_spawner: CodexSpawner,
-        sample_task: Task,
-        temp_dir: Path,
         catalog_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """agent.model_resolved reports the correct source for each origin."""
         from structlog.testing import capture_logs
 
         from maestro.catalog import load_catalog
 
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-        workdir = Path(sample_task.workdir)
-
         with capture_logs() as logs:
-            codex_spawner.spawn(
-                sample_task, "", workdir, temp_dir / "t.log", model="routed-x"
+            codex_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+                model="routed-x",
             )
         ev = next(e for e in logs if e["event"] == "agent.model_resolved")
         assert ev["source"] == "routed"
         assert ev["model"] == "routed-x"
+        assert ev["harness"] == "codex_cli"
 
-        with (
-            capture_logs() as logs,
-            patch.dict(os.environ, {"MAESTRO_CODEX_MODEL": "env-y"}),
-        ):
-            codex_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
+        monkeypatch.setenv("MAESTRO_CODEX_MODEL", "env-y")
+        with capture_logs() as logs:
+            codex_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+            )
         ev = next(e for e in logs if e["event"] == "agent.model_resolved")
         assert ev["source"] == "env"
         assert ev["model"] == "env-y"
 
-        with capture_logs() as logs, patch.dict(os.environ, {}, clear=True):
-            os.environ["ATP_CATALOG"] = str(catalog_env)
-            codex_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
+        monkeypatch.delenv("MAESTRO_CODEX_MODEL", raising=False)
+        with capture_logs() as logs:
+            codex_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+            )
         ev = next(e for e in logs if e["event"] == "agent.model_resolved")
         assert ev["source"] == "catalog"
         cat = load_catalog()
         assert cat is not None
         assert ev["model"] == cat.default_model_for_harness("codex_cli")
 
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_prompt_contains_task_info(
+    def test_build_request_routed_model_halts_on_malformed_catalog(
         self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
         codex_spawner: CodexSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-        catalog_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Test that spawn passes prompt with task information."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
+        """A routed model can't dodge a malformed catalog (halt is global)."""
+        from maestro.catalog import CatalogMalformed
 
-        log_file = temp_dir / "task.log"
-        context = "Previous task completed"
-        workdir = Path(sample_task.workdir)
+        fixture = Path(__file__).parent / "fixtures" / "agents-catalog-malformed.toml"
+        monkeypatch.setenv("ATP_CATALOG", str(fixture))
 
-        codex_spawner.spawn(sample_task, context, workdir, log_file)
-
-        call_args = mock_popen.call_args
-        cmd = call_args[0][0]
-
-        # Prompt is the last positional argument for codex
-        prompt = cmd[-1]
-        assert sample_task.title in prompt
-        assert sample_task.prompt in prompt
-        assert context in prompt
+        with pytest.raises(CatalogMalformed):
+            codex_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+                model="routed-x",
+            )
 
 
 # =============================================================================
@@ -1026,141 +497,151 @@ class TestOpencodeSpawner:
         """Test that agent_type returns correct value."""
         assert opencode_spawner.agent_type == "opencode"
 
-    def test_opencode_available_when_in_path(
+    def test_build_request_uses_catalog_default_qualified(
         self,
         opencode_spawner: OpencodeSpawner,
-    ) -> None:
-        """Test is_available returns True when opencode is in PATH."""
-        with patch(
-            "maestro.spawners.opencode.shutil.which",
-            return_value="/opt/homebrew/bin/opencode",
-        ):
-            assert opencode_spawner.is_available() is True
-
-    def test_opencode_unavailable_when_not_in_path(
-        self,
-        opencode_spawner: OpencodeSpawner,
-    ) -> None:
-        """Test is_available returns False when opencode is not in PATH."""
-        with patch(
-            "maestro.spawners.opencode.shutil.which",
-            return_value=None,
-        ):
-            assert opencode_spawner.is_available() is False
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_creates_process_with_correct_args(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        opencode_spawner: OpencodeSpawner,
-        sample_task: Task,
-        temp_dir: Path,
         catalog_env: Path,
     ) -> None:
         """Catalog default resolves and is provider-qualified on the argv."""
-        mock_process = MagicMock()
-        mock_popen.return_value = mock_process
-        mock_os_open.return_value = 42
-
-        log_file = temp_dir / "task.log"
-        workdir = Path(sample_task.workdir)
-
-        result = opencode_spawner.spawn(sample_task, "ctx", workdir, log_file)
-
-        mock_popen.assert_called_once()
-        call_args = mock_popen.call_args
-        cmd = call_args[0][0]
-
-        assert cmd[0] == "opencode"
-        assert cmd[1] == "run"
-        assert "--format" in cmd
-        assert cmd[cmd.index("--format") + 1] == "json"
+        req = opencode_spawner.build_request(
+            _mk_task(),
+            context="ctx",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
+        assert req.argv[0] == "opencode"
+        assert req.argv[1] == "run"
+        assert "--format" in req.argv
+        assert req.argv[req.argv.index("--format") + 1] == "json"
         # Fixture catalog default glm-5.1, prefixed for the CLI:
-        assert cmd[cmd.index("-m") + 1] == "opencode/glm-5.1"
-        assert call_args[1]["cwd"] == workdir
-        assert call_args[1]["stdout"] == 42
-        assert call_args[1]["stderr"] == subprocess.STDOUT
-        mock_os_close.assert_called_once_with(42)
-        assert result == mock_process
+        assert req.argv[req.argv.index("-m") + 1] == "opencode/glm-5.1"
+        assert req.required_tools == ["opencode"]
 
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_model_override_from_env(
+    def test_build_request_model_override_from_env(
         self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
         opencode_spawner: OpencodeSpawner,
-        sample_task: Task,
-        temp_dir: Path,
         catalog_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """MAESTRO_OPENCODE_MODEL overrides the catalog default."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-        workdir = Path(sample_task.workdir)
+        monkeypatch.setenv("MAESTRO_OPENCODE_MODEL", "qwen3.6")
+        req = opencode_spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
+        assert req.argv[req.argv.index("-m") + 1] == "opencode/qwen3.6"
 
-        with patch.dict(os.environ, {"MAESTRO_OPENCODE_MODEL": "qwen3.6"}):
-            opencode_spawner.spawn(sample_task, "", workdir, temp_dir / "t.log")
-
-        cmd = mock_popen.call_args[0][0]
-        assert cmd[cmd.index("-m") + 1] == "opencode/qwen3.6"
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_routed_model_beats_env(
+    def test_build_request_routed_model_beats_env(
         self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
         opencode_spawner: OpencodeSpawner,
-        sample_task: Task,
-        temp_dir: Path,
         catalog_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Precedence routed > env: routed model overrides MAESTRO_OPENCODE_MODEL."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-        workdir = Path(sample_task.workdir)
+        monkeypatch.setenv("MAESTRO_OPENCODE_MODEL", "env-model")
+        req = opencode_spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+            model="glm-5.1",
+        )
+        assert req.argv[req.argv.index("-m") + 1] == "opencode/glm-5.1"
 
-        with patch.dict(os.environ, {"MAESTRO_OPENCODE_MODEL": "env-model"}):
-            opencode_spawner.spawn(
-                sample_task, "", workdir, temp_dir / "t.log", model="glm-5.1"
-            )
-
-        cmd = mock_popen.call_args[0][0]
-        assert cmd[cmd.index("-m") + 1] == "opencode/glm-5.1"
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_provider_qualified_routed_model_not_double_prefixed(
+    def test_build_request_provider_qualified_routed_model_not_double_prefixed(
         self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
         opencode_spawner: OpencodeSpawner,
-        sample_task: Task,
-        temp_dir: Path,
         catalog_env: Path,
     ) -> None:
         """A routed 'provider/model' id passes through _qualify unchanged."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-        workdir = Path(sample_task.workdir)
-
-        opencode_spawner.spawn(
-            sample_task, "", workdir, temp_dir / "t.log", model="zai/glm-5.1"
+        req = opencode_spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+            model="zai/glm-5.1",
         )
+        assert req.argv[req.argv.index("-m") + 1] == "zai/glm-5.1"
 
-        cmd = mock_popen.call_args[0][0]
-        assert cmd[cmd.index("-m") + 1] == "zai/glm-5.1"
+    def test_build_request_emits_model_resolved_source(
+        self,
+        opencode_spawner: OpencodeSpawner,
+        catalog_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """agent.model_resolved reports the correct source for each origin."""
+        from structlog.testing import capture_logs
+
+        from maestro.catalog import load_catalog
+
+        with capture_logs() as logs:
+            opencode_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+                model="routed-x",
+            )
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "routed"
+        assert ev["model"] == "routed-x"
+        assert ev["harness"] == "opencode"
+
+        monkeypatch.setenv("MAESTRO_OPENCODE_MODEL", "env-y")
+        with capture_logs() as logs:
+            opencode_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+            )
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "env"
+        assert ev["model"] == "env-y"
+
+        monkeypatch.delenv("MAESTRO_OPENCODE_MODEL", raising=False)
+        with capture_logs() as logs:
+            opencode_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+            )
+        ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+        assert ev["source"] == "catalog"
+        cat = load_catalog()
+        assert cat is not None
+        assert ev["model"] == cat.default_model_for_harness("opencode")
+
+    def test_build_request_routed_model_halts_on_malformed_catalog(
+        self,
+        opencode_spawner: OpencodeSpawner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A routed model can't dodge a malformed catalog (halt is global)."""
+        from maestro.catalog import CatalogMalformed
+
+        fixture = Path(__file__).parent / "fixtures" / "agents-catalog-malformed.toml"
+        monkeypatch.setenv("ATP_CATALOG", str(fixture))
+
+        with pytest.raises(CatalogMalformed):
+            opencode_spawner.build_request(
+                _mk_task(),
+                context="",
+                workdir=Path("/tmp/wd"),
+                log_file=Path("/tmp/wd/t1.log"),
+                run_id="run-1",
+                model="routed-x",
+            )
 
 
 # =============================================================================
@@ -1175,155 +656,6 @@ class TestAiderSpawner:
         """Test that agent_type returns correct value."""
         assert aider_spawner.agent_type == "aider"
 
-    def test_aider_available_when_in_path(
-        self,
-        aider_spawner: AiderSpawner,
-    ) -> None:
-        """Test is_available returns True when aider is in PATH."""
-        with patch(
-            "maestro.spawners.aider.shutil.which",
-            return_value="/usr/local/bin/aider",
-        ):
-            assert aider_spawner.is_available() is True
-
-    def test_aider_unavailable_when_not_in_path(
-        self,
-        aider_spawner: AiderSpawner,
-    ) -> None:
-        """Test is_available returns False when aider is not in PATH."""
-        with patch(
-            "maestro.spawners.aider.shutil.which",
-            return_value=None,
-        ):
-            assert aider_spawner.is_available() is False
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_creates_process_with_correct_args(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        aider_spawner: AiderSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-    ) -> None:
-        """Test that spawn creates process with correct arguments."""
-        mock_process = MagicMock()
-        mock_popen.return_value = mock_process
-        mock_os_open.return_value = 42
-
-        log_file = temp_dir / "task.log"
-        context = "Some context"
-        workdir = Path(sample_task.workdir)
-
-        result = aider_spawner.spawn(sample_task, context, workdir, log_file)
-
-        mock_popen.assert_called_once()
-        call_args = mock_popen.call_args
-        cmd = call_args[0][0]
-
-        assert cmd[0] == "aider"
-        assert "--yes-always" in cmd
-        assert "--no-auto-commits" in cmd
-        assert "--message" in cmd
-        assert call_args[1]["cwd"] == workdir
-        assert call_args[1]["stdout"] == 42
-        assert call_args[1]["stderr"] == subprocess.STDOUT
-        mock_os_close.assert_called_once_with(42)
-        assert result == mock_process
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_includes_scope_files(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        aider_spawner: AiderSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-    ) -> None:
-        """Test that spawn includes scope files as arguments."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-
-        log_file = temp_dir / "task.log"
-        workdir = Path(sample_task.workdir)
-
-        aider_spawner.spawn(sample_task, "", workdir, log_file)
-
-        call_args = mock_popen.call_args
-        cmd = call_args[0][0]
-
-        # Scope files should be appended after --message <prompt>
-        assert "src/module.py" in cmd
-        assert "tests/test_module.py" in cmd
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_no_scope_files_when_empty(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        aider_spawner: AiderSpawner,
-        sample_task_no_scope: Task,
-        temp_dir: Path,
-    ) -> None:
-        """Test that spawn omits scope files when scope is empty."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-
-        log_file = temp_dir / "task.log"
-        workdir = Path(sample_task_no_scope.workdir)
-
-        aider_spawner.spawn(sample_task_no_scope, "", workdir, log_file)
-
-        call_args = mock_popen.call_args
-        cmd = call_args[0][0]
-
-        # Command should be: aider --yes-always --no-auto-commits
-        #                     --message <prompt>
-        # No extra file args
-        assert len(cmd) == 5
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_prompt_contains_task_info(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        aider_spawner: AiderSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-    ) -> None:
-        """Test that spawn passes prompt with task information."""
-        mock_popen.return_value = MagicMock()
-        mock_os_open.return_value = 42
-
-        log_file = temp_dir / "task.log"
-        context = "Previous task completed"
-        workdir = Path(sample_task.workdir)
-
-        aider_spawner.spawn(sample_task, context, workdir, log_file)
-
-        call_args = mock_popen.call_args
-        cmd = call_args[0][0]
-
-        # Find --message and get the prompt
-        msg_index = cmd.index("--message")
-        prompt = cmd[msg_index + 1]
-
-        assert sample_task.title in prompt
-        assert sample_task.prompt in prompt
-        assert context in prompt
-
 
 # =============================================================================
 # Unit Tests: AnnounceSpawner
@@ -1337,201 +669,167 @@ class TestAnnounceSpawner:
         """Test that agent_type returns correct value."""
         assert announce_spawner.agent_type == "announce"
 
-    def test_announce_always_available(self, announce_spawner: AnnounceSpawner) -> None:
-        """Test that announce spawner is always available."""
-        assert announce_spawner.is_available() is True
-
-    @patch("subprocess.Popen")
-    @patch("os.close")
-    @patch("os.open")
-    def test_spawn_creates_echo_process(
-        self,
-        mock_os_open: MagicMock,
-        mock_os_close: MagicMock,
-        mock_popen: MagicMock,
-        announce_spawner: AnnounceSpawner,
-        sample_task: Task,
-        temp_dir: Path,
-    ) -> None:
-        """Test that spawn creates an echo process."""
-        mock_process = MagicMock()
-        mock_popen.return_value = mock_process
-        mock_os_open.return_value = 42
-
-        log_file = temp_dir / "task.log"
-        context = "Some context"
-        workdir = Path(sample_task.workdir)
-
-        result = announce_spawner.spawn(sample_task, context, workdir, log_file)
-
-        mock_popen.assert_called_once()
-        call_args = mock_popen.call_args
-        cmd = call_args[0][0]
-
-        assert cmd[0] == "echo"
-        assert call_args[1]["cwd"] == workdir
-        assert call_args[1]["stdout"] == 42
-        assert call_args[1]["stderr"] == subprocess.STDOUT
-        mock_os_close.assert_called_once_with(42)
-        assert result == mock_process
-
-    @pytest.mark.integration
-    def test_announce_spawn_writes_to_log(
-        self,
-        announce_spawner: AnnounceSpawner,
-        temp_dir: Path,
-    ) -> None:
-        """Integration test: announce spawner writes to log file."""
-        task = Task(
-            id="announce-task",
-            title="Milestone Alpha",
-            prompt="All alpha tasks completed",
-            workdir=str(temp_dir),
-            agent_type=AgentType.ANNOUNCE,
-            scope=["docs/"],
-        )
-
-        log_file = temp_dir / "announce.log"
-        context = "Previous milestones done"
-
-        process = announce_spawner.spawn(task, context, temp_dir, log_file)
-        return_code = process.wait()
-
-        assert return_code == 0
-        log_content = log_file.read_text()
-        assert task.title in log_content
-        assert task.prompt in log_content
-        assert context in log_content
-
 
 # =============================================================================
-# Unit Tests: is_available checks (all spawners)
+# build_request() / can_build_request() golden-argv tests (Task 4)
 # =============================================================================
 
 
-class TestIsAvailableAllSpawners:
-    """Cross-spawner is_available tests."""
-
-    def test_codex_checks_codex_binary(self) -> None:
-        """Test that CodexSpawner checks for 'codex' binary."""
-        spawner = CodexSpawner()
-        with patch("maestro.spawners.codex.shutil.which") as mock_which:
-            mock_which.return_value = None
-            assert spawner.is_available() is False
-            mock_which.assert_called_once_with("codex")
-
-    def test_aider_checks_aider_binary(self) -> None:
-        """Test that AiderSpawner checks for 'aider' binary."""
-        spawner = AiderSpawner()
-        with patch("maestro.spawners.aider.shutil.which") as mock_which:
-            mock_which.return_value = None
-            assert spawner.is_available() is False
-            mock_which.assert_called_once_with("aider")
-
-    def test_claude_checks_claude_binary(self) -> None:
-        """Test that ClaudeCodeSpawner checks for 'claude' binary."""
-        spawner = ClaudeCodeSpawner()
-        with patch("maestro.spawners.claude_code.shutil.which") as mock_which:
-            mock_which.return_value = None
-            assert spawner.is_available() is False
-            mock_which.assert_called_once_with("claude")
-
-    def test_announce_needs_no_binary(self) -> None:
-        """Test that AnnounceSpawner requires no external binary."""
-        spawner = AnnounceSpawner()
-        # Should always be available regardless of PATH
-        assert spawner.is_available() is True
+def _mk_task() -> Task:
+    return Task(
+        id="t1",
+        title="T",
+        prompt="do it",
+        workdir="/tmp/wd",
+        agent_type=AgentType.CLAUDE_CODE,
+        scope=["a.py"],
+    )
 
 
-# =============================================================================
-# Integration Tests: Spawn with Mock (Additional Spawners)
-# =============================================================================
+def test_claude_build_request_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MAESTRO_CLAUDE_MODEL", "claude-sonnet-5")
+    req = ClaudeCodeSpawner().build_request(
+        _mk_task(),
+        context="ctx",
+        workdir=Path("/tmp/wd"),
+        log_file=Path("/tmp/wd/t1.log"),
+        run_id="run-1",
+    )
+    assert isinstance(req, ExecutionRequest)
+    assert req.argv[0] == "claude"
+    assert req.argv[1:4] == ["--model", "claude-sonnet-5", "--print"]
+    assert req.argv[-2] == "-p"
+    assert req.argv[-1].startswith("Task: T")
+    assert req.inherit_env is True
+    assert req.capture_output is False
+    assert req.collect.mode == "none"
+    assert req.required_tools == ["claude"]
+    assert req.workdir == Path("/tmp/wd")
+    assert req.log_path == Path("/tmp/wd/t1.log")
 
 
-class TestSpawnIntegrationAdditional:
-    """Integration tests for new spawners with real subprocess."""
+def test_claude_build_request_routed_model_beats_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Precedence routed > env: routed model overrides MAESTRO_CLAUDE_MODEL."""
+    monkeypatch.setenv("MAESTRO_CLAUDE_MODEL", "env-model")
+    req = ClaudeCodeSpawner().build_request(
+        _mk_task(),
+        context="",
+        workdir=Path("/tmp/wd"),
+        log_file=Path("/tmp/wd/t1.log"),
+        run_id="run-1",
+        model="routed-model",
+    )
+    assert req.argv[req.argv.index("--model") + 1] == "routed-model"
 
-    @pytest.mark.integration
-    def test_codex_spawn_with_mock(self, temp_dir: Path, catalog_env: Path) -> None:
-        """Test CodexSpawner with mocked Popen arguments."""
-        spawner = CodexSpawner()
-        task = Task(
-            id="codex-task",
-            title="Codex Test",
-            prompt="Test prompt for codex",
-            workdir=str(temp_dir),
-            agent_type=AgentType.CODEX,
-            scope=["app.py"],
+
+def test_claude_build_request_emits_model_resolved_source(
+    catalog_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """agent.model_resolved reports the correct source for each origin."""
+    from structlog.testing import capture_logs
+
+    from maestro.catalog import load_catalog
+
+    spawner = ClaudeCodeSpawner()
+
+    with capture_logs() as logs:
+        spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+            model="routed-x",
+        )
+    ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+    assert ev["source"] == "routed"
+    assert ev["model"] == "routed-x"
+    assert ev["harness"] == "claude_code"
+
+    monkeypatch.setenv("MAESTRO_CLAUDE_MODEL", "env-y")
+    with capture_logs() as logs:
+        spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
+    ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+    assert ev["source"] == "env"
+    assert ev["model"] == "env-y"
+
+    monkeypatch.delenv("MAESTRO_CLAUDE_MODEL", raising=False)
+    with capture_logs() as logs:
+        spawner.build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+        )
+    ev = next(e for e in logs if e["event"] == "agent.model_resolved")
+    assert ev["source"] == "catalog"
+    cat = load_catalog()
+    assert cat is not None
+    assert ev["model"] == cat.default_model_for_harness("claude_code")
+
+
+def test_claude_build_request_routed_model_halts_on_malformed_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routed model can't dodge a malformed catalog.
+
+    load_catalog() runs before resolve_model() in build_request(), so even a
+    routed task halts when $ATP_CATALOG points at a malformed file.
+    """
+    from maestro.catalog import CatalogMalformed
+
+    fixture = Path(__file__).parent / "fixtures" / "agents-catalog-malformed.toml"
+    monkeypatch.setenv("ATP_CATALOG", str(fixture))
+
+    with pytest.raises(CatalogMalformed):
+        ClaudeCodeSpawner().build_request(
+            _mk_task(),
+            context="",
+            workdir=Path("/tmp/wd"),
+            log_file=Path("/tmp/wd/t1.log"),
+            run_id="run-1",
+            model="routed-x",
         )
 
-        log_file = temp_dir / "codex.log"
 
-        with (
-            patch("subprocess.Popen") as mock_popen,
-            patch("os.open", return_value=42),
-            patch("os.close"),
-        ):
-            mock_process = MagicMock()
-            mock_process.wait.return_value = 0
-            mock_popen.return_value = mock_process
+def test_announce_build_request_argv() -> None:
+    req = AnnounceSpawner().build_request(
+        _mk_task(),
+        context="ctx",
+        workdir=Path("/tmp/wd"),
+        log_file=Path("/tmp/wd/t1.log"),
+        run_id="run-1",
+    )
+    assert req.argv[0] == "echo"
+    assert req.argv[1].startswith("Task: T")
+    assert req.required_tools == []  # echo is a shell builtin/coreutil; no gate
 
-            process = spawner.spawn(task, "ctx", temp_dir, log_file)
 
-            cmd = mock_popen.call_args[0][0]
-            assert cmd[0] == "codex"
-            assert cmd[1] == "exec"
-            assert process.wait() == 0
+def test_aider_build_request_appends_scope() -> None:
+    req = AiderSpawner().build_request(
+        _mk_task(),
+        context="ctx",
+        workdir=Path("/tmp/wd"),
+        log_file=Path("/tmp/wd/t1.log"),
+        run_id="run-1",
+    )
+    assert req.argv[0] == "aider"
+    assert req.argv[-1] == "a.py"  # scope file appended last
+    assert req.required_tools == ["aider"]
 
-    @pytest.mark.integration
-    def test_aider_spawn_with_mock(self, temp_dir: Path) -> None:
-        """Test AiderSpawner with mocked Popen arguments."""
-        spawner = AiderSpawner()
-        task = Task(
-            id="aider-task",
-            title="Aider Test",
-            prompt="Test prompt for aider",
-            workdir=str(temp_dir),
-            agent_type=AgentType.AIDER,
-            scope=["main.py", "utils.py"],
-        )
 
-        log_file = temp_dir / "aider.log"
-
-        with (
-            patch("subprocess.Popen") as mock_popen,
-            patch("os.open", return_value=42),
-            patch("os.close"),
-        ):
-            mock_process = MagicMock()
-            mock_process.wait.return_value = 0
-            mock_popen.return_value = mock_process
-
-            process = spawner.spawn(task, "ctx", temp_dir, log_file)
-
-            cmd = mock_popen.call_args[0][0]
-            assert cmd[0] == "aider"
-            assert "--yes-always" in cmd
-            assert "main.py" in cmd
-            assert "utils.py" in cmd
-            assert process.wait() == 0
-
-    @pytest.mark.integration
-    def test_announce_spawn_real_process(self, temp_dir: Path) -> None:
-        """Test AnnounceSpawner with real subprocess (echo)."""
-        spawner = AnnounceSpawner()
-        task = Task(
-            id="announce-int",
-            title="Integration Announce",
-            prompt="Announce integration test",
-            workdir=str(temp_dir),
-            agent_type=AgentType.ANNOUNCE,
-        )
-
-        log_file = temp_dir / "announce_int.log"
-
-        process = spawner.spawn(task, "context", temp_dir, log_file)
-        return_code = process.wait()
-
-        assert return_code == 0
-        log_content = log_file.read_text()
-        assert "Integration Announce" in log_content
+def test_can_build_request_true() -> None:
+    assert ClaudeCodeSpawner().can_build_request() is True
+    assert AnnounceSpawner().can_build_request() is True
+    assert CodexSpawner().can_build_request() is True
+    assert OpencodeSpawner().can_build_request() is True

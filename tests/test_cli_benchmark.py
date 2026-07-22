@@ -1,5 +1,7 @@
 """Tests for `maestro benchmark` (R-06b M5)."""
 
+import shutil
+import sys
 from pathlib import Path
 from typing import ClassVar
 
@@ -9,7 +11,7 @@ from typer.testing import CliRunner
 import maestro.cli as cli_mod
 from maestro.benchmark.models import BenchmarkResult
 from maestro.cli import app
-from maestro.models import Task
+from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.spawners.base import AgentSpawner
 
 
@@ -65,8 +67,17 @@ class FakeAdapter:
         return None
 
 
+_OK_LOG = '{"result": "ok", "usage": {"input_tokens": 10, "output_tokens": 5}}'
+
+
 class FakeBenchSpawner(AgentSpawner):
-    """Writes a claude-format log so cost parsing yields tokens."""
+    """Runs a trivial real subprocess that emits a claude-format log.
+
+    Uses ``sys.executable`` rather than the actual CLI so these tests
+    stay agent-CLI-agnostic and don't depend on ``claude``/``codex``/etc.
+    being installed — the responder now drives a real ``LocalBackend``,
+    so ``build_request`` must produce an argv that genuinely runs.
+    """
 
     def __init__(self, agent_type_str: str = "claude_code") -> None:
         self._agent_type = agent_type_str
@@ -75,19 +86,16 @@ class FakeBenchSpawner(AgentSpawner):
     def agent_type(self) -> str:
         return self._agent_type
 
-    def is_available(self) -> bool:
-        return True
-
-    def spawn(
-        self, task: Task, context, workdir, log_file, retry_context="", *, model=None
-    ):
-        import subprocess
-
-        log_file.write_text(
-            '{"result": "ok", "usage": {"input_tokens": 10, "output_tokens": 5}}',
-            encoding="utf-8",
+    def build_request(
+        self, task, context, workdir, log_file, run_id, retry_context="", *, model=None
+    ) -> ExecutionRequest:
+        return ExecutionRequest(
+            run_id=run_id,
+            argv=[sys.executable, "-c", f"import sys; sys.stdout.write({_OK_LOG!r})"],
+            workdir=workdir,
+            log_path=log_file,
+            collect=CollectPolicy(mode="none"),
         )
-        return subprocess.Popen(["true"])
 
 
 @pytest.fixture(autouse=True)
@@ -97,6 +105,7 @@ def _reset_fakes(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         cli_mod, "_bench_spawner_for", lambda agent: FakeBenchSpawner(agent)
     )
+    monkeypatch.setattr(cli_mod, "_agent_cli_available", lambda _agent: True)
     monkeypatch.delenv("MAESTRO_ARBITER_BIN", raising=False)
     monkeypatch.delenv("MAESTRO_ATP_BASE_URL", raising=False)
 
@@ -123,12 +132,18 @@ class TestAgentValidation:
     def test_unavailable_agent_cli_short_circuits(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        class Unavailable(FakeBenchSpawner):
-            def is_available(self) -> bool:
-                return False
-
+        monkeypatch.setitem(
+            cli_mod._BENCH_CLI_BY_AGENT,
+            "claude_code",
+            "definitely-not-a-real-cli-xyz",
+        )
+        # Override the autouse fixture's blanket True so this test genuinely
+        # exercises the real `shutil.which` PATH lookup (against a binary
+        # name that cannot exist) rather than the faked-available default.
         monkeypatch.setattr(
-            cli_mod, "_bench_spawner_for", lambda agent: Unavailable(agent)
+            cli_mod,
+            "_agent_cli_available",
+            lambda agent: shutil.which(cli_mod._BENCH_CLI_BY_AGENT[agent]) is not None,
         )
         result = runner.invoke(app, ["benchmark", "b1", "--agent", "claude_code"])
         assert result.exit_code == 1
@@ -215,20 +230,28 @@ class TestHappyPath:
         """A failing task lands in the table, not the exit code."""
 
         class ErroringSpawner(FakeBenchSpawner):
-            def spawn(
+            def build_request(
                 self,
                 task,
                 context,
                 workdir,
                 log_file,
+                run_id,
                 retry_context="",
                 *,
                 model=None,
-            ):
-                import subprocess
-
-                log_file.write_text("no usable json", encoding="utf-8")
-                return subprocess.Popen(["false"])
+            ) -> ExecutionRequest:
+                return ExecutionRequest(
+                    run_id=run_id,
+                    argv=[
+                        sys.executable,
+                        "-c",
+                        "import sys; sys.stdout.write('no usable json'); sys.exit(1)",
+                    ],
+                    workdir=workdir,
+                    log_path=log_file,
+                    collect=CollectPolicy(mode="none"),
+                )
 
         monkeypatch.setattr(
             cli_mod, "_bench_spawner_for", lambda agent: ErroringSpawner(agent)

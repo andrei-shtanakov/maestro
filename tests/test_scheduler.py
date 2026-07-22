@@ -5,6 +5,7 @@ import subprocess
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock
 
 import anyio
@@ -12,6 +13,7 @@ import pytest
 
 from maestro.dag import DAG
 from maestro.database import Database, create_database
+from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.models import AgentType, Task, TaskConfig, TaskStatus
 from maestro.retry import RetryManager
 from maestro.scheduler import (
@@ -23,6 +25,31 @@ from maestro.scheduler import (
     TaskTimeoutError,
     create_scheduler_from_config,
 )
+from tests.fakes.fake_execution_backend import FakeExecutionBackend
+
+
+@pytest.fixture(autouse=True)
+def _fake_execution_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch every Scheduler's LocalBackend with a fake for this module.
+
+    `Scheduler.__init__` does `self._backend = LocalBackend()`; patching the
+    name in `maestro.scheduler` makes every scheduler built in this file use
+    `FakeExecutionBackend` instead, so `spawner.build_request(...)` +
+    `await self._backend.run(request)` never spawns a real subprocess. See
+    tests/fakes/fake_execution_backend.py for the handle/backend doubles.
+    """
+    monkeypatch.setattr("maestro.scheduler.LocalBackend", FakeExecutionBackend)
+
+
+def _fake_backend(scheduler: Scheduler) -> FakeExecutionBackend:
+    """Type-narrowing accessor for `scheduler._backend` in tests.
+
+    Statically typed as `LocalBackend` on `Scheduler`; the autouse fixture
+    above swaps in a `FakeExecutionBackend` at runtime, so tests that need
+    `created_handles` go through this cast instead of a raw attribute access
+    pyrefly can't verify.
+    """
+    return cast("FakeExecutionBackend", scheduler._backend)
 
 
 # =============================================================================
@@ -117,6 +144,46 @@ class MockSpawner(BaseSpawner):
         self._mock_processes.append(mock_process)
         return mock_process
 
+    def build_request(
+        self,
+        task: Task,
+        context: str,
+        workdir: Path,
+        log_file: Path,
+        run_id: str,
+        retry_context: str = "",
+        *,
+        model: str | None = None,
+    ) -> ExecutionRequest:
+        """Build a fake request; behavior is decoded by FakeExecutionBackend.
+
+        `required_tools` carries the ``available`` flag forward: a bogus,
+        never-installed tool name makes `FakeExecutionBackend.can_run`
+        (which reuses LocalBackend's real `shutil.which` check) report
+        `ok=False`, reproducing the old `is_available() == False` failure
+        without any backend-specific test wiring.
+        """
+        self._spawn_count += 1
+        self._spawned_tasks.append(task)
+        self._spawned_contexts.append(context)
+        self._spawned_retry_contexts.append(retry_context)
+        self._spawned_models.append(model)
+
+        required_tools = [] if self._available else ["__mock_spawner_unavailable__"]
+        return ExecutionRequest(
+            run_id=run_id,
+            argv=["true"],
+            workdir=workdir,
+            log_path=log_file,
+            collect=CollectPolicy(mode="none"),
+            required_tools=required_tools,
+            labels={
+                "fake_return_code": str(self._return_code),
+                "fake_delay_seconds": str(self._delay_seconds),
+                "fake_pid": str(12345 + self._spawn_count),
+            },
+        )
+
 
 class FailingSpawner(BaseSpawner):
     """Spawner that always fails to spawn."""
@@ -141,9 +208,23 @@ class FailingSpawner(BaseSpawner):
         msg = "Spawn failed intentionally"
         raise RuntimeError(msg)
 
+    def build_request(
+        self,
+        task: Task,
+        context: str,
+        workdir: Path,
+        log_file: Path,
+        run_id: str,
+        retry_context: str = "",
+        *,
+        model: str | None = None,
+    ) -> ExecutionRequest:
+        msg = "Spawn failed intentionally"
+        raise RuntimeError(msg)
+
 
 class RaisingSpawner(BaseSpawner):
-    """Spawner whose spawn() raises a supplied exception."""
+    """Spawner whose spawn()/build_request() raises a supplied exception."""
 
     def __init__(self, exc: Exception, agent_type_name: str = "claude_code") -> None:
         self._exc = exc
@@ -166,6 +247,19 @@ class RaisingSpawner(BaseSpawner):
         *,
         model: str | None = None,
     ) -> subprocess.Popen[bytes]:
+        raise self._exc
+
+    def build_request(
+        self,
+        task: Task,
+        context: str,
+        workdir: Path,
+        log_file: Path,
+        run_id: str,
+        retry_context: str = "",
+        *,
+        model: str | None = None,
+    ) -> ExecutionRequest:
         raise self._exc
 
 
@@ -360,11 +454,11 @@ class TestReadyTaskResolution:
         )
 
         # Simulate task-a is running
-        mock_process = MagicMock()
-        mock_process.poll.return_value = None
+        mock_handle = MagicMock()
+        mock_handle.poll.return_value = None
         scheduler._running_tasks["task-a"] = RunningTask(
             task=Task.from_config(independent_task_configs[0], "/tmp"),
-            process=mock_process,
+            handle=mock_handle,
             started_at=datetime.now(UTC),
             log_file=Path("/tmp/task-a.log"),
         )
@@ -882,7 +976,7 @@ class TestTimeoutHandling:
             await scheduler._monitor_running_tasks()
 
             # Process should have been terminated
-            assert running_task.process.terminate.called  # type: ignore[union-attr]
+            assert running_task.handle.terminate_called  # type: ignore[attr-defined]
 
             # Task should be in NEEDS_REVIEW
             task = await db.get_task("slow-task")
@@ -997,9 +1091,13 @@ class TestGracefulShutdown:
             await scheduler.shutdown()
             await scheduler._cleanup()
 
-            # All processes should be terminated
-            for mock_proc in mock_spawner._mock_processes:
-                assert mock_proc.terminate.called
+            # All processes should be terminated. `scheduler._backend`
+            # outlives `_running_tasks` (cleared by `_cleanup()` below), so
+            # handles are inspected off the backend, not the spawner.
+            created_handles = _fake_backend(scheduler).created_handles
+            assert created_handles
+            for handle in created_handles:
+                assert handle.terminate_called
 
             # Running tasks should be cleared
             assert scheduler.running_count == 0
@@ -1248,21 +1346,64 @@ class TestRunningTask:
             prompt="Test prompt",
             workdir=str(temp_dir),
         )
-        mock_process = MagicMock(spec=subprocess.Popen)
+        mock_handle = MagicMock()
         started = datetime.now(UTC)
         log_file = temp_dir / "test.log"
 
         running_task = RunningTask(
             task=task,
-            process=mock_process,
+            handle=mock_handle,
             started_at=started,
             log_file=log_file,
         )
 
         assert running_task.task == task
-        assert running_task.process == mock_process
+        assert running_task.handle == mock_handle
         assert running_task.started_at == started
         assert running_task.log_file == log_file
+        assert not hasattr(running_task, "process")
+
+    @pytest.mark.anyio
+    async def test_running_task_holds_handle_after_spawn(
+        self, temp_db_path: Path, temp_dir: Path
+    ) -> None:
+        """After a task starts via the scheduler, RunningTask exposes
+        `.handle` (a TaskHandle from the ExecutionBackend), not `.process`."""
+        configs = [
+            TaskConfig(
+                id="handle-task",
+                title="Handle Task",
+                prompt="do it",
+                agent_type=AgentType.CLAUDE_CODE,
+            )
+        ]
+
+        db = await create_database(temp_db_path)
+        try:
+            for config in configs:
+                await db.create_task(Task.from_config(config, str(temp_dir)))
+
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG(configs),
+                spawners={"claude_code": MockSpawner()},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+            )
+
+            ready = scheduler._resolve_ready_tasks(set())
+            await scheduler._spawn_ready_tasks(ready)
+
+            running = next(iter(scheduler._running_tasks.values()))
+            assert hasattr(running, "handle")
+            assert not hasattr(running, "process")
+            # `running.handle` must be the exact FakeTaskHandle the backend's
+            # `run()` created for this task — not just some object that
+            # happens to expose `.poll()`.
+            created = _fake_backend(scheduler).created_handles
+            assert len(created) == 1
+            assert running.handle is created[0]
+        finally:
+            await db.close()
 
 
 # =============================================================================
@@ -1442,6 +1583,74 @@ class TestSpawnerErrorHandling:
             task = await db.get_task("unavailable-agent-task")
             assert task.status == TaskStatus.FAILED
             assert "not available" in (task.error_message or "")
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_unavailable_spawner_never_transitions_to_running(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """Regression: a missing required tool must fail READY->FAILED,
+        never READY->RUNNING->FAILED.
+
+        Locks the ordering fix in `_spawn_task`: `backend.can_run()` now
+        gates before the READY->RUNNING DB write and before `task.spawn`'s
+        span opens. Verifies via two independent signals that RUNNING was
+        never entered:
+        - no ("ready", "running") status-change callback fires
+        - `started_at` stays unset (it is only stamped on the RUNNING
+          transition, see `Task.with_status_update`)
+        """
+        configs = [
+            TaskConfig(
+                id="unavailable-agent-task",
+                title="Task with unavailable agent",
+                prompt="Test prompt",
+                agent_type=AgentType.CLAUDE_CODE,
+            )
+        ]
+
+        db = await create_database(temp_db_path)
+        try:
+            for config in configs:
+                task = Task.from_config(config, str(temp_dir))
+                await db.create_task(task)
+
+            changes: list[tuple[str, str, str]] = []
+
+            def on_status_change(task_id: str, old: str, new: str) -> None:
+                changes.append((task_id, old, new))
+
+            # Create spawner that reports unavailable (missing required tool)
+            mock_spawner = MockSpawner(available=False)
+            dag = DAG(configs)
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                log_dir=temp_dir / "logs",
+            )
+
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={"claude_code": mock_spawner},
+                config=scheduler_config,
+                on_status_change=on_status_change,
+            )
+
+            ready = scheduler._resolve_ready_tasks(set())
+            await scheduler._spawn_ready_tasks(ready)
+
+            task = await db.get_task("unavailable-agent-task")
+            assert task.status == TaskStatus.FAILED
+            assert task.started_at is None, (
+                "started_at must stay unset — it is only stamped on the "
+                "READY->RUNNING transition, which a missing tool must never "
+                "reach"
+            )
+            assert ("unavailable-agent-task", "ready", "running") not in changes
         finally:
             await db.close()
 
@@ -1918,8 +2127,8 @@ class TestCatalogFaultHandling:
 
             assert scheduler._running_tasks == {}
             assert delayed_spawner.spawn_count == 1
-            tracked_process = delayed_spawner._mock_processes[0]
-            assert tracked_process.terminate.called
+            tracked_handle = _fake_backend(scheduler).created_handles[0]
+            assert tracked_handle.terminate_called
         finally:
             await db.close()
 
