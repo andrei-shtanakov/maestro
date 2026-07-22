@@ -18,6 +18,13 @@ dependencies = [
     "cryptography>=48.0.1",
     "fastapi>=0.128.1",
     "fastmcp>=2.14.5",
+    # Direct security floor for the transitive `mcp` SDK: fastmcp only
+    # requires mcp>=1.24.0, a range that still admits versions vulnerable to
+    # CVE-2026-59950 / -52869 / -52870 (WebSocket Host/Origin bypass, HTTP
+    # principal-verification gaps, cross-client task access). Pin the floor at
+    # the first fully-patched release so the resolver can never select a
+    # vulnerable mcp within fastmcp's window.
+    "mcp>=1.28.1",
     "pydantic>=2.12.5",
     "pyjwt>=2.13.0",
     "pyyaml>=6.0.3",
