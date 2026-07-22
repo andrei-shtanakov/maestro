@@ -1,0 +1,253 @@
+# Executable scope-gate — design
+
+- **Date:** 2026-07-22
+- **Status:** approved (brainstorming)
+- **Scope:** idea #7a from `../prograph-vault/authored/notes/2026-07-22-ideas-from-ai-repos-research.md`
+  (interfaces-ledger half, #7b, is explicitly out of scope)
+
+## 1. Problem
+
+A workstream declares a `scope` (list of file/dir globs). Today that scope is
+enforced only two ways, and neither guarantees the workstream's *actual*
+changes stay inside it:
+
+- **Preflight** (`maestro/preflight.py`) checks scope *overlap between*
+  workstreams before the run. It never checks whether a workstream's committed
+  diff adheres to its own declared scope.
+- **WS-006 gates** (`maestro/gates.py::GateKeeper`) are **opt-in** and delegate
+  classification to an external `steward risk-classify` binary. The ex-post
+  gate already computes the actual diff and can emit a `scope_violation` flag —
+  but only if steward is configured (`config.gates is not None`) and only as a
+  risk-tier judgement, not a deterministic structural check.
+
+**Gap:** when `config.gates is None` (the default), nothing stops a workstream
+from committing changes to files *outside* its declared scope and merging them
+into the base branch. Scope containment is currently a prompt-level expectation,
+not an executable invariant.
+
+## 2. Goal
+
+Make scope containment a deterministic, always-on, executable gate:
+
+> A workstream's committed diff (`base..HEAD`, minus orchestrator-managed
+> artifacts) must touch only paths matched by its declared `scope`. Any escape
+> blocks the merge (exit≠0 / `NEEDS_REVIEW`), with a deliberate operator
+> override.
+
+This is the codex-build `check_scope.py` philosophy: declared scope = allowlist,
+any path outside → hard fail — no LLM, no risk model, no human in the common
+path.
+
+## 3. Architecture
+
+Three parts, split by responsibility so the matching logic is pure and
+transport-agnostic while the git dependency stays at the edge:
+
+### 3.1 Pure core — `maestro/scope_gate.py`
+
+No git, no DB, no filesystem. One function:
+
+```python
+def find_escapes(
+    changed_paths: list[str],   # normalized, repo-relative, POSIX
+    scope: list[str],           # normalized glob patterns
+) -> list[str]:
+    """Return the subset of changed_paths matched by no scope pattern.
+
+    Empty result == containment holds. Empty scope == skip (returns []).
+    """
+```
+
+Fully unit-testable on lists of strings. Callers pass **already-normalized**
+paths and patterns; the core does not normalize, glob the filesystem, or shell
+out.
+
+### 3.2 Changed-paths source — git helper
+
+Kept explicitly separate from the pure matcher:
+
+```python
+async def changed_paths_since(
+    base_ref: str, head_ref: str, repo_root: Path
+) -> list[str]:
+    """`git diff --name-only base_ref..head_ref`, orchestrator-managed
+    artifacts filtered out, normalized to repo-relative POSIX paths."""
+```
+
+The `git diff --name-only` + `_orchestrator_managed` filter logic currently
+lives inside `GateKeeper` (`gates.py::_git_diff_paths`, `_orchestrator_managed`).
+Extract it into a shared location so both the always-on scope-gate and
+`GateKeeper` use one implementation — the scope-gate must **not** depend on a
+`GateKeeper` instance existing (it only exists when steward gates are
+configured). This is a targeted, non-speculative refactor: no behavior change to
+`GateKeeper`, one source of truth for "what did this workstream change".
+
+**Transport seam (Phase 1+):** for remote/Docker backends the changed-path
+source moves to the execution-layer `collect` step (`CollectPolicy`,
+`CollectResult`) rather than a local `git diff`. The pure core is unchanged;
+only the source is swapped. This design wires the Phase-0 local source and
+leaves that seam explicit — no contract changes now.
+
+### 3.3 Callers
+
+- Orchestrator ex-post edge (always-on gate).
+- `maestro check-scope` CLI (operator/CI inspection).
+
+## 4. Glob semantics (pure core)
+
+Pathlib-`Path.glob`-compatible **string** matching (not filesystem globbing —
+`git diff` reports deleted paths that no longer exist on disk, so
+`repo.glob()` would miss them). Implemented via a small glob→regex translator,
+**no new dependency**.
+
+- `**` matches any number of path segments (including zero).
+- `*` matches within a single segment; it does **not** cross `/`.
+- A pattern with no glob metacharacters is an **exact match only**:
+  `src/foo.py` matches exactly `src/foo.py`.
+- `src/**` covers `src/foo.py` and `src/a/b.py`.
+- `dir/**` matches the **contents** of `dir`, not `dir` itself. Matching `dir`
+  itself would need `dir` or `dir/**` as a separate pattern. (Minor: `git diff`
+  reports files, not bare directories.)
+- Matching is case-sensitive (POSIX paths).
+
+**Normalization** happens in the source layer *before* the core: strip a
+leading `./`, use POSIX separators, ensure repo-relative. The core assumes
+normalized input on both sides.
+
+**Empty scope → skip:** `find_escapes(paths, [])` returns `[]`. Enforcing an
+empty scope would be a breaking always-on failure, and preflight already emits a
+`scope-empty` warning for it.
+
+**Renames:** the source does **not** pass `-M`, so `--name-only` reports a
+rename as a delete (old path) + add (new path). The gate checks *every* affected
+repo-relative path independently — it does not try to understand rename
+semantics. Stricter, simpler, and correct for containment: if either endpoint of
+a rename is outside scope, that endpoint is an escape.
+
+## 5. Orchestrator integration
+
+Insert into `_handle_success`, **before** `_gate_ex_post` — the cheap
+deterministic check runs first (fail fast); the optional steward risk gate runs
+after. Both must pass to reach `MERGING`.
+
+**Always-on:** the scope-gate runs regardless of `config.gates`. This differs
+from `GateKeeper`, which is opt-in. It is an intentional behavior change:
+workstreams whose committed diff escapes their declared scope now block by
+default. Workstreams with correct/loose scopes are unaffected.
+
+**On escape:** `RUNNING → NEEDS_REVIEW`, worktree left **intact** for
+inspection, `error_message = "scope escape: <paths>"` (see §5.1). Stats mirror
+the existing ex-post block path (`stats.failed += 1`).
+
+The steward ex-post gate is untouched; its own risk-model `scope_violation` flag
+now sits above a deterministic floor. Independent sources — acceptable
+redundancy.
+
+### 5.1 Message length
+
+The `error_message` is truncated for readability:
+
+```
+scope escape: a.py, b.py, c.py, ... (+N more)
+```
+
+The **full** escape list is emitted via the orchestrator's structured logger
+(always available, independent of whether `GateKeeper`/steward is configured),
+never dropped. It is not conditional on the `gate_verdicts.jsonl` stream, which
+only exists under `GateKeeper`.
+
+### 5.2 Evaluation order (avoid redundant git work)
+
+Check the approval **before** computing the diff:
+
+```
+sha = worktree HEAD
+if (phase="ex_post", sha) in approvals:   # operator already waived this sha
+    skip scope-gate  ->  proceed
+else:
+    paths = changed_paths_since(base, HEAD, worktree)
+    escapes = find_escapes(paths, scope)
+    if escapes: block -> NEEDS_REVIEW
+```
+
+This avoids a wasted `git diff` on every H-6 resume.
+
+## 6. Override & recovery
+
+Reuse the existing gate-approval + H-6 machinery — no new tables, no
+reason-specific approvals in this PR:
+
+- `maestro workstream-approve <ws>` records an approval in `gate_approvals`,
+  keyed `(phase="ex_post", sha)`.
+- A single approval clears the ex-post edge **regardless of cause** — a
+  deterministic scope escape and/or a steward tier. Approvals key on
+  `(phase, sha)`, not on the reason.
+- Re-queue → `_try_resume_ex_post` (H-6): if the worktree HEAD still equals the
+  approved sha → `RUNNING` → `_handle_success` re-runs → the scope-gate sees the
+  approval (§5.2) and skips → steward gate (if any) sees it too → `MERGING` →
+  merge → `DONE`.
+- **Requirement:** the scope-gate MUST honor `(ex_post, sha) in approvals` and
+  skip; otherwise the resume loops forever.
+
+## 7. CLI — `maestro check-scope <workstream-id>`
+
+Mirrors exactly what the gate computes; for operator inspection and CI.
+
+```
+maestro check-scope <workstream-id> --db maestro.db
+```
+
+- Resolves the workstream's `scope` (DB) and worktree, computes
+  `changed_paths_since` + `find_escapes`, prints escaping paths.
+
+**Exit codes:**
+
+- `0` — clean, or scope empty / skipped.
+- `1` — escapes found (paths printed).
+- `2` — invalid input: unknown workstream, unreadable DB, missing worktree, or
+  bad base/HEAD state.
+
+Aligned with `maestro workstreams` / `maestro workstream-approve` CLI
+conventions. `--json` output is **deferred** (not this PR).
+
+## 8. Config
+
+**None.** Always-on, no toggle. Scope lives in the workstream spec, so its
+enforcement is a deterministic safety invariant, not an option. Fewer surfaces.
+
+## 9. Testing
+
+**Pure core (`find_escapes`)** — table of cases:
+
+- exact match; `dir/**` contents; `*` does not cross `/`; nested globs; escape
+  in a parent dir; empty scope → `[]`; deleted-path string (not on FS) still
+  matched.
+
+**Rename cases** (delete+add via `--name-only`, no `-M`):
+
+- inside-scope file renamed outside → escape includes the dest; source clean.
+- outside file renamed inside → escape includes the source.
+- outside → outside by a scoped workstream → both endpoints escape.
+- inside → inside → clean.
+
+**Source helper (`changed_paths_since`)** — on a temp repo: added / deleted /
+renamed file, orchestrator-managed filter.
+
+**Integration:**
+
+- escape → `NEEDS_REVIEW` + worktree intact; `stats.failed` incremented.
+- approve → resume → `DONE` (H-6), no redundant diff on resume (§5.2).
+- always-on when `config.gates is None`.
+
+**Regression:** a clean workstream (all changes in scope) passes unchanged.
+
+**CLI:** exit `0` / `1` / `2` paths.
+
+## 10. Out of scope
+
+- #7b interfaces ledger (verified public-interface publication → dependent
+  briefs).
+- Remote/Docker changed-path source (Phase 1+ execution `collect`).
+- `maestro check-scope --json`.
+- Uncommitted-change enforcement (only committed `base..HEAD` merges, so the
+  committed diff is the complete and correct surface).
