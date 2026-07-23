@@ -36,6 +36,10 @@ class BackendResolver:
                 raise ExecutionConfigError(
                     "backend 'docker' selected but no execution.docker config"
                 )
-            # Real docker backend is wired in Task 13.
-            raise ExecutionConfigError("docker backend not yet available (Task 13)")
+            from maestro.execution.docker_cli import DockerCli
+            from maestro.execution.isolators import DockerIsolator
+
+            docker = DockerCli()
+            isolator = DockerIsolator(self._execution.docker, docker=docker)
+            return LocalBackend(isolator, backend_id="docker", docker=docker)
         raise ExecutionConfigError(f"unknown backend '{name}'")

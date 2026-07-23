@@ -1,6 +1,6 @@
 import pytest
 
-from maestro.execution.exec_config import ExecutionConfig
+from maestro.execution.exec_config import DockerConfig, ExecutionConfig
 from maestro.execution.local import LocalBackend
 from maestro.execution.resolver import BackendResolver, ExecutionConfigError
 
@@ -38,3 +38,19 @@ def test_resolve_uses_entity_backend_then_default():
     assert r.resolve(None).id == "local"
     # explicit local
     assert r.resolve("local").id == "local"
+
+
+def test_docker_resolves_when_config_present():
+    r = BackendResolver(ExecutionConfig(docker=DockerConfig(image="maestro-runner:x")))
+    backend = r.resolve("docker")
+    assert backend.id == "docker"
+
+
+@pytest.mark.anyio
+async def test_docker_healthcheck_rejects_ssh_docker_host(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "ssh://gpu-box")
+    r = BackendResolver(ExecutionConfig(docker=DockerConfig(image="i")))
+    backend = r.resolve("docker")
+    health = await backend.healthcheck()
+    assert health.reachable is False
+    assert "DOCKER_HOST" in health.detail

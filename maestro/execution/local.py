@@ -5,7 +5,7 @@ import contextlib
 import os
 import shutil
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from maestro._vendor.obs import child_env
 from maestro.execution.env import build_local_env  # noqa: F401 (re-exported)
@@ -25,7 +25,8 @@ if TYPE_CHECKING:
     # Imported only for type hints: isolators.py imports this module, so a
     # runtime import here would create a circular import.
     from maestro.execution.backend import TaskHandle
-    from maestro.execution.isolators import Isolator
+    from maestro.execution.docker_cli import DockerCli
+    from maestro.execution.isolators import DockerIsolator, Isolator
 
 
 _TAIL_LIMIT = 4000
@@ -136,11 +137,22 @@ def _cleanup_prepared(prepared: PreparedRun) -> None:
 
 
 class LocalBackend:
-    """Runs an ExecutionRequest as a local asyncio subprocess."""
+    """Runs an ExecutionRequest as a local asyncio subprocess.
 
-    id = "local"
+    Isolation-aware: with no `docker` client, `healthcheck`/`can_run` behave
+    exactly as the plain local backend always has. Passing a `DockerCli`
+    (paired with a `DockerIsolator`, see `resolver.py`) switches `healthcheck`
+    to a daemon/DOCKER_HOST reachability check and `can_run` to an image
+    presence gate — the composition the docker backend is built from.
+    """
 
-    def __init__(self, isolator: "Isolator | None" = None) -> None:
+    def __init__(
+        self,
+        isolator: "Isolator | None" = None,
+        *,
+        backend_id: str = "local",
+        docker: "DockerCli | None" = None,
+    ) -> None:
         # Default BareIsolator; imported lazily to break the import cycle
         # (isolators.py imports LocalTaskHandle from this module).
         if isolator is None:
@@ -148,13 +160,38 @@ class LocalBackend:
 
             isolator = BareIsolator()
         self._isolator = isolator
+        self._backend_id = backend_id
+        self._docker = docker
+
+    @property
+    def id(self) -> str:
+        return self._backend_id
 
     async def healthcheck(self) -> BackendHealth:
+        if self._docker is None:
+            return BackendHealth(reachable=True)
+        host = os.environ.get("DOCKER_HOST", "")
+        if host.startswith("ssh://") or host.startswith("tcp://"):
+            return BackendHealth(
+                reachable=False,
+                detail=f"DOCKER_HOST={host!r} is remote; Phase 1 is local only",
+            )
+        if not await self._docker.version_ok():
+            return BackendHealth(reachable=False, detail="docker daemon unreachable")
         return BackendHealth(reachable=True)
 
     async def can_run(self, req: ExecutionRequest) -> CapabilityResult:
-        missing = [t for t in req.required_tools if shutil.which(t) is None]
-        return CapabilityResult(ok=not missing, missing_tools=missing)
+        if self._docker is None:
+            missing = [t for t in req.required_tools if shutil.which(t) is None]
+            return CapabilityResult(ok=not missing, missing_tools=missing)
+        # Docker: image presence is the Phase-1 capability gate; a full
+        # in-image tool probe (a --rm helper container) is exercised by
+        # integration tests. `self._docker is not None` here implies the
+        # resolver paired this backend with a DockerIsolator (resolver.py).
+        image = cast("DockerIsolator", self._isolator)._cfg.image
+        if not await self._docker.image_exists(image):
+            return CapabilityResult(ok=False, missing_tools=[f"image:{image}"])
+        return CapabilityResult(ok=True)
 
     async def run(self, req: ExecutionRequest) -> "TaskHandle":
         plan = self._isolator.prepare(
