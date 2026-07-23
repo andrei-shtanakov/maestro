@@ -1764,8 +1764,10 @@ class TestStatusChangeCallback:
             spawners={},
             on_status_change=callback,
         )
-        # Verify the helper invokes the callback
-        scheduler._report_status_change("t1", "ready", "running")
+        # The callback is wired into the transition dispatcher, which invokes
+        # it (with plain strings) on every real status transition.
+        assert scheduler._dispatcher._status_change_cb is callback
+        scheduler._dispatcher._status_change_cb("t1", "ready", "running")
         assert changes == [("t1", "ready", "running")]
 
     def test_scheduler_no_callback(self) -> None:
@@ -1777,8 +1779,8 @@ class TestStatusChangeCallback:
             dag=dag,
             spawners={},
         )
-        # Should not raise
-        scheduler._report_status_change("t1", "ready", "running")
+        # No callback wired into the dispatcher -> transitions never crash.
+        assert scheduler._dispatcher._status_change_cb is None
 
 
 class TestAutoCommit:
