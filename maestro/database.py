@@ -635,9 +635,16 @@ class Database:
         `CREATE TABLE IF NOT EXISTS` (+ its indexes) — a no-op on databases
         whose SCHEMA_SQL already created the table; creates it for
         pre-v7 databases. Mirrors `_migrate_gate_approvals` (migration 6).
+
+        Uses three sequential `execute()` calls rather than `executescript()`:
+        `executescript()` implicitly commits any pending transaction before
+        running (then runs in autocommit), which would force-commit the
+        batch of migrations 1-6 mid-loop and break the single-final-commit
+        atomicity `initialize_schema()` relies on. `execute()` leaves the
+        transaction open, matching every other migration in this list.
         """
         assert self._connection is not None
-        await self._connection.executescript(
+        await self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS execution_handles (
                 execution_id   TEXT PRIMARY KEY,
@@ -649,12 +656,16 @@ class Database:
                 state          TEXT NOT NULL CHECK (state IN ('prepared','running','terminal','cleaned')),
                 created_at     TEXT NOT NULL,
                 finished_at    TEXT
-            );
-            CREATE INDEX IF NOT EXISTS ix_exec_state_backend
-                ON execution_handles (state, backend_id);
-            CREATE INDEX IF NOT EXISTS ix_exec_entity
-                ON execution_handles (entity_kind, entity_id, attempt);
+            )
             """
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_exec_state_backend "
+            "ON execution_handles (state, backend_id)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_exec_entity "
+            "ON execution_handles (entity_kind, entity_id, attempt)"
         )
 
     async def _migrate_entity_backend_columns(self) -> None:
