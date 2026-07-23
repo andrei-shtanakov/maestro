@@ -4,6 +4,8 @@
 `materialize` performs the filesystem side effects right before spawn.
 """
 
+import os
+import shutil
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -161,12 +163,53 @@ class DockerIsolator:
         )
 
     def materialize(self, plan: PreparedRunPlan) -> PreparedRun:
-        """Materialize plan into run (not implemented yet; Task 11)."""
-        raise NotImplementedError("Task 11")
+        """Create the tmp dir (0700) and, if secrets are planned, the env-file (0600).
 
-    def transport_ref(self, prepared: PreparedRun, pid: int) -> str:
-        """Compute transport reference (not implemented yet; Task 11)."""
-        raise NotImplementedError("Task 11")
+        Secret VALUES are read from `os.environ` here (not in `prepare`), and each
+        value is validated to reject embedded `\\n`, `\\r`, or NUL — a raw value
+        containing one of those could corrupt the `KEY=value` env-file format or
+        smuggle extra lines into it. On any failure, partial artifacts (the tmp
+        dir and/or env-file) are removed before the exception propagates, since
+        the caller (`LocalBackend.run`) invokes `materialize` outside its own
+        spawn try/except and cannot clean up on our behalf.
+
+        Raises ValueError if a secret value contains a forbidden control char.
+        """
+        assert plan.tmp_dir is not None
+        env_file: Path | None = None
+        try:
+            plan.tmp_dir.mkdir(parents=True, exist_ok=True)
+            plan.tmp_dir.chmod(0o700)
+            if plan.env_file_keys:
+                env_file = plan.tmp_dir / "env"
+                lines = []
+                for key in plan.env_file_keys:
+                    value = os.environ.get(key, "")
+                    if any(c in value for c in ("\n", "\r", "\x00")):
+                        raise ValueError(
+                            f"secret {key} value has a forbidden control char"
+                        )
+                    lines.append(f"{key}={value}")
+                # 0600 from creation: O_CREAT|O_WRONLY with mode 0o600.
+                fd = os.open(
+                    str(env_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+                )
+                with os.fdopen(fd, "w") as fh:
+                    fh.write("\n".join(lines) + "\n")
+                env_file.chmod(0o600)  # defensive: umask could have narrowed
+        except Exception:
+            shutil.rmtree(plan.tmp_dir, ignore_errors=True)
+            if env_file is not None:
+                env_file.unlink(missing_ok=True)
+            raise
+        cleanup: list[Path] = [plan.tmp_dir]
+        if env_file is not None:
+            cleanup.append(env_file)
+        return PreparedRun(plan=plan, env_file=env_file, cleanup_paths=cleanup)
+
+    def transport_ref(self, prepared: PreparedRun, pid: int) -> str:  # noqa: ARG002
+        """Return the docker transport reference for this run's container."""
+        return f"docker:{prepared.plan.container_name}"
 
     def wrap(
         self,
@@ -174,5 +217,5 @@ class DockerIsolator:
         prepared: PreparedRun,
         ref: ExecutionHandleRef,
     ) -> TaskHandle:
-        """Wrap local handle (not implemented yet; Task 11)."""
-        raise NotImplementedError("Task 11")
+        """Wrap local handle (not implemented yet; Task 12)."""
+        raise NotImplementedError("Task 12")

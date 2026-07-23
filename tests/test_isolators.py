@@ -1,3 +1,5 @@
+import os as _os
+import stat as _stat
 from pathlib import Path
 
 import pytest as _pytest
@@ -130,3 +132,42 @@ def test_docker_prepare_env_includes_host_env_for_docker_cli() -> None:
     assert "sk-secret-key-xyz" not in " ".join(plan.argv)
     # secret is tracked for env-file, not inlined into argv
     assert plan.env_file_keys == ["ANTHROPIC_API_KEY"]
+
+
+def test_docker_materialize_writes_0600_env_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
+    iso = _docker_iso(secret_env=["ANTHROPIC_API_KEY"])
+    plan = iso.prepare(
+        _req(execution_id="e-mat"), trace_env={}, host_env=dict(_os.environ)
+    )
+    prepared = iso.materialize(plan)
+    assert prepared.env_file is not None and prepared.env_file.exists()
+    mode = _stat.S_IMODE(prepared.env_file.stat().st_mode)
+    assert mode == 0o600
+    dir_mode = _stat.S_IMODE(prepared.env_file.parent.stat().st_mode)
+    assert dir_mode == 0o700
+    assert "ANTHROPIC_API_KEY=sk-secret" in prepared.env_file.read_text()
+    assert prepared.env_file in prepared.cleanup_paths
+    assert plan.tmp_dir in prepared.cleanup_paths
+
+
+def test_docker_materialize_rejects_newline_in_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("BAD", "line1\nline2")
+    iso = _docker_iso(secret_env=["BAD"])
+    plan = iso.prepare(
+        _req(execution_id="e-bad"), trace_env={}, host_env=dict(_os.environ)
+    )
+    with _pytest.raises(ValueError):
+        iso.materialize(plan)
+    # self-clean on failure (carry-forward from Task 3 review): no partial dir left
+    assert plan.tmp_dir is not None
+    assert not plan.tmp_dir.exists()
+
+
+def test_docker_transport_ref_is_docker_container_name() -> None:
+    iso = _docker_iso()
+    plan = iso.prepare(_req(execution_id="e-ref"), trace_env={}, host_env={})
+    prepared = iso.materialize(plan)
+    assert iso.transport_ref(prepared, 999) == "docker:maestro-e-ref"
