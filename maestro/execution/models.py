@@ -50,6 +50,30 @@ class ExecutionRequest(BaseModel):
     progress_mirror: ProgressMirrorPolicy | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     required_tools: list[str] = Field(default_factory=list)
+    execution_id: str | None = None
+    entity_kind: Literal["task", "workstream"] | None = None
+    attempt: int = 1
+    backend_id: str = "local"
+
+
+class PreparedRunPlan(BaseModel):
+    """Deterministic launch plan (no I/O performed to build it)."""
+
+    argv: list[str]
+    env: dict[str, str] = Field(default_factory=dict)
+    container_name: str | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
+    env_file_keys: list[str] = Field(default_factory=list)
+    cidfile_path: Path | None = None
+    tmp_dir: Path | None = None
+
+
+class PreparedRun(BaseModel):
+    """A plan after its filesystem side effects have been materialized."""
+
+    plan: PreparedRunPlan
+    env_file: Path | None = None
+    cleanup_paths: list[Path] = Field(default_factory=list)
 
 
 class ExecutionResult(BaseModel):

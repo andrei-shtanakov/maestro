@@ -68,3 +68,50 @@ def test_protocols_importable():
     # Protocols are runtime-checkable enough to reference; just assert identity.
     assert TaskHandle.__name__ == "TaskHandle"
     assert ExecutionBackend.__name__ == "ExecutionBackend"
+
+
+def _req(**kw) -> ExecutionRequest:
+    base = {
+        "run_id": "task-1",
+        "argv": ["echo", "hi"],
+        "workdir": Path("/tmp/wd"),
+        "log_path": Path("/tmp/wd/log"),
+        "collect": CollectPolicy(mode="none"),
+    }
+    base.update(kw)
+    return ExecutionRequest(**base)
+
+
+def test_launch_fields_default_to_local_compatible_values():
+    req = _req()
+    assert req.execution_id is None
+    assert req.entity_kind is None
+    assert req.attempt == 1
+    assert req.backend_id == "local"
+
+
+def test_launch_fields_round_trip():
+    req = _req(
+        execution_id="11111111-1111-4111-8111-111111111111",
+        entity_kind="workstream",
+        attempt=3,
+        backend_id="docker",
+    )
+    again = ExecutionRequest.model_validate(req.model_dump())
+    assert again.entity_kind == "workstream"
+    assert again.attempt == 3
+    assert again.backend_id == "docker"
+
+
+def test_prepared_run_plan_defaults():
+    from maestro.execution.models import PreparedRun, PreparedRunPlan
+
+    plan = PreparedRunPlan(argv=["docker", "run"], env={"A": "1"})
+    assert plan.container_name is None
+    assert plan.labels == {}
+    assert plan.env_file_keys == []
+    assert plan.cidfile_path is None
+    assert plan.tmp_dir is None
+    prepared = PreparedRun(plan=plan)
+    assert prepared.env_file is None
+    assert prepared.cleanup_paths == []
