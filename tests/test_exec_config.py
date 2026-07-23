@@ -4,7 +4,13 @@ import pytest
 from pydantic import ValidationError
 
 from maestro.execution.exec_config import DockerConfig, ExecutionConfig
-from maestro.models import ProjectConfig
+from maestro.models import (
+    ProjectConfig,
+    Task,
+    TaskConfig,
+    Workstream,
+    WorkstreamConfig,
+)
 
 
 def test_defaults_local_no_docker():
@@ -45,3 +51,27 @@ def test_project_config_execution_round_trip():
     assert cfg.execution.docker is not None
     assert cfg.execution.docker.image == "maestro-runner:x"
     assert cfg.tasks[0].backend == "docker"
+
+
+def test_task_from_config_threads_backend_through():
+    config = TaskConfig(id="t", title="T", prompt="p", backend="docker")
+    task = Task.from_config(config, workdir="/tmp/demo")
+    assert task.backend == "docker"
+
+
+def test_task_from_config_defaults_backend_to_none():
+    config = TaskConfig(id="t", title="T", prompt="p")
+    task = Task.from_config(config, workdir="/tmp/demo")
+    assert task.backend is None
+
+
+def test_workstream_from_config_threads_backend_through():
+    config = WorkstreamConfig(id="w", title="W", description="d", backend="docker")
+    workstream = Workstream.from_config(config)
+    assert workstream.backend == "docker"
+
+
+def test_workstream_from_config_defaults_backend_to_none():
+    config = WorkstreamConfig(id="w", title="W", description="d")
+    workstream = Workstream.from_config(config)
+    assert workstream.backend is None
