@@ -63,6 +63,87 @@ def effective_cost(cost: TaskCost) -> float | None:
     return None
 
 
+@dataclass(frozen=True)
+class CostGroup:
+    """Aggregated cost/usage for one grouping key (or the grand total)."""
+
+    label: str
+    known_cost_usd: float
+    input_tokens: int
+    output_tokens: int
+    tasks: int
+    attempts: int
+    unknown_attempts: int
+    unknown_tasks: int
+
+
+@dataclass(frozen=True)
+class CostReport:
+    """Aggregated cost report: total, by harness, by task."""
+
+    total: CostGroup
+    by_harness: list[CostGroup]
+    by_task: list[CostGroup]
+
+
+class _Acc:
+    """Mutable accumulator; frozen into a CostGroup at the end."""
+
+    def __init__(self) -> None:
+        self.known = 0.0
+        self.inp = 0
+        self.out = 0
+        self.attempts = 0
+        self.unknown_attempts = 0
+        self._task_ids: set[str] = set()
+        self._unknown_task_ids: set[str] = set()
+
+    def add(self, cost: TaskCost) -> None:
+        self.attempts += 1
+        self.inp += cost.input_tokens
+        self.out += cost.output_tokens
+        self._task_ids.add(cost.task_id)
+        eff = effective_cost(cost)
+        if eff is None:
+            self.unknown_attempts += 1
+            self._unknown_task_ids.add(cost.task_id)
+        else:
+            self.known += eff
+
+    def freeze(self, label: str) -> CostGroup:
+        return CostGroup(
+            label=label,
+            known_cost_usd=self.known,
+            input_tokens=self.inp,
+            output_tokens=self.out,
+            tasks=len(self._task_ids),
+            attempts=self.attempts,
+            unknown_attempts=self.unknown_attempts,
+            unknown_tasks=len(self._unknown_task_ids),
+        )
+
+
+def summarize_costs(costs: list[TaskCost]) -> CostReport:
+    """Database-wide cost summary: TOTAL + per-harness + per-task.
+
+    Known/unknown per row is decided by `effective_cost` (SSOT). `known_cost_usd`
+    is a known subtotal; unknown attempts/tasks are reported alongside, never
+    folded into the dollar figure. Tokens are summed over all supplied rows.
+    """
+    total = _Acc()
+    by_harness: dict[str, _Acc] = {}
+    by_task: dict[str, _Acc] = {}
+    for cost in costs:
+        total.add(cost)
+        by_harness.setdefault(cost.agent_type.value, _Acc()).add(cost)
+        by_task.setdefault(cost.task_id, _Acc()).add(cost)
+    return CostReport(
+        total=total.freeze("TOTAL"),
+        by_harness=[acc.freeze(k) for k, acc in sorted(by_harness.items())],
+        by_task=[acc.freeze(k) for k, acc in sorted(by_task.items())],
+    )
+
+
 # =========================================================================
 # Token Usage Data
 # =========================================================================

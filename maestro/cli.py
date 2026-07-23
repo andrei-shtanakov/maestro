@@ -77,6 +77,7 @@ from maestro.workspace import WorkspaceManager
 
 
 if TYPE_CHECKING:
+    from maestro.cost_tracker import CostReport
     from maestro.gates import ApprovalMarker
 
 
@@ -1731,6 +1732,78 @@ def merge_logs_cmd(
 ) -> None:
     """Time-sort per-pid JSONL under a pipeline directory into merged.jsonl."""
     raise SystemExit(_merge_logs.main([target]))
+
+
+@app.command("costs")
+def costs_command(
+    db: Annotated[
+        Path | None, typer.Option("--db", "-d", help="Path to SQLite database file")
+    ] = None,
+) -> None:
+    """Database-wide cost summary (read-only) over recorded task costs.
+
+    NOTE: this aggregates the whole database, which may span several runs
+    (one DB survives --resume); it is a database-wide summary, not a run total.
+    Costs of unpriced harnesses with no self-reported cost are shown as
+    UNKNOWN, never as $0.
+
+    Examples:
+        maestro costs --db run/maestro.db
+    """
+    from maestro.cost_tracker import summarize_costs
+    from maestro.database import DatabaseError, read_all_costs_readonly
+
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> int:
+        try:
+            costs = await read_all_costs_readonly(db_path)
+        except DatabaseError as exc:
+            err_console.print(f"[red]{exc}[/red]")
+            return 2
+        if not costs:
+            console.print("[dim]No cost records.[/dim]")
+            return 0
+        _render_cost_report(summarize_costs(costs))
+        return 0
+
+    raise typer.Exit(asyncio.run(_run()))
+
+
+def _render_cost_report(report: "CostReport") -> None:
+    """Render a CostReport as Rich tables: TOTAL, by harness, by task."""
+    from maestro.cost_tracker import CostGroup
+
+    def _row(g: CostGroup) -> tuple[str, ...]:
+        return (
+            g.label,
+            f"${g.known_cost_usd:.4f}",
+            f"{g.input_tokens}/{g.output_tokens}",
+            str(g.tasks),
+            str(g.attempts),
+            str(g.unknown_attempts),
+            str(g.unknown_tasks),
+        )
+
+    def _table(title: str, first_col: str, groups: list[CostGroup]) -> Table:
+        t = Table(title=title, show_header=True, header_style="bold")
+        t.add_column(first_col)
+        for col in (
+            "Known $",
+            "Tokens in/out",
+            "Tasks",
+            "Attempts",
+            "Unknown attempts",
+            "Unknown tasks",
+        ):
+            t.add_column(col, justify="right")
+        for g in groups:
+            t.add_row(*_row(g))
+        return t
+
+    console.print(_table("Cost — database-wide TOTAL", "Scope", [report.total]))
+    console.print(_table("By harness", "Harness", report.by_harness))
+    console.print(_table("By task", "Task", report.by_task))
 
 
 @app.callback()
