@@ -73,6 +73,30 @@ async def test_missing_id_column_raises(tmp_path):
         await read_all_costs_readonly(p)
 
 
+async def test_incompatible_row_data_raises(tmp_path):
+    # a compatible schema but a row with an unknown agent_type -> _row_to_task_cost
+    # raises ValueError; the reader must map it to DatabaseError (clean exit 2),
+    # not let it crash the CLI.
+    p = tmp_path / "bad_data.db"
+    conn = sqlite3.connect(p)
+    conn.execute(
+        "CREATE TABLE task_costs (id INTEGER PRIMARY KEY, task_id TEXT, "
+        "agent_type TEXT, input_tokens INT, output_tokens INT, "
+        "estimated_cost_usd REAL, reported_cost_usd REAL, attempt INT, "
+        "created_at TIMESTAMP)"
+    )
+    conn.execute(
+        "INSERT INTO task_costs (task_id, agent_type, input_tokens, "
+        "output_tokens, estimated_cost_usd, reported_cost_usd, attempt, "
+        "created_at) VALUES ('t1', 'legacy_unknown_harness', 0, 0, 0.0, NULL, "
+        "1, '2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(DatabaseError):
+        await read_all_costs_readonly(p)
+
+
 async def test_reads_seeded_db(tmp_path):
     p = tmp_path / "state.db"
     await _seed(p)

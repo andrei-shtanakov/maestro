@@ -16,8 +16,10 @@
 - Async tests: `async def test_...` under pytest-asyncio auto mode.
 - **Read-only is the connection lifecycle, not just the query:** never create a
   missing file, never run schema/migrations, never modify the DB. Use SQLite
-  `mode=ro` (NOT `immutable=1`). The command creates **no new files** and
-  modifies nothing; it may read pre-existing `-wal`/`-shm`.
+  `mode=ro` (NOT `immutable=1`). The invariant is **no writes to the database**
+  (its data/schema/migrations are untouched; a missing path is never created) —
+  **not** "no new files": reading a WAL DB read-only may create/modify/leave
+  SQLite `-wal`/`-shm` service files, which is allowed (spec r4 §7/§8).
 - Known/unknown cost = `cost_tracker.effective_cost(row)` (single source of
   truth): `reported > priced-estimate > None`. `announce`=known-$0;
   `opencode`-unpriced-unreported=unknown. Never sum an unpriced `estimated=0.0`

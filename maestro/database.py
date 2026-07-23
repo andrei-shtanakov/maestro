@@ -2187,8 +2187,17 @@ async def read_all_costs_readonly(db_path: str | Path) -> list[TaskCost]:
                 "database has no compatible 'task_costs' table "
                 "(missing table or required columns)"
             )
-        cursor = await conn.execute("SELECT * FROM task_costs ORDER BY created_at")
-        rows = await cursor.fetchall()
-        return [_row_to_task_cost(row) for row in rows]
+        try:
+            cursor = await conn.execute("SELECT * FROM task_costs ORDER BY created_at")
+            rows = await cursor.fetchall()
+            return [_row_to_task_cost(row) for row in rows]
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+            raise DatabaseError(f"not a valid database: {exc}") from exc
+        except (ValueError, KeyError, TypeError) as exc:
+            # data-level incompatibility (e.g. an unknown agent_type string, a
+            # NULL/wrong type in a required column) -> clean exit 2, not a crash.
+            raise DatabaseError(
+                f"database has incompatible 'task_costs' data: {exc}"
+            ) from exc
     finally:
         await conn.close()
