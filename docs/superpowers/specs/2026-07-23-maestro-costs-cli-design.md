@@ -106,8 +106,8 @@ Definitions (as in §2): `tasks` = distinct task_ids with ≥1 stored cost row;
 retries are fully counted in tokens and the known subtotal.
 
 - Empty DB (no cost rows) → exit `0`, a clear **"No cost records."** message /
-  zeroed tables.
-- Exit codes: `0` success (incl. empty); `2` invalid input (unreadable DB).
+  zeroed tables. Full exit-code / input matrix is **§8** (enforced by the
+  read-only connection, §7).
 - `--json` is **deferred** — this MVP is explicitly human-only output.
 - The command uses the DB path option (`--db`, default `DEFAULT_DB_PATH`),
   matching `maestro status` / `maestro workstreams` conventions.
@@ -151,19 +151,80 @@ uses only the new, correct aggregator.
 **CLI:**
 - exit `0` with populated tables on a seeded DB; the mixed-known row renders
   "$X known · N unknown".
-- empty DB → exit `0`, "No cost records."
-- unreadable DB → exit `2`.
+- empty (valid) DB → exit `0`, "No cost records."
 - **Documented-boundary test:** the output has **no** "by model" and **no**
   "by run" table (guards against a future regression re-introducing the
   unprovable groupings).
 
-## 7. Architecture summary
+**Read-only boundary (§7/§8) — the boundary is enforced, not just described:**
+- `test_costs_missing_db_does_not_create_file`: `costs --db <missing>` → exit
+  `2` **and** `not missing.exists()` (the connection must not create the file).
+- directory path → exit `2`; non-SQLite / unreadable file → exit `2`.
+- valid SQLite lacking `task_costs` (old/foreign schema) → exit `2` (not
+  "No cost records").
+- **Filesystem-immutability:** run `costs` against a seeded, compatible DB and
+  assert the file's mtime/size and sibling directory are unchanged — no
+  `-wal`/`-shm`, no journal, no migration writes.
+
+## 7. Read-only connection contract (boundary enforcement)
+
+"Read-only" must be the **connection lifecycle**, not just the query — otherwise
+SQLite silently breaks the boundary. `Database.connect()` is **not** safe here:
+it `aiosqlite.connect(path)` (which **creates a missing file**), then
+`executescript(SCHEMA_SQL)` (creates tables) and runs migrations. So reusing it
+for `maestro costs --db missing.db` would *create* a database and run
+migrations — violating the hard boundary and the claimed exit 2.
+
+The command opens the DB **read-only** via a SQLite URI:
+
+```python
+# Missing file / bad path / non-SQLite -> OperationalError (never creates a file)
+conn = await aiosqlite.connect(f"file:{ro_uri(path)}?mode=ro", uri=True)
+```
+
+Add a dedicated read-only entry point (context manager) so the write-path
+`Database` is never touched, e.g.:
+
+```python
+async with open_costs_read_only(path) as reader:   # or Database.connect_read_only
+    costs = await reader.get_all_costs()
+```
+
+`mode=ro` guarantees the connection:
+- never creates a missing file;
+- never runs `executescript(SCHEMA_SQL)` or any migration;
+- never issues a write PRAGMA (no WAL setup, journal, or `-wal`/`-shm`/journal
+  side files);
+- fails to open a missing/invalid/non-SQLite target with `OperationalError`.
+
+`ro_uri(path)` builds the URI from the **absolute** path with proper
+percent-quoting (spaces / special chars). The reader then verifies the
+`task_costs` table exists (via `sqlite_master` / `PRAGMA table_info`); a valid
+SQLite file lacking `task_costs` (old/foreign schema) is an **error → exit 2**,
+distinct from a valid Maestro DB whose `task_costs` is merely empty (→ exit 0,
+"No cost records").
+
+## 8. Input cases & exit codes (locked)
+
+| Input | Result |
+|---|---|
+| missing path | **exit 2**, and **no file is created** |
+| path is a directory | **exit 2** |
+| file unreadable / not a SQLite database | **exit 2** |
+| valid SQLite but **no `task_costs`** / incompatible schema | **exit 2** (not "No cost records") |
+| valid Maestro DB, **empty** `task_costs` | **exit 0**, "No cost records." |
+| valid Maestro DB with cost rows | **exit 0**, populated tables |
+
+**Invariant:** after the command runs, the filesystem is unchanged — no new DB
+file, no `-wal`/`-shm`, no journal, no migration side effects.
+
+## 9. Architecture summary
 
 - `maestro/cost_tracker.py`: add a pure aggregator, e.g.
   `summarize_costs(costs: list[TaskCost]) -> CostReport` producing the TOTAL +
   per-harness + per-task breakdown with the §2 fields (reusing `effective_cost`).
-- `maestro/database.py`: a read-only fetch of all cost rows (reuse
-  `get_all_costs()`; no model join needed since "by model" is out).
-- `maestro/cli.py`: a `costs` command that fetches rows, calls the aggregator,
-  renders the Rich tables.
+- read-only DB access (§7): `aiosqlite.connect(..., uri=True, mode=ro)` +
+  `get_all_costs()`; no model join (by-model is out), no write-path `Database`.
+- `maestro/cli.py`: a `costs` command that opens read-only, fetches rows, calls
+  the aggregator, renders the Rich tables, maps the §8 error cases to exit 2.
 - No writes, no schema change, no touch to scheduler/orchestrator/event-log.
