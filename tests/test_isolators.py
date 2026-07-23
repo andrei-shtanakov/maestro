@@ -6,7 +6,7 @@ import pytest as _pytest
 
 from maestro.execution.exec_config import DockerConfig
 from maestro.execution.isolators import BareIsolator, DockerIsolator
-from maestro.execution.models import CollectPolicy, ExecutionRequest
+from maestro.execution.models import CollectPolicy, ExecutionRequest, PreparedRun
 
 
 def _req(**kw) -> ExecutionRequest:
@@ -169,5 +169,8 @@ def test_docker_materialize_rejects_newline_in_secret(tmp_path, monkeypatch):
 def test_docker_transport_ref_is_docker_container_name() -> None:
     iso = _docker_iso()
     plan = iso.prepare(_req(execution_id="e-ref"), trace_env={}, host_env={})
-    prepared = iso.materialize(plan)
+    # transport_ref only reads prepared.plan.container_name; build PreparedRun
+    # directly rather than calling materialize() so the test stays hermetic and
+    # never touches the filesystem (materialize would create a real tmp dir).
+    prepared = PreparedRun(plan=plan)
     assert iso.transport_ref(prepared, 999) == "docker:maestro-e-ref"
