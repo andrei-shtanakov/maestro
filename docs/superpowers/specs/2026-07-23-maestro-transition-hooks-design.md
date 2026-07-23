@@ -76,8 +76,9 @@ call site cannot change status and forget the effect.
 - `_emit_tick` (periodic snapshot, not a transition) and new transport buses
   (SSE etc.).
 - **Transactional outbox / exactly-once delivery.** Effects fire *after* the DB
-  commit as at-most-once best effort (§4.4). A crash between commit and fire
-  loses that one effect. Guaranteed delivery would need an outbox; out of scope.
+  commit as **best-effort, non-durable delivery** (§4.4). A crash between commit
+  and fire loses that one effect; a re-run can re-deliver one. Guaranteed/deduped
+  delivery would need an outbox; out of scope.
 - **Intercepting every status mutation app-wide.** Statuses are also changed by
   the CLI (`maestro approve`, `maestro workstream-approve`), recovery, REST, and
   MCP. This iteration scopes *firing* to the Scheduler and Orchestrator loops.
@@ -104,7 +105,12 @@ class TransitionSubject:
     status: TaskStatus | WorkstreamStatus  # the NEW status
 ```
 
-Built from a `Task` or `Workstream` at the call site.
+Built from a `Task` or `Workstream` at the call site. **It lives in
+`maestro/models.py`** — the neutral module that already owns `TaskStatus` /
+`WorkstreamStatus` and imports neither `notifications` nor `event_log`. This
+placement is load-bearing: it breaks the import cycle that would otherwise form
+(`transitions` → `notifications.base` → `transitions`), since
+`Notification.from_subject` needs to reference `TransitionSubject` (§3.2).
 
 ### 3.2 Generalized event/notification envelope
 
@@ -116,7 +122,11 @@ about its type.
   (populated only for task events) so the persisted `events.jsonl` contract
   stays backward compatible — existing consumers keying on `task_id` keep
   working; new consumers read `entity_type`/`entity_id`. Workstream events set
-  `entity_type="workstream"`, `entity_id=<ws id>`, `task_id=None`.
+  `entity_type="workstream"`, `entity_id=<ws id>`, `task_id=None`. The event's
+  JSONL serializer (`to_json_line()`) now emits `entity_type`/`entity_id`
+  alongside `task_id`. **Backward compatibility here means the `task_id` field
+  is preserved for task events, not that the serialized JSON is byte-identical**
+  (task events gain the two new keys).
 - **`notifications.Notification`** is generalized: `status: TaskStatus |
   WorkstreamStatus`, plus `entity_kind: Literal["task","workstream"]` and
   entity-neutral `subject_id` / `subject_title` (replacing `task_id` /
@@ -161,8 +171,10 @@ class TransitionDispatcher:
     ) -> None: ...
 ```
 
-`fire` is **async** (`NotificationManager.notify()` is async). It looks up the
-effect for `(frm, subject.status)` (§5) and drives the subscribers.
+`fire` is **async** (`NotificationManager.notify()` is async). It selects the
+effect table by `subject.kind` (the `TASK_*` tables for a task, the
+`WORKSTREAM_*` tables for a workstream — never a cross-entity lookup; §5.4), then
+looks up the effect for `(frm, subject.status)` and drives the subscribers.
 
 ### 3.3.1 Subscriber contract (resolves the empty-effect vs callback case)
 
@@ -180,8 +192,13 @@ Total tables (§5.1) guarantee there is no fourth "unknown" combination. So
 `VALIDATING`/`PENDING` (empty effects) still fire the dashboard callback on a
 real transition — they just emit no event/notification.
 
-- **status-change callback** — `_on_status_change(id, frm, to)` (dashboard
-  feed), called on every real transition.
+- **status-change callback** — the existing `StatusChangeCallback =
+  Callable[[str, str, str], None]` (dashboard feed), called on every real
+  transition **with plain strings**: `status_change_cb(subject.id, frm.value,
+  subject.status.value)`. The callback contract is string-based (the CLI feed
+  compares `new_status == "running"` / `"done"`, cli.py:539); passing raw
+  `StrEnum` members would "work" by accident, so the dispatcher passes `.value`
+  explicitly and the tests assert strings.
 - **event log** — `Event(event_type=effect.event, entity_type=subject.kind,
   entity_id=subject.id, task_id=<id if task else None>, message=message,
   details=details or {})` when `effect.event` is set.
@@ -321,9 +338,11 @@ nothing else.
 ### 5.3 Task table (intentional behavior — see §0, NOT parity)
 
 This table binds effects to committed transitions. It is a deliberate behavior
-**expansion** over today's scattered emits (§0): every transition now emits an
-event; notifications are chosen for hygiene (no notification on the transient
-`FAILED`; the actionable notification stays at `NEEDS_REVIEW`).
+**expansion** over today's scattered emits (§0): selected lifecycle status
+entries now emit events according to the total table (`PENDING`,
+`AWAITING_APPROVAL`, `VALIDATING` remain empty-event by design); notifications
+are chosen for hygiene (no notification on the transient `FAILED`; the actionable
+notification stays at `NEEDS_REVIEW`).
 
 | status (entry) | event | notification | vs today |
 |---|---|---|---|
@@ -345,8 +364,22 @@ exact "vs today" mapping is pinned by the contract tests (§9).
 
 ### 5.4 Pair overrides (from-aware)
 
-`TRANSITION_OVERRIDES: dict[tuple[frm, to], StatusEffect]`, consulted before the
-entry table. Every entry names concrete enums so the SSOT is complete:
+**Two separate tables**, symmetric with `TASK_EFFECTS`/`WORKSTREAM_EFFECTS`:
+
+```python
+TASK_TRANSITION_OVERRIDES: dict[tuple[TaskStatus, TaskStatus], StatusEffect]
+WORKSTREAM_TRANSITION_OVERRIDES: dict[
+    tuple[WorkstreamStatus, WorkstreamStatus], StatusEffect
+]
+```
+
+They must **not** share one dict. `TaskStatus` and `WorkstreamStatus` are both
+`StrEnum` with overlapping values (`"failed"`, `"ready"`, `"needs_review"`), so
+`(TaskStatus.FAILED, TaskStatus.READY)` and `(WorkstreamStatus.FAILED,
+WorkstreamStatus.READY)` are **equal keys** — a shared dict silently collapses
+them (verified: the workstream entry overwrites the task entry, len 1). The
+dispatcher picks the table by `subject.kind` (§3.3), so there is no cross-entity
+lookup. Every entry names concrete enums so the SSOT is complete:
 
 | (frm → to) | task effect | workstream effect | note |
 |---|---|---|---|
@@ -448,14 +481,20 @@ still reads task events unchanged.
 **AST static guard** (over production files — a grep would be too brittle):
 
 - In `scheduler.py`, a direct `self._db.update_task_status(...)` call is allowed
-  **only** inside `_transition`.
+  **only** inside `_transition` (AST: check the name of the enclosing
+  `FunctionDef`).
 - In `orchestrator.py`, a direct `self._db.update_workstream_status(...)` call is
-  allowed **only** inside `_transition` or `_update_fields`.
-- A call to a known atomic transition helper (`reset_for_retry_atomic`) in those
-  files must be accompanied by a `_dispatch_committed_transition` on its success
-  path.
+  allowed **only** inside `_transition` or `_update_fields` (same enclosing-def
+  check).
 - `maestro/transitions.py` is imported by the orchestration layer but **not** by
   `maestro/database.py`.
+
+The atomic-helper rule is **not** a self-built control-flow analysis (that is
+too heavy and brittle). Instead: an AST test asserts each
+`reset_for_retry_atomic` call in `scheduler.py` sits inside a function that also
+references `_dispatch_committed_transition`, plus a behavioral unit test that the
+`TASK_RETRYING` effect fires on `ok=True` and does **not** on `ok=False`. The
+behavior test is the real guarantee; the AST check is a cheap tripwire.
 
 The guard asserts scope precisely — it does **not** claim "all `update_*_status`
 everywhere go through `_transition`" (database tests, CLI, REST, MCP, recovery
