@@ -71,13 +71,25 @@ Two axes, composed (not four backend classes):
 
 `LocalBackend` remains the single **transport**; an **isolator** is injected
 (default `BareIsolator`). The isolator is split so argv/mount/label construction
-stays purely unit-testable and all filesystem/secret side effects happen in one
-place immediately before spawn.
+stays deterministic and unit-testable, and all filesystem/secret side effects
+happen in one place immediately before spawn.
+
+`prepare` is **deterministic w.r.t. its arguments, not pure w.r.t. process
+globals**: it must not read `os.environ` / `child_env()` itself (`BareIsolator`
+needs the inherited env; both isolators need the trace env). Those are passed in
+explicitly so a test controls the whole plan with no monkeypatching. Secret
+**values** are still read only in `materialize`.
 
 ```python
 class Isolator(Protocol):
     id: str
-    def prepare(self, req: ExecutionRequest) -> PreparedRunPlan: ...   # PURE: no I/O
+    def prepare(                                  # DETERMINISTIC: no global-state reads, no I/O
+        self,
+        req: ExecutionRequest,
+        *,
+        trace_env: Mapping[str, str],             # child_env(): TRACEPARENT, ORCHESTRA_*
+        inherited_env: Mapping[str, str] | None,  # os.environ snapshot; None for docker
+    ) -> PreparedRunPlan: ...
     def materialize(self, plan: PreparedRunPlan) -> PreparedRun: ...   # I/O, just before spawn
     def wrap(self, local: LocalTaskHandle, prepared: PreparedRun,
              ref: ExecutionHandleRef) -> TaskHandle: ...
@@ -97,19 +109,22 @@ class PreparedRun(BaseModel):          # after materialize: paths that now exist
     cleanup_paths: list[Path]          # tmp_dir/env-file/cidfile to unlink
 ```
 
-- **`BareIsolator`** — identity. `prepare` returns today's argv/env
-  (`build_local_env`, honoring `inherit_env`); `materialize` is a no-op; `wrap`
-  returns the `LocalTaskHandle` unchanged. Zero behavior change.
+- **`BareIsolator`** — identity. `prepare` returns today's argv and
+  `{**inherited_env, **trace_env}` (honoring `inherit_env`); `materialize` is a
+  no-op; `wrap` returns the `LocalTaskHandle` unchanged. Behavior-compatible with
+  today.
 - **`DockerIsolator(cfg)`** — `prepare` builds the `docker run` argv (§4), the
-  identity labels (§5) and the env split (§3), naming secret keys only.
-  `materialize` creates the `0700` tmp dir, writes the `0600` env-file, and fixes
-  the `--cidfile` path. `wrap` returns a `DockerTaskHandle`.
+  identity labels (§5) and the env split (§3, `trace_env` inlined via `-e`,
+  `inherited_env` ignored), naming secret keys only. `materialize` creates the
+  `0700` tmp dir, writes the `0600` env-file, and fixes the `--cidfile` path.
+  `wrap` returns a `DockerTaskHandle`.
 
-`LocalBackend.run(req)` becomes: `plan = isolator.prepare(req)` →
-`prepared = isolator.materialize(plan)` → spawn `prepared.plan.argv` via the
-existing asyncio path → build `ExecutionHandleRef` (docker `transport_ref =
-"docker:maestro-<execution_id>"`) → `isolator.wrap(local_handle, prepared, ref)`.
-On spawn failure, `materialize`'d paths are cleaned (§3).
+`LocalBackend.run(req)` becomes: `plan = isolator.prepare(req, trace_env=…,
+inherited_env=…)` → `prepared = isolator.materialize(plan)` → spawn
+`prepared.plan.argv` via the existing asyncio path → build `ExecutionHandleRef`
+(docker `transport_ref = "docker:maestro-<execution_id>"`) →
+`isolator.wrap(local_handle, prepared, ref)`. On spawn failure, `materialize`'d
+paths are cleaned (§3).
 
 ### 2. `DockerTaskHandle` — compositional, honest lifecycle
 
@@ -196,6 +211,26 @@ Container name = `maestro-<execution_id>`; `transport_ref =
 pipeline id is added later, it becomes an additional label — it does not replace
 `execution_id`.
 
+**Launch context lives on `ExecutionRequest`.** `backend.run(req)` receives only
+an `ExecutionRequest`, but `prepare` needs the identity — and the identity must
+be minted *and persisted* before `run()` (§6). So the backend cannot mint it
+inside `prepare`. The Phase-0 contract is extended with backward-compatible,
+defaulted launch fields:
+
+```python
+class ExecutionRequest(BaseModel):
+    ...                                              # Phase-0 fields unchanged
+    execution_id: str | None = None                 # uuid4; None = local/bare (no persisted row)
+    entity_kind: Literal["task", "workstream"] | None = None
+    attempt: int = 1                                 # = retry_count + 1 (cost-contract numbering)
+    backend_id: str = "local"
+```
+
+`entity_id` is the existing `run_id` (an entity id today). The orchestration
+layer — **not** the backend — mints `execution_id`, persists the
+`execution_handles` row (§6), and only then hands the fully-populated request to
+`backend.run`. Old local/bare requests keep the defaults and write no row.
+
 ### 6. Durable execution identity — `execution_handles` table
 
 Execution is a first-class "one launch attempt" entity, not a property of a
@@ -222,46 +257,114 @@ Added via the existing linear `schema_migrations` runner (LABS-85). A separate
 into the runtime `Task`/`Workstream` models and their rows — it is the *selected
 configuration for future runs*, distinct from `execution_handles.backend_id`
 which records what a specific past attempt used. Without threading `backend`
-into the persisted entity, the choice is lost after a DB read.
+into the persisted entity, the choice is lost after a DB read. `backend` must
+participate in the config serialization round-trip and the schema migration for
+**both** `tasks` and `workstreams` (nullable, default `None` → resolves to
+`default_backend`).
 
 Rows are written for docker-backed attempts. Local/bare attempts may write a row
 too (uniformity) or skip it; Phase 1 writes rows only for non-local backends to
-keep the local path byte-identical.
+keep the local **runtime** path behavior-compatible (the schema itself changes —
+the migration adds tables/columns, so "byte-identical" applies to observable
+behavior, not to the DB schema).
 
-#### Persistence ordering
+#### Persistence ordering — one atomic primitive
 
-1. Generate `execution_id`, container name, labels.
-2. In one logical operation: transition `READY → RUNNING` **and** insert the
-   `execution_handles` row in state `prepared`.
+There is **one** decision here, not a "big vs. minimal" fork. A single atomic DB
+primitive couples the status CAS and the row insert; the two can never diverge:
+
+```python
+async def start_execution(
+    entity_kind: Literal["task", "workstream"],
+    entity_id: str,
+    expected_status: TaskStatus | WorkstreamStatus,   # READY
+    handle: ExecutionHandleRecord,                     # execution_id, backend_id, transport_ref
+) -> Entity:                                           # updated row, or raises ConcurrentModificationError
+```
+
+In one `aiosqlite` transaction it: (1) CAS-updates the entity `READY → RUNNING`
+(the existing `expected_status` guard / `ConcurrentModificationError`, cf.
+`database.py:1087` / `:1880` / `reset_for_retry_atomic` at `:954`); (2) inserts
+`execution_handles(state="prepared")`; (3) commits. If the transaction rolls
+back, **neither** the status **nor** the execution row persists — there is no
+window where a `prepared` row exists for an entity that never entered `RUNNING`.
+The separate-insert fallback from the draft is **removed** for exactly this
+reason.
+
+Because the transition-hooks work (PR #94/#96) routes status effects through the
+`TransitionDispatcher`, the new atomic path must fire hooks the same way: after
+`start_execution` commits, the orchestration layer calls
+`_dispatch_committed_transition` (`scheduler.py:333`) for the committed
+`READY → RUNNING` — otherwise status/effect desync reappears.
+
+Full ordering:
+
+1. Mint `execution_id`, container name, labels.
+2. `start_execution(...)` — atomic CAS `RUNNING` + `execution_handles` row
+   `prepared`; then `_dispatch_committed_transition` for the committed edge.
 3. `materialize` (write env-file / cidfile / tmp dir).
 4. `docker run`.
-5. Update the row to `running`.
-6. After terminal handling (§7 finalize): `terminal`.
-7. After successful cleanup: `cleaned`.
+5. Row → `running`.
+6. After terminal handling (§7 finalize): row → `terminal`.
+7. After *confirmed* cleanup only: row → `cleaned`.
 
-If the atomic transition + row insert of step 2 is too large for Phase 1, the
-minimum guarantee is: **the row is created before the transition/spawn**, and
-recovery treats `prepared` as *uncertain* → `NEEDS_REVIEW`. This reuses the
-existing spawn-in-progress sentinel pattern (already present in the orchestrator)
-to close the "container created, CID not yet persisted" window.
+A crash after step 2 but before/at spawn leaves a `prepared`/`running` row;
+recovery (§11) treats both as *uncertain* and probes by label — because the
+container name is deterministic from the already-persisted `execution_id`, the
+"container created, CID not yet persisted" window is closed with no extra
+sentinel.
 
 ### 7. Finalization — single owner, no new protocol method
 
 The Phase-0 protocol already has `wait()` / `collect()` / `cleanup()`; **no
-`finalize()` is added to the protocol.** Instead a shared helper enforces order:
+`finalize()` is added to the protocol.** Instead a shared helper enforces order
+and never lets a `collect`/`cleanup` fault swallow the run result:
 
 ```python
 async def finalize_handle(handle: TaskHandle) -> ExecutionResult:
-    result = await handle.wait()          # reap
+    result = await handle.wait()                 # reap; the authoritative outcome
+    errors: list[str] = []
     try:
-        await handle.collect()            # apply changes back (docker: no-op, still called)
-        return result
-    finally:
-        await handle.cleanup()            # remove container + files; idempotent
+        await handle.collect()                   # docker: no-op, still called
+    except Exception as e:                        # collect must not hide the result
+        errors.append(f"collect: {e}")
+    try:
+        # Shield so an external cancellation cannot abort a targeted
+        # container stop/rm or leave secret files on disk.
+        await asyncio.shield(handle.cleanup())   # raises on ownership/daemon failure
+    except Exception as e:
+        errors.append(f"cleanup: {e}")           # row stays 'terminal', NOT 'cleaned'
+    if errors:
+        result.error_message = "; ".join(
+            filter(None, [result.error_message, *errors])
+        )
+    return result
 ```
 
-**Ownership is singular.** The monitor loop is the one caller that finalizes,
-then dispatches to the existing status handlers with the reaped result:
+Contract this pins down:
+
+- **Exactly one finalization task per running entity.** The monitor records the
+  in-flight finalize `Task` on the running-entity record; any second caller
+  (shutdown loop, a re-tick) awaits that same task and its result rather than
+  starting a second finalize. `cleanup` idempotency is the safety net, not the
+  primary mechanism.
+- **`collect`/`cleanup` errors are recorded, not fatal.** They fold into
+  `ExecutionResult.error_message`; terminal entity processing (cost parse, status
+  transition) still runs on the reaped `result`.
+- **`cleanup` is cancellation-shielded** enough to finish the targeted
+  `docker stop`/`rm` and unlink the env-file / cidfile / tmp dir.
+- **`execution_handles.state = "cleaned"` is set only after a confirmed
+  successful cleanup.** A daemon/ownership failure leaves the row `terminal`, so
+  recovery (§11) can still find it and GC the possibly-leftover container (the
+  entity's maestro status is already settled — this is a resource sweep, not a
+  status change).
+- **`cleanup()` signals a fail-closed ownership refusal by raising** (the
+  protocol returns `None`; a structured `CleanupResult` is deferred). The helper
+  catches and records it — it does not crash the monitor.
+
+**Ownership is singular at the monitor.** The monitor loop is the one caller that
+finalizes, then dispatches to the existing status handlers with the reaped
+result:
 
 - Normal completion (`poll()` returns non-None): call `finalize_handle` directly
   — `wait()` returns at once.
@@ -270,16 +373,16 @@ then dispatches to the existing status handlers with the reaped result:
   reaps immediately and the container-stop is targeted).
 
 Finalization is **not** scattered across `_handle_task_completion`,
-`_handle_task_failure`, and `_handle_task_timeout` — that would create races and
-double ownership. `cleanup` idempotency is the safety net, not the primary
-mechanism. The same single-owner
-refactor is applied to the Mode-2 orchestrator monitor. Cost parsing and
-(local) validation run after `finalize_handle` returns; because `collect` is a
-bind-mount no-op and the log is already on the host, ordering is preserved.
+`_handle_task_failure`, and `_handle_task_timeout`. The same single-owner
+refactor is applied to the Mode-2 orchestrator monitor. Cost parsing and (local)
+validation run after `finalize_handle` returns; because `collect` is a bind-mount
+no-op and the log is already on the host, ordering is preserved.
 
-**Safe cleanup (ownership check):** before `docker rm -f <name>`, `inspect` the
+**Safe cleanup (ownership check).** Before `docker rm -f <name>`, `inspect` the
 container and confirm its `maestro.execution_id` label matches the expected id.
-On mismatch, do **not** remove; `cleanup` returns a fail-closed diagnostic. UUID
+On mismatch, do **not** remove and **raise** a fail-closed ownership error (the
+helper records it; the row stays `terminal`). If the container is already absent,
+cleanup still unlinks the local env-file / cidfile / tmp dir and succeeds. UUID
 collisions are effectively impossible, but a destructive op still verifies
 ownership.
 
@@ -292,7 +395,11 @@ Phase 1 is local only. `healthcheck` inspects the effective Docker endpoint:
 - Allow a local Unix socket / Docker Desktop context.
 
 Selecting `backend: docker` runs this check, plus image presence
-(`docker image inspect`), **before the first task starts**.
+(`docker image inspect`), **before the first task starts**. If `can_run` probes
+`required_tools` by starting a throwaway container inside the image, that
+**helper container uses `--rm` and its own unique label** and is not an execution
+container — the "no `--rm`" rule (§4) applies only to execution containers, whose
+exited state recovery must be able to observe.
 
 ### 9. Config contract
 
@@ -314,7 +421,8 @@ tasks:                       # or workstreams: for Mode 2 — same backend: loca
 The `execution` block is added to **both** root config models (`ProjectConfig`,
 `OrchestratorConfig`) via a shared mixin. Rules:
 
-- No `execution` section → `local + bare`, byte-identical to today.
+- No `execution` section → `local + bare`, behavior-compatible with today
+  (runtime path unchanged; the schema migration still applies).
 - `default_backend: local` requires no Docker.
 - `backend: docker` with no `execution.docker` → **fail-fast** config error.
 - Unknown backend name → **fail-fast, no fallback to local**.
@@ -340,8 +448,10 @@ the resolver.
 
 ### 11. Recovery — probe-by-label, fail-closed
 
-Recovery reads persisted `execution_handles` rows. For a docker-backed attempt
-found in a non-terminal/uncertain state (`prepared` or `running`):
+Recovery reads persisted `execution_handles` rows and handles two concerns.
+
+**(a) Uncertain execution** — a docker-backed row in state `prepared` or
+`running` (the entity may be mid-flight):
 
 - Probe by the persisted exact ref first, then label fallback:
   `docker ps -a --filter label=maestro.execution_id=<id>` — across **all**
@@ -355,6 +465,13 @@ found in a non-terminal/uncertain state (`prepared` or `running`):
   `NEEDS_REVIEW`.
 - The recovery probe **deletes nothing** — it classifies only. Cleanup is a
   separate explicit action bound by the same ownership check (§7).
+
+**(b) Leftover-container GC** — a row in state `terminal` but not `cleaned`
+(finalize ran, cleanup did not confirm). The entity's maestro status is already
+settled, so this is **not** a status change: recovery runs the ownership-checked
+cleanup (§7) to remove the possibly-orphaned container and unlink stale secret
+files, then marks the row `cleaned`. A daemon failure leaves it `terminal` for
+the next sweep.
 
 ### 12. Observability
 
@@ -407,7 +524,8 @@ reachability is a manual smoke step, not CI.
 
 ## Acceptance
 
-- No `execution` config → all current tests green; local path byte-identical.
+- No `execution` config → all current tests green; local runtime path
+  behavior-compatible (schema migration aside).
 - `backend: docker` runs an agent (Mode 1) and a spec-runner workstream (Mode 2)
   in a local container with the workspace bind-mounted; results land on the host.
 - Every terminal path (success / failure / timeout / cancellation / shutdown)
