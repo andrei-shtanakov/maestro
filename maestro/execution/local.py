@@ -5,8 +5,10 @@ import contextlib
 import os
 import shutil
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-from maestro.execution.env import build_local_env
+from maestro._vendor.obs import child_env
+from maestro.execution.env import build_local_env  # noqa: F401 (re-exported)
 from maestro.execution.models import (
     BackendHealth,
     CapabilityResult,
@@ -14,8 +16,16 @@ from maestro.execution.models import (
     ExecutionHandleRef,
     ExecutionRequest,
     ExecutionResult,
+    PreparedRun,
     ProbeResult,
 )
+
+
+if TYPE_CHECKING:
+    # Imported only for type hints: isolators.py imports this module, so a
+    # runtime import here would create a circular import.
+    from maestro.execution.backend import TaskHandle
+    from maestro.execution.isolators import Isolator
 
 
 _TAIL_LIMIT = 4000
@@ -115,10 +125,29 @@ def _decode_tail(data: bytes | None) -> str:
     return text[-_TAIL_LIMIT:]
 
 
+def _cleanup_prepared(prepared: PreparedRun) -> None:
+    """Best-effort removal of files an isolator materialized (spawn-failure path)."""
+    for path in prepared.cleanup_paths:
+        with contextlib.suppress(OSError):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+
+
 class LocalBackend:
     """Runs an ExecutionRequest as a local asyncio subprocess."""
 
     id = "local"
+
+    def __init__(self, isolator: "Isolator | None" = None) -> None:
+        # Default BareIsolator; imported lazily to break the import cycle
+        # (isolators.py imports LocalTaskHandle from this module).
+        if isolator is None:
+            from maestro.execution.isolators import BareIsolator
+
+            isolator = BareIsolator()
+        self._isolator = isolator
 
     async def healthcheck(self) -> BackendHealth:
         return BackendHealth(reachable=True)
@@ -127,8 +156,13 @@ class LocalBackend:
         missing = [t for t in req.required_tools if shutil.which(t) is None]
         return CapabilityResult(ok=not missing, missing_tools=missing)
 
-    async def run(self, req: ExecutionRequest) -> LocalTaskHandle:
-        env = build_local_env(req)
+    async def run(self, req: ExecutionRequest) -> "TaskHandle":
+        plan = self._isolator.prepare(
+            req, trace_env=child_env(), host_env=dict(os.environ)
+        )
+        prepared = self._isolator.materialize(plan)
+        argv = prepared.plan.argv
+        env = prepared.plan.env
         log_fd: int | None = None
         if req.capture_output:
             stdout = asyncio.subprocess.PIPE
@@ -139,7 +173,7 @@ class LocalBackend:
             stderr = asyncio.subprocess.STDOUT
         try:
             proc = await asyncio.create_subprocess_exec(
-                *req.argv,
+                *argv,
                 cwd=req.workdir,
                 env=env,
                 stdin=asyncio.subprocess.PIPE if req.stdin is not None else None,
@@ -149,6 +183,8 @@ class LocalBackend:
         except BaseException:
             if log_fd is not None:
                 os.close(log_fd)
+            # Clean any files the isolator created before the spawn failed.
+            _cleanup_prepared(prepared)
             raise
         if log_fd is not None:
             # The child inherited its own dup of the fd when spawned above;
@@ -162,12 +198,13 @@ class LocalBackend:
             proc.stdin.write(req.stdin.encode("utf-8"))
             proc.stdin.close()
         ref = ExecutionHandleRef(
-            backend_id=self.id,
+            backend_id=req.backend_id,
             run_id=req.run_id,
-            transport_ref=f"local_pid:{proc.pid}",
+            transport_ref=self._isolator.transport_ref(prepared, proc.pid),
             started_at=datetime.now(UTC),
         )
-        return LocalTaskHandle(proc, req, log_fd, ref)
+        local_handle = LocalTaskHandle(proc, req, log_fd, ref)
+        return self._isolator.wrap(local_handle, prepared, ref)
 
     async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
         if not ref.transport_ref.startswith("local_pid:"):
