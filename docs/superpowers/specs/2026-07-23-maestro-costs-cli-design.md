@@ -160,11 +160,15 @@ uses only the new, correct aggregator.
 - `test_costs_missing_db_does_not_create_file`: `costs --db <missing>` → exit
   `2` **and** `not missing.exists()` (the connection must not create the file).
 - directory path → exit `2`; non-SQLite / unreadable file → exit `2`.
-- valid SQLite lacking `task_costs` (old/foreign schema) → exit `2` (not
-  "No cost records").
+- valid SQLite lacking `task_costs` **or missing a required column** (e.g. an
+  old DB without `reported_cost_usd`) → exit `2` (not "No cost records", not a
+  later row-conversion crash).
 - **Filesystem-immutability:** run `costs` against a seeded, compatible DB and
-  assert the file's mtime/size and sibling directory are unchanged — no
-  `-wal`/`-shm`, no journal, no migration writes.
+  assert the **set** of files in the directory and each file's metadata
+  (mtime/size) are unchanged before vs after — i.e. **no new files and no
+  modification**. The test compares the before/after file set, it does **not**
+  require the absence of `-wal`/`-shm` (a WAL DB may legitimately already have
+  them; §7/§8).
 
 ## 7. Read-only connection contract (boundary enforcement)
 
@@ -193,16 +197,28 @@ async with open_costs_read_only(path) as reader:   # or Database.connect_read_on
 `mode=ro` guarantees the connection:
 - never creates a missing file;
 - never runs `executescript(SCHEMA_SQL)` or any migration;
-- never issues a write PRAGMA (no WAL setup, journal, or `-wal`/`-shm`/journal
-  side files);
+- never modifies the DB or schema and issues no write PRAGMA / checkpoint;
 - fails to open a missing/invalid/non-SQLite target with `OperationalError`.
 
+**WAL nuance (do not over-constrain).** Maestro opens the DB with
+`PRAGMA journal_mode=WAL` (database.py:346). A read of a WAL database *may*
+consult **existing** `-wal`/`-shm` sidecars to see committed data — `mode=ro`
+does not mean the sidecars are uninvolved. The invariant is therefore "creates
+**no new** files and modifies nothing", **not** "no sidecars exist" (§8). Use
+`mode=ro`, **not** `immutable=1`: `immutable=1` on a potentially-live DB can
+ignore WAL contents and hand back a stale/incorrect snapshot.
+
 `ro_uri(path)` builds the URI from the **absolute** path with proper
-percent-quoting (spaces / special chars). The reader then verifies the
-`task_costs` table exists (via `sqlite_master` / `PRAGMA table_info`); a valid
-SQLite file lacking `task_costs` (old/foreign schema) is an **error → exit 2**,
-distinct from a valid Maestro DB whose `task_costs` is merely empty (→ exit 0,
-"No cost records").
+percent-quoting (spaces / special chars).
+
+**Schema check — required columns, not just the table.** The reader verifies
+`task_costs` exists **and** carries every column `TaskCost` reads:
+`task_id, agent_type, input_tokens, output_tokens, estimated_cost_usd,
+reported_cost_usd, attempt, created_at` (via `PRAGMA table_info(task_costs)`).
+Table-presence alone is insufficient: an old `task_costs` predating the
+`reported_cost_usd` migration must fail cleanly with **exit 2**, not crash later
+during row conversion. A valid schema whose `task_costs` is merely empty is
+**not** an error (→ exit 0, "No cost records").
 
 ## 8. Input cases & exit codes (locked)
 
@@ -211,12 +227,15 @@ distinct from a valid Maestro DB whose `task_costs` is merely empty (→ exit 0,
 | missing path | **exit 2**, and **no file is created** |
 | path is a directory | **exit 2** |
 | file unreadable / not a SQLite database | **exit 2** |
-| valid SQLite but **no `task_costs`** / incompatible schema | **exit 2** (not "No cost records") |
+| valid SQLite but **no `task_costs`** / missing a required column | **exit 2** (not "No cost records") |
 | valid Maestro DB, **empty** `task_costs` | **exit 0**, "No cost records." |
 | valid Maestro DB with cost rows | **exit 0**, populated tables |
 
-**Invariant:** after the command runs, the filesystem is unchanged — no new DB
-file, no `-wal`/`-shm`, no journal, no migration side effects.
+**Invariant:** the command **creates no new files** and **modifies nothing** —
+no new DB file, no *new* `-wal`/`-shm`, no journal, no migration writes; the DB
+and its schema are untouched. It may **read** pre-existing `-wal`/`-shm`
+sidecars (WAL nuance, §7) — their presence before the command is allowed and
+they are left unmodified.
 
 ## 9. Architecture summary
 
