@@ -14,6 +14,8 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from maestro.execution.exec_config import ExecutionConfig
+
 
 # Namespace for every file Maestro generates inside a target repo's
 # worktree (gates v1.2, H-7): spec/maestro-{tasks,requirements,design}.md,
@@ -466,6 +468,10 @@ class TaskConfig(BaseModel):
             "Task.from_config() time."
         ),
     )
+    backend: str | None = Field(
+        default=None,
+        description=("Execution backend name (local|docker); None -> default_backend"),
+    )
 
     @field_validator("id")
     @classmethod
@@ -541,6 +547,10 @@ class Task(BaseModel):
         default=False, description="Whether task requires approval"
     )
     validation_cmd: str | None = Field(default=None, description="Validation command")
+    backend: str | None = Field(
+        default=None,
+        description=("Execution backend name (local|docker); None -> default_backend"),
+    )
     task_type: TaskType = Field(
         default=TaskType.FEATURE,
         description="Arbiter task type (always populated; from_config infers it)",
@@ -707,6 +717,7 @@ class Task(BaseModel):
             timeout_minutes=config.timeout_minutes,
             requires_approval=config.requires_approval,
             validation_cmd=config.validation_cmd,
+            backend=config.backend,
             task_type=config.task_type or infer_task_type(config.prompt),
             language=config.language or infer_language(config.scope),
             complexity=config.complexity or infer_complexity(config.scope),
@@ -795,6 +806,13 @@ class ProjectConfig(BaseModel):
         description=(
             "Optional arbiter integration. When omitted/None the scheduler "
             "stays on zero-config StaticRouting and no subprocess is spawned."
+        ),
+    )
+    execution: ExecutionConfig | None = Field(
+        default=None,
+        description=(
+            "Execution backends config; None keeps zero-config local/bare "
+            "execution (old behavior)."
         ),
     )
 
@@ -1017,6 +1035,10 @@ class WorkstreamConfig(BaseModel):
         le=100,
         description="Execution priority (-100 to 100)",
     )
+    backend: str | None = Field(
+        default=None,
+        description=("Execution backend name (local|docker); None -> default_backend"),
+    )
 
     @field_validator("id")
     @classmethod
@@ -1084,6 +1106,10 @@ class Workstream(BaseModel):
         description="IDs of workstreams this one depends on",
     )
     priority: int = Field(default=0, description="Execution priority")
+    backend: str | None = Field(
+        default=None,
+        description=("Execution backend name (local|docker); None -> default_backend"),
+    )
     process_pid: int | None = Field(
         default=None, description="PID of spec-runner process"
     )
@@ -1161,6 +1187,7 @@ class Workstream(BaseModel):
             scope=config.scope,
             depends_on=config.depends_on,
             priority=config.priority,
+            backend=config.backend,
         )
 
 
@@ -1445,6 +1472,13 @@ class OrchestratorConfig(BaseModel):
     gates: GatesConfig | None = Field(
         default=None,
         description="Gates-in-DAG guard config (WS-006); None disables gates.",
+    )
+    execution: ExecutionConfig | None = Field(
+        default=None,
+        description=(
+            "Execution backends config; None keeps zero-config local/bare "
+            "execution (old behavior)."
+        ),
     )
 
     @field_validator("repo_path")
