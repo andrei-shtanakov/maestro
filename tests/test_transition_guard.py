@@ -162,6 +162,19 @@ def test_scheduler_update_task_status_only_in_transition() -> None:
     assert _calls_inside(tree, "update_task_status", {"_transition"}) == []
 
 
+def test_orchestrator_update_workstream_status_only_in_transition_or_fields() -> None:
+    """Every `update_workstream_status(...)` call in orchestrator.py must live
+    inside `_transition` or `_update_fields` — the only two places that write
+    workstream status, one of which also dispatches the effect table."""
+    tree = ast.parse((_REPO_ROOT / "maestro" / "orchestrator.py").read_text())
+    assert (
+        _calls_inside(
+            tree, "update_workstream_status", {"_transition", "_update_fields"}
+        )
+        == []
+    )
+
+
 def test_transitions_not_imported_by_database() -> None:
     """The DB layer stays effect-free: it never imports the dispatcher."""
     src = (_REPO_ROOT / "maestro" / "database.py").read_text()

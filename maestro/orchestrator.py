@@ -12,6 +12,7 @@ import logging
 import os
 import signal
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.changed_paths import changed_paths_since
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
+from maestro.event_log import get_event_logger
 from maestro.execution.backend import TaskHandle
 from maestro.execution.local import LocalBackend
 from maestro.execution.models import CollectPolicy, ExecutionRequest
@@ -37,18 +39,31 @@ from maestro.merge_logs import merge_logs_dir
 from maestro.models import (
     SPEC_PREFIX,
     OrchestratorConfig,
+    TransitionSubject,
     Workstream,
     WorkstreamConfig,
     WorkstreamStatus,
 )
+from maestro.notifications.manager import NotificationManager
 from maestro.pr_manager import PRManager, PRManagerError
 from maestro.scope_gate import build_scope_escape_reason, find_escapes, normalize
 from maestro.spec_runner import read_executor_state
+from maestro.transitions import TransitionDispatcher
 from maestro.workspace import WorkspaceManager, ensure_harness_excludes
 
 
 class OrchestratorError(Exception):
     """Base exception for orchestrator errors."""
+
+
+StatusChangeCallback = Callable[[str, str, str], None]
+
+
+def _subject(workstream: Workstream) -> TransitionSubject:
+    """Build the dispatcher's entity-agnostic view of a workstream."""
+    return TransitionSubject(
+        "workstream", workstream.id, workstream.title, workstream.status
+    )
 
 
 _SPAWNING_SENTINEL = -1
@@ -138,6 +153,8 @@ class Orchestrator:
         pr_manager: PRManager,
         config: OrchestratorConfig,
         log_dir: Path | None = None,
+        notifier: NotificationManager | None = None,
+        on_status_change: StatusChangeCallback | None = None,
     ) -> None:
         """Initialize orchestrator.
 
@@ -148,12 +165,21 @@ class Orchestrator:
             pr_manager: PR creation manager.
             config: Orchestrator configuration.
             log_dir: Directory for log files.
+            notifier: Optional notification manager for workstream
+                lifecycle notifications.
+            on_status_change: Optional callback for workstream status changes.
         """
         self._db = db
         self._workspace_mgr = workspace_mgr
         self._decomposer = decomposer
         self._pr_manager = pr_manager
         self._config = config
+        self._on_status_change = on_status_change
+        self._dispatcher = TransitionDispatcher(
+            notifier=notifier,
+            event_logger_getter=get_event_logger,
+            status_change_cb=on_status_change,
+        )
         self._log_dir = log_dir or Path(config.repo_path).expanduser() / "logs"
         self._gates: GateKeeper | None = None
         if config.gates is not None:
@@ -179,6 +205,47 @@ class Orchestrator:
     def is_running(self) -> bool:
         """Check if orchestrator is running."""
         return self._loop is not None and not self._shutdown_requested
+
+    async def _transition(
+        self,
+        workstream_id: str,
+        to_status: WorkstreamStatus,
+        *,
+        expected_status: WorkstreamStatus,
+        details: dict[str, object] | None = None,
+        message: str | None = None,
+        **fields: object,
+    ) -> Workstream:
+        """Write a workstream status transition and dispatch its effects.
+
+        Mirrors `Scheduler._transition` (spec §4.1): `expected_status` is a
+        CAS guard on the write; on success it *is* the true `frm` for the
+        dispatcher (a plain re-`get` would be unreliable under concurrent
+        writes). `details`/`message` feed the event/notification only;
+        `**fields` are DB columns (error_message, pr_url, ...) and never
+        leak into the effect.
+        """
+        workstream = await self._db.update_workstream_status(
+            workstream_id, to_status, expected_status=expected_status, **fields
+        )
+        await self._dispatcher.fire(
+            _subject(workstream),
+            frm=expected_status,
+            details=details,
+            message=message,
+        )
+        return workstream
+
+    async def _update_fields(self, workstream_id: str, **fields: object) -> Workstream:
+        """Patch workstream columns without a status transition (no dispatch).
+
+        For same-state writes that reuse the status API to update columns
+        (pid tracking, progress text, ...) — see spec §4.2.
+        """
+        workstream = await self._db.get_workstream(workstream_id)
+        return await self._db.update_workstream_status(
+            workstream_id, workstream.status, expected_status=None, **fields
+        )
 
     async def run(self) -> OrchestratorStats:
         """Run the orchestrator main loop.
@@ -259,10 +326,10 @@ class Orchestrator:
                                 state.value,
                                 orphan_pid,
                             )
-                        await self._db.update_workstream_status(
-                            w.id, WorkstreamStatus.FAILED
+                        await self._transition(
+                            w.id, WorkstreamStatus.FAILED, expected_status=state
                         )
-                        await self._db.update_workstream_status(
+                        await self._transition(
                             w.id,
                             WorkstreamStatus.NEEDS_REVIEW,
                             expected_status=WorkstreamStatus.FAILED,
@@ -278,8 +345,8 @@ class Orchestrator:
                             "DECOMPOSING -> READY",
                             w.id,
                         )
-                        await self._db.update_workstream_status(
-                            w.id, WorkstreamStatus.READY
+                        await self._transition(
+                            w.id, WorkstreamStatus.READY, expected_status=state
                         )
                     else:
                         # RUNNING (dead) / MERGING / PR_CREATED: cannot go
@@ -289,10 +356,10 @@ class Orchestrator:
                             w.id,
                             state.value,
                         )
-                        await self._db.update_workstream_status(
-                            w.id, WorkstreamStatus.FAILED
+                        await self._transition(
+                            w.id, WorkstreamStatus.FAILED, expected_status=state
                         )
-                        await self._db.update_workstream_status(
+                        await self._transition(
                             w.id,
                             WorkstreamStatus.READY,
                             expected_status=WorkstreamStatus.FAILED,
@@ -341,7 +408,7 @@ class Orchestrator:
                     target.value,
                 )
                 if target is WorkstreamStatus.NEEDS_REVIEW:
-                    await self._db.update_workstream_status(
+                    await self._transition(
                         w.id,
                         WorkstreamStatus.NEEDS_REVIEW,
                         expected_status=WorkstreamStatus.FAILED,
@@ -351,7 +418,7 @@ class Orchestrator:
                     # Parked for review — signal via exit code + summary.
                     self._stats.failed += 1
                 else:
-                    await self._db.update_workstream_status(
+                    await self._transition(
                         w.id,
                         WorkstreamStatus.READY,
                         expected_status=WorkstreamStatus.FAILED,
@@ -528,11 +595,15 @@ class Orchestrator:
             # Clear generation_pid atomically in the same READY write: on the
             # cancel path the `finally` clear can itself be interrupted by a
             # re-raised CancelledError before its awaits complete, so cleanup
-            # must not depend on it here.
+            # must not depend on it here. Re-read the current status right
+            # before writing so the CAS reflects the actual pre-cancel state
+            # (typically DECOMPOSING) rather than a hardcoded guess.
             with contextlib.suppress(Exception):
-                await self._db.update_workstream_status(
+                current = await self._db.get_workstream(workstream_id)
+                await self._transition(
                     workstream_id,
                     WorkstreamStatus.READY,
+                    expected_status=current.status,
                     generation_pid=None,
                 )
             raise
@@ -547,15 +618,11 @@ class Orchestrator:
             self._generating.pop(workstream_id, None)
             # Clear the generation pid on every exit (success/cancel/failure);
             # a stale pid only pollutes REST/dashboard, but keep it clean.
-            # Same-state write WITHOUT expected_status (update_workstream_status
-            # does not validate transitions — an expected_status here would
-            # wrongly block the reset after READY/FAILED).
+            # Same-state field patch (spec §4.2) — no dispatch.
             with contextlib.suppress(Exception):
                 w = await self._db.get_workstream(workstream_id)
                 if w.generation_pid is not None:
-                    await self._db.update_workstream_status(
-                        workstream_id, w.status, generation_pid=None
-                    )
+                    await self._update_fields(workstream_id, generation_pid=None)
 
     async def _spawn_workstream(self, workstream_id: str) -> None:
         """Spawn a spec-runner process for a workstream."""
@@ -577,7 +644,7 @@ class Orchestrator:
         # Transition to DECOMPOSING; write the spawning sentinel up front — it
         # marks a spawn-in-progress AND overwrites any stale prior generation
         # pid (re-decompose).
-        await self._db.update_workstream_status(
+        await self._transition(
             workstream_id,
             WorkstreamStatus.DECOMPOSING,
             expected_status=workstream.status,
@@ -592,12 +659,8 @@ class Orchestrator:
         else:
             workspace = self._workspace_mgr.get_workspace_path(workstream_id)
 
-        # Update workspace path in DB
-        await self._db.update_workstream_status(
-            workstream_id,
-            WorkstreamStatus.DECOMPOSING,
-            workspace_path=str(workspace),
-        )
+        # Update workspace path in DB (same-state field patch, no dispatch).
+        await self._update_fields(workstream_id, workspace_path=str(workspace))
 
         # H-7: keep every harness artifact untracked in the target repo —
         # repo-local ignore block, shared by all linked worktrees.
@@ -626,18 +689,19 @@ class Orchestrator:
         )
 
         async def _on_gen_pid(pid: int) -> None:
-            await self._db.update_workstream_status(
-                workstream_id,
-                WorkstreamStatus.DECOMPOSING,
-                generation_pid=pid,
-            )
+            # Same-state field patch (still DECOMPOSING) — no dispatch.
+            await self._update_fields(workstream_id, generation_pid=pid)
 
         await self._decomposer.generate_spec(
             workstream_config, workspace, on_pid=_on_gen_pid
         )
 
         # Transition to READY then RUNNING
-        await self._db.update_workstream_status(workstream_id, WorkstreamStatus.READY)
+        await self._transition(
+            workstream_id,
+            WorkstreamStatus.READY,
+            expected_status=WorkstreamStatus.DECOMPOSING,
+        )
 
         # Gates (WS-006): ex-ante guard over the declared scope. A block
         # routes to NEEDS_REVIEW; the operator re-queueing it approves the
@@ -645,7 +709,7 @@ class Orchestrator:
         if not await self._gate_ex_ante(workstream_id, workstream):
             return
 
-        await self._db.update_workstream_status(
+        await self._transition(
             workstream_id,
             WorkstreamStatus.RUNNING,
             expected_status=WorkstreamStatus.READY,
@@ -691,12 +755,8 @@ class Orchestrator:
             log_file=log_file,
         )
 
-        # Update PID in DB
-        await self._db.update_workstream_status(
-            workstream_id,
-            WorkstreamStatus.RUNNING,
-            process_pid=handle.os_pid,
-        )
+        # Update PID in DB (same-state field patch, no dispatch).
+        await self._update_fields(workstream_id, process_pid=handle.os_pid)
 
         self._logger.info(
             "Spawned spec-runner for '%s' (PID %s) in %s",
@@ -821,10 +881,9 @@ class Orchestrator:
         if state is None:
             return
 
-        await self._db.update_workstream_status(
-            workstream_id,
-            WorkstreamStatus.RUNNING,
-            subtask_progress=state.progress_label(),
+        # Same-state field patch (still RUNNING) — no dispatch.
+        await self._update_fields(
+            workstream_id, subtask_progress=state.progress_label()
         )
 
     async def _gate_ex_ante(self, workstream_id: str, workstream: Workstream) -> bool:
@@ -891,7 +950,7 @@ class Orchestrator:
                 marker.sha[:12],
             )
             return False
-        await self._db.update_workstream_status(
+        await self._transition(
             workstream.id,
             WorkstreamStatus.RUNNING,
             expected_status=workstream.status,
@@ -912,16 +971,18 @@ class Orchestrator:
 
         The worktree is left intact for inspection. Returns False (blocked).
         """
-        await self._db.update_workstream_status(
+        await self._transition(
             workstream_id,
             WorkstreamStatus.FAILED,
             expected_status=WorkstreamStatus.RUNNING,
+            message=reason,
             error_message=reason,
         )
-        await self._db.update_workstream_status(
+        await self._transition(
             workstream_id,
             WorkstreamStatus.NEEDS_REVIEW,
             expected_status=WorkstreamStatus.FAILED,
+            message=reason,
             error_message=reason,
         )
         self._stats.failed += 1
@@ -993,10 +1054,11 @@ class Orchestrator:
         )
         if decision.allow:
             return True
-        await self._db.update_workstream_status(
+        await self._transition(
             workstream_id,
             WorkstreamStatus.FAILED,
             expected_status=WorkstreamStatus.RUNNING,
+            message=decision.reason,
             error_message=decision.reason,
         )
         await self._route_gate_block(
@@ -1016,10 +1078,11 @@ class Orchestrator:
         self._logger.warning(
             "Gates blocked workstream '%s': %s", workstream_id, decision.reason
         )
-        await self._db.update_workstream_status(
+        await self._transition(
             workstream_id,
             WorkstreamStatus.NEEDS_REVIEW,
             expected_status=expected,
+            message=decision.reason,
             error_message=decision.reason,
         )
 
@@ -1069,7 +1132,7 @@ class Orchestrator:
             return
 
         # Transition to MERGING
-        await self._db.update_workstream_status(
+        await self._transition(
             workstream_id,
             WorkstreamStatus.MERGING,
             expected_status=WorkstreamStatus.RUNNING,
@@ -1085,9 +1148,10 @@ class Orchestrator:
                     base_branch=self._config.base_branch,
                 )
 
-                await self._db.update_workstream_status(
+                await self._transition(
                     workstream_id,
                     WorkstreamStatus.PR_CREATED,
+                    expected_status=WorkstreamStatus.MERGING,
                     pr_url=pr_url,
                 )
 
@@ -1110,9 +1174,10 @@ class Orchestrator:
                 # later crash before DONE would then full-respawn instead
                 # of resuming (the marker clears ONLY on the DONE write).
                 note = f"PR creation note: {e}"
-                await self._db.update_workstream_status(
+                await self._transition(
                     workstream_id,
                     WorkstreamStatus.PR_CREATED,
+                    expected_status=WorkstreamStatus.MERGING,
                     error_message=preserve_approval_marker(
                         note, workstream.error_message
                     ),
@@ -1122,9 +1187,10 @@ class Orchestrator:
         # here); auto_pr=False creates no PR, so pass MERGING -> PR_CREATED.
         current = await self._db.get_workstream(workstream_id)
         if current.status == WorkstreamStatus.MERGING:
-            await self._db.update_workstream_status(
+            await self._transition(
                 workstream_id,
                 WorkstreamStatus.PR_CREATED,
+                expected_status=WorkstreamStatus.MERGING,
             )
 
         # Merge the feature branch into base BEFORE marking DONE, so DONE is
@@ -1143,16 +1209,19 @@ class Orchestrator:
                 workstream_id,
                 e,
             )
-            await self._db.update_workstream_status(
+            merge_failed_msg = f"Base merge failed: {e}"
+            await self._transition(
                 workstream_id,
                 WorkstreamStatus.FAILED,
                 expected_status=WorkstreamStatus.PR_CREATED,
-                error_message=f"Base merge failed: {e}",
+                message=merge_failed_msg,
+                error_message=merge_failed_msg,
             )
-            await self._db.update_workstream_status(
+            await self._transition(
                 workstream_id,
                 WorkstreamStatus.NEEDS_REVIEW,
                 expected_status=WorkstreamStatus.FAILED,
+                message=merge_failed_msg,
             )
             self._stats.failed += 1
             # Leave the workspace intact so a human can resolve the conflict.
@@ -1163,7 +1232,7 @@ class Orchestrator:
         # to survive a crash-tail through MERGING/PR_CREATED (both reset to
         # READY on recovery, and the next run must still see the marker to
         # resume instead of full-respawning).
-        await self._db.update_workstream_status(
+        await self._transition(
             workstream_id,
             WorkstreamStatus.DONE,
             expected_status=WorkstreamStatus.PR_CREATED,
@@ -1196,13 +1265,20 @@ class Orchestrator:
                 new_count,
                 workstream.max_retries,
             )
-            await self._db.update_workstream_status(
+            # `workstream.status` (fresh, above) is the real `frm`: unlike
+            # the scheduler's analogous failure handler, this is reached
+            # from both a DECOMPOSING failure (spec gen) and a RUNNING
+            # failure (process exit), so the prior status can't be
+            # hardcoded.
+            await self._transition(
                 workstream_id,
                 WorkstreamStatus.FAILED,
+                expected_status=workstream.status,
+                message=preserved,
                 error_message=preserved,
                 retry_count=new_count,
             )
-            await self._db.update_workstream_status(
+            await self._transition(
                 workstream_id,
                 WorkstreamStatus.READY,
                 expected_status=WorkstreamStatus.FAILED,
@@ -1212,15 +1288,18 @@ class Orchestrator:
                 "Workstream '%s' exhausted retries",
                 workstream_id,
             )
-            await self._db.update_workstream_status(
+            await self._transition(
                 workstream_id,
                 WorkstreamStatus.FAILED,
+                expected_status=workstream.status,
+                message=preserved,
                 error_message=preserved,
             )
-            await self._db.update_workstream_status(
+            await self._transition(
                 workstream_id,
                 WorkstreamStatus.NEEDS_REVIEW,
                 expected_status=WorkstreamStatus.FAILED,
+                message=preserved,
             )
             self._stats.failed += 1
 
@@ -1275,12 +1354,18 @@ class Orchestrator:
                 )
 
             try:
-                await self._db.update_workstream_status(
+                # `running.workstream.status` is RUNNING (set at registration
+                # in _spawn_workstream, and _update_progress only patches
+                # subtask_progress, never status), matching the scheduler's
+                # analogous shutdown-cleanup transition (expected=RUNNING).
+                await self._transition(
                     zid,
                     WorkstreamStatus.FAILED,
+                    expected_status=WorkstreamStatus.RUNNING,
+                    message="Orchestrator shutdown",
                     error_message="Orchestrator shutdown",
                 )
-                await self._db.update_workstream_status(
+                await self._transition(
                     zid,
                     WorkstreamStatus.READY,
                     expected_status=WorkstreamStatus.FAILED,
