@@ -86,23 +86,28 @@ def _fake_execution_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch every Orchestrator's `LocalBackend` with a fake for this module.
 
     Mirrors the scheduler test pattern (Task 5, see test_scheduler.py):
-    `Orchestrator.__init__` does `self._backend = LocalBackend()`; patching
-    the name in `maestro.orchestrator` makes every orchestrator built in
-    this file use `FakeOrchestratorBackend` instead, so `_spawn_workstream`
-    never spawns a real `spec-runner` subprocess.
+    `Orchestrator.__init__` builds `self._backends = BackendResolver(...)`,
+    and `BackendResolver._build()` (in `maestro.execution.resolver`) is what
+    constructs `LocalBackend()` for the "local" name. Patching the name
+    there makes every orchestrator built in this file resolve to
+    `FakeOrchestratorBackend` instead, so `_spawn_workstream` never spawns a
+    real `spec-runner` subprocess.
     """
-    monkeypatch.setattr("maestro.orchestrator.LocalBackend", FakeOrchestratorBackend)
+    monkeypatch.setattr(
+        "maestro.execution.resolver.LocalBackend", FakeOrchestratorBackend
+    )
 
 
 def _set_fake_backend(orch: Orchestrator, backend: FakeOrchestratorBackend) -> None:
-    """Type-narrowing assignment of `orch._backend` in tests.
+    """Type-narrowing assignment of the orchestrator's resolved backend.
 
-    Statically typed as `LocalBackend` on `Orchestrator`; the autouse fixture
-    above already swaps in a `FakeOrchestratorBackend` at construction time,
-    but a handful of tests need a *specific* pid/exit_code, so they build
-    their own instance and assign it here instead of relying on the default.
+    The autouse fixture above already swaps in a `FakeOrchestratorBackend` at
+    construction time (cached under the "local" key), but a handful of tests
+    need a *specific* pid/exit_code, so they build their own instance and
+    overwrite the resolver's cache entry here instead of relying on the
+    default.
     """
-    orch._backend = cast("LocalBackend", backend)
+    orch._backends._cache["local"] = cast("LocalBackend", backend)
 
 
 # =============================================================================
@@ -227,7 +232,7 @@ def orchestrator(
 def orchestrator_with_fake_backend(orchestrator: Orchestrator) -> Orchestrator:
     """Alias for readability in tests that spawn a workstream and inspect
     `.handle`. The autouse `_fake_execution_backend` fixture above already
-    wires `orchestrator._backend` to a `FakeOrchestratorBackend`.
+    wires `orchestrator._backends` to resolve to a `FakeOrchestratorBackend`.
     """
     return orchestrator
 

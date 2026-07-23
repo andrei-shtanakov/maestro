@@ -37,9 +37,10 @@ from maestro.dag import DAG
 from maestro.database import Database
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
 from maestro.execution.backend import TaskHandle
+from maestro.execution.exec_config import ExecutionConfig
 from maestro.execution.finalize import ensure_finalize_task
-from maestro.execution.local import LocalBackend
 from maestro.execution.models import ExecutionRequest
+from maestro.execution.resolver import BackendResolver
 from maestro.models import (
     AgentType,
     ArbiterMode,
@@ -231,6 +232,7 @@ class Scheduler:
         on_status_change: StatusChangeCallback | None = None,
         routing: RoutingStrategy | None = None,
         arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
+        execution: ExecutionConfig | None = None,
     ) -> None:
         """Initialize scheduler.
 
@@ -245,6 +247,10 @@ class Scheduler:
             routing: Routing strategy (defaults to StaticRouting).
             arbiter_mode: ADVISORY (default) or AUTHORITATIVE; drives retry
                 gating when arbiter becomes unavailable.
+            execution: Optional execution-backends config (the `execution:`
+                block of the project config). None keeps the zero-config
+                local/bare path — `BackendResolver` resolves every task to
+                `LocalBackend`, identical to the pre-Task-8 behavior.
         """
         self._db = db
         self._dag = dag
@@ -264,7 +270,7 @@ class Scheduler:
         self._arbiter_mode: ArbiterMode = arbiter_mode
         self._hold_throttle: HoldThrottle = HoldThrottle()
         self._abandon_outcome_after_s: int = 300
-        self._backend = LocalBackend()
+        self._backends = BackendResolver(execution)
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._last_tick: tuple[int, int, int] | None = None
@@ -1052,6 +1058,12 @@ class Scheduler:
             model=routed_model,
         )
 
+        # Resolve the execution backend for this task (per-entity, falling
+        # back to the configured/default backend — see BackendResolver).
+        # Stamped onto the request before any capability check/spawn.
+        backend = self._backends.resolve(task.backend)
+        request = request.model_copy(update={"backend_id": backend.id})
+
         # Executor-side tool probe (replaces is_available()): checks the
         # request's required_tools against the target executor. Fails
         # fast with the same "not available" wording the old
@@ -1059,7 +1071,7 @@ class Scheduler:
         # hold even though the check now runs backend-side. Runs before any
         # RUNNING transition/span so a missing tool never leaves the task
         # observed as briefly RUNNING.
-        cap = await self._backend.can_run(request)
+        cap = await backend.can_run(request)
         if not cap.ok:
             msg = (
                 f"Agent '{spawner_key}' is not available on this system "
@@ -1090,7 +1102,7 @@ class Scheduler:
             )
             self._retry_ready_times.pop(task_id, None)
 
-            handle = await self._backend.run(request)
+            handle = await backend.run(request)
 
             # Track running task
             self._running_tasks[task_id] = RunningTask(
@@ -1695,6 +1707,7 @@ async def create_scheduler_from_config(
     routing: RoutingStrategy | None = None,
     arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
     arbiter_enabled: bool = False,
+    execution: ExecutionConfig | None = None,
 ) -> Scheduler:
     """Create a scheduler from task configurations.
 
@@ -1715,6 +1728,10 @@ async def create_scheduler_from_config(
         auto_commit: Whether to auto-commit after task completion.
         routing: Routing strategy (defaults to StaticRouting).
         arbiter_mode: Arbiter authority mode (ADVISORY by default).
+        arbiter_enabled: Whether arbiter integration is enabled.
+        execution: Optional execution-backends config (the project's
+            `execution:` block); forwarded to `Scheduler` for per-task
+            backend resolution. None keeps the zero-config local path.
 
     Returns:
         Configured Scheduler instance.
@@ -1755,4 +1772,5 @@ async def create_scheduler_from_config(
         on_status_change=on_status_change,
         routing=routing,
         arbiter_mode=arbiter_mode,
+        execution=execution,
     )

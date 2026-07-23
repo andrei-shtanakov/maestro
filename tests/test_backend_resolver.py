@@ -27,3 +27,14 @@ def test_docker_without_docker_config_fails_fast():
 def test_local_instance_is_cached():
     r = BackendResolver(None)
     assert r.resolve("local") is r.resolve("local")
+
+
+def test_resolve_uses_entity_backend_then_default():
+    """Documents the dispatch contract both loops rely on: an entity's own
+    `backend` wins when set, otherwise the configured default is used.
+    """
+    r = BackendResolver(ExecutionConfig(default_backend="local"))
+    # entity backend None -> default_name
+    assert r.resolve(None).id == "local"
+    # explicit local
+    assert r.resolve("local").id == "local"

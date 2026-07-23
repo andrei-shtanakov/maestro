@@ -23,8 +23,8 @@ from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
 from maestro.event_log import get_event_logger
 from maestro.execution.backend import TaskHandle
-from maestro.execution.local import LocalBackend
 from maestro.execution.models import CollectPolicy, ExecutionRequest
+from maestro.execution.resolver import BackendResolver
 from maestro.gates import (
     BLOCK_REASON_PREFIX,
     ApprovalMarker,
@@ -191,7 +191,7 @@ class Orchestrator:
                 log_dir=pipeline_log_dir(),
             )
 
-        self._backend = LocalBackend()
+        self._backends = BackendResolver(self._config.execution)
         self._running: dict[str, RunningWorkstream] = {}
         self._generating: dict[str, asyncio.Task[None]] = {}
         self._shutdown_grace_seconds: float = 5.0
@@ -735,8 +735,14 @@ class Orchestrator:
             collect=CollectPolicy(mode="none"),
             required_tools=["spec-runner"],
         )
+
+        # Resolve the execution backend for this workstream (per-entity,
+        # falling back to the configured/default backend).
+        backend = self._backends.resolve(workstream.backend)
+        request = request.model_copy(update={"backend_id": backend.id})
+
         with span("task.execute", task_id=workstream_id):
-            handle = await self._backend.run(request)
+            handle = await backend.run(request)
 
         # Register in _running BEFORE any further await, so a shutdown
         # cancellation can never orphan the spawned process: once it's

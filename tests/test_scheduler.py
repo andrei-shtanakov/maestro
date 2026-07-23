@@ -50,24 +50,27 @@ from tests.fakes.fake_execution_backend import FakeExecutionBackend
 def _fake_execution_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch every Scheduler's LocalBackend with a fake for this module.
 
-    `Scheduler.__init__` does `self._backend = LocalBackend()`; patching the
-    name in `maestro.scheduler` makes every scheduler built in this file use
+    `Scheduler.__init__` builds `self._backends = BackendResolver(execution)`;
+    `BackendResolver._build()` constructs `LocalBackend()` for the "local"
+    name, so patching the name in `maestro.execution.resolver` (where that
+    construction happens) makes every scheduler built in this file resolve to
     `FakeExecutionBackend` instead, so `spawner.build_request(...)` +
-    `await self._backend.run(request)` never spawns a real subprocess. See
+    `await backend.run(request)` never spawns a real subprocess. See
     tests/fakes/fake_execution_backend.py for the handle/backend doubles.
     """
-    monkeypatch.setattr("maestro.scheduler.LocalBackend", FakeExecutionBackend)
+    monkeypatch.setattr("maestro.execution.resolver.LocalBackend", FakeExecutionBackend)
 
 
 def _fake_backend(scheduler: Scheduler) -> FakeExecutionBackend:
-    """Type-narrowing accessor for `scheduler._backend` in tests.
+    """Type-narrowing accessor for the scheduler's resolved backend in tests.
 
-    Statically typed as `LocalBackend` on `Scheduler`; the autouse fixture
-    above swaps in a `FakeExecutionBackend` at runtime, so tests that need
-    `created_handles` go through this cast instead of a raw attribute access
-    pyrefly can't verify.
+    `BackendResolver.resolve()` is statically typed to return an
+    `ExecutionBackend`; the autouse fixture above swaps in a
+    `FakeExecutionBackend` at runtime, so tests that need `created_handles`
+    go through this cast instead of a raw attribute access pyrefly can't
+    verify.
     """
-    return cast("FakeExecutionBackend", scheduler._backend)
+    return cast("FakeExecutionBackend", scheduler._backends.resolve(None))
 
 
 # =============================================================================
@@ -1109,7 +1112,7 @@ class TestGracefulShutdown:
             await scheduler.shutdown()
             await scheduler._cleanup()
 
-            # All processes should be terminated. `scheduler._backend`
+            # All processes should be terminated. The resolved backend
             # outlives `_running_tasks` (cleared by `_cleanup()` below), so
             # handles are inspected off the backend, not the spawner.
             created_handles = _fake_backend(scheduler).created_handles
@@ -2418,7 +2421,7 @@ class TestTransitionDispatchWiring:
             async def _raise_on_run(request: object) -> None:
                 raise RuntimeError("launch boom")
 
-            monkeypatch.setattr(scheduler._backend, "run", _raise_on_run)
+            monkeypatch.setattr(scheduler._backends.resolve(None), "run", _raise_on_run)
 
             await scheduler._spawn_ready_tasks(["t1"])
 
