@@ -176,10 +176,31 @@ def test_orchestrator_update_workstream_status_only_in_transition_or_fields() ->
 
 
 def test_transitions_not_imported_by_database() -> None:
-    """The DB layer stays effect-free: it never imports the dispatcher."""
-    src = (_REPO_ROOT / "maestro" / "database.py").read_text()
-    assert "import transitions" not in src
-    assert "from maestro.transitions" not in src
+    """The DB layer stays effect-free: it never imports the dispatcher.
+
+    AST-based (not a substring scan) so it catches every import form —
+    ``import maestro.transitions``, ``from maestro.transitions import X``,
+    ``from maestro import transitions``, ``from . import transitions`` — and
+    never false-positives on a comment or string that mentions the module.
+    """
+    tree = ast.parse((_REPO_ROOT / "maestro" / "database.py").read_text())
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                # `import transitions` / `import maestro.transitions`
+                if alias.name == "transitions" or alias.name.endswith(".transitions"):
+                    offenders.append(f"import {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            # `from maestro.transitions import X` / `from transitions import X`
+            if module == "transitions" or module.endswith(".transitions"):
+                offenders.append(f"from {module} import ...")
+            # `from maestro import transitions` / `from . import transitions`
+            for alias in node.names:
+                if alias.name == "transitions":
+                    offenders.append(f"from {module or '.'} import {alias.name}")
+    assert not offenders, f"database.py imports the dispatcher: {offenders}"
 
 
 def test_atomic_transition_helpers_dispatch_effects() -> None:
