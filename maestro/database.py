@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.request import pathname2url
 
 import aiosqlite
 
@@ -2139,3 +2140,53 @@ async def create_database(db_path: str | Path) -> Database:
     # Database.connect() auto-runs initialize_schema(); no separate call needed.
     await db.connect()
     return db
+
+
+_REQUIRED_TASK_COST_COLUMNS = frozenset(
+    {
+        "task_id",
+        "agent_type",
+        "input_tokens",
+        "output_tokens",
+        "estimated_cost_usd",
+        "reported_cost_usd",
+        "attempt",
+        "created_at",
+    }
+)
+
+
+def _ro_uri(db_path: str | Path) -> str:
+    """SQLite read-only URI for an absolute path (percent-quoted)."""
+    abspath = Path(db_path).resolve()
+    return f"file:{pathname2url(str(abspath))}?mode=ro"
+
+
+async def read_all_costs_readonly(db_path: str | Path) -> list[TaskCost]:
+    """Open ``db_path`` READ-ONLY and return all TaskCost rows.
+
+    mode=ro never creates a missing file, runs no schema/migrations, and does not
+    modify the DB (it may read pre-existing -wal/-shm). Raises DatabaseError for
+    a missing / non-SQLite / schema-incompatible DB.
+    """
+    try:
+        conn = await aiosqlite.connect(_ro_uri(db_path), uri=True)
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+        raise DatabaseError(f"cannot open database read-only: {exc}") from exc
+    try:
+        conn.row_factory = aiosqlite.Row
+        try:
+            cursor = await conn.execute("PRAGMA table_info(task_costs)")
+            columns = {row["name"] for row in await cursor.fetchall()}
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+            raise DatabaseError(f"not a valid database: {exc}") from exc
+        if not columns >= _REQUIRED_TASK_COST_COLUMNS:
+            raise DatabaseError(
+                "database has no compatible 'task_costs' table "
+                "(missing table or required columns)"
+            )
+        cursor = await conn.execute("SELECT * FROM task_costs ORDER BY created_at")
+        rows = await cursor.fetchall()
+        return [_row_to_task_cost(row) for row in rows]
+    finally:
+        await conn.close()
