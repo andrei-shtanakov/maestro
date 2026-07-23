@@ -602,8 +602,18 @@ class Scheduler:
                     released = await self._db.abandon_pending_outcome_and_release(
                         task.id
                     )
+                    # `released` only reflects that the UPDATE's WHERE id=?
+                    # matched a row — the CASE inside it leaves `status`
+                    # untouched (and still counts as a matched row) when the
+                    # task wasn't FAILED, so the flip is real only when the
+                    # in-memory pre-image was FAILED. Verified empirically:
+                    # sqlite rowcount counts WHERE-matched rows regardless of
+                    # whether the CASE branch changed the value.
                     if released and task.status is TaskStatus.FAILED:
-                        self._report_status_change(task.id, "failed", "ready")
+                        retried_task = await self._db.get_task(task.id)
+                        await self._dispatch_committed_transition(
+                            retried_task, frm=TaskStatus.FAILED
+                        )
                 # Arbiter is clearly down — stop for this tick.
                 break
             else:

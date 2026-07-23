@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import anyio
 import pytest
 
+from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.dag import DAG
 from maestro.database import Database, create_database
 from maestro.event_log import (
@@ -21,7 +22,15 @@ from maestro.event_log import (
     set_event_logger,
 )
 from maestro.execution.models import CollectPolicy, ExecutionRequest
-from maestro.models import AgentType, Task, TaskConfig, TaskStatus
+from maestro.models import (
+    AgentType,
+    ArbiterMode,
+    RouteDecision,
+    Task,
+    TaskConfig,
+    TaskOutcome,
+    TaskStatus,
+)
 from maestro.notifications.base import NotificationChannel, NotificationEvent
 from maestro.notifications.manager import NotificationManager
 from maestro.retry import RetryManager
@@ -2354,6 +2363,21 @@ def _capturing_notification_manager() -> tuple[NotificationManager, AsyncMock]:
     return manager, channel
 
 
+class _AlwaysUnavailableRouting:
+    """Minimal `RoutingStrategy` double: `report_outcome` always raises
+    `ArbiterUnavailable`, driving `_outcome_reattempt_pass` down its
+    force-release branch."""
+
+    async def route(self, task: Task) -> RouteDecision:
+        raise NotImplementedError
+
+    async def report_outcome(self, task: Task, outcome: TaskOutcome) -> None:
+        raise ArbiterUnavailable("dead")
+
+    async def aclose(self) -> None:
+        return None
+
+
 class TestTransitionDispatchWiring:
     """Task 6 contract: scheduler status sites route through the dispatcher."""
 
@@ -2662,5 +2686,56 @@ class TestTransitionDispatchWiring:
 
             task = await db.get_task("t1")
             assert task.status == TaskStatus.AWAITING_APPROVAL
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_abandon_release_fires_retrying_event(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        """`abandon_pending_outcome_and_release` is a 4th atomic FAILED->READY
+        DB helper (distinct from `reset_for_retry_atomic`, not named in the
+        original brief) — its `_outcome_reattempt_pass` call site
+        (AUTHORITATIVE + arbiter down + completed_at past the abandon
+        window) must also dispatch TASK_RETRYING, not just the raw status
+        callback.
+        """
+        past = datetime.now(UTC) - timedelta(seconds=10)
+        db = await create_database(temp_db_path)
+        try:
+            task = Task(
+                id="t1",
+                title="T1",
+                prompt="do it",
+                workdir=str(temp_dir),
+                status=TaskStatus.FAILED,
+                arbiter_decision_id="dec-abandon",
+                created_at=past,
+                started_at=past,
+                completed_at=past,
+            )
+            await db.create_task(task)
+
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([]),
+                spawners={},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                routing=_AlwaysUnavailableRouting(),
+                arbiter_mode=ArbiterMode.AUTHORITATIVE,
+            )
+            scheduler._abandon_outcome_after_s = 1
+
+            await scheduler._outcome_reattempt_pass()
+
+            event_types = captured_events.transition_event_types()
+            assert event_types == [EventType.TASK_RETRYING]
+
+            refetched = await db.get_task("t1")
+            assert refetched.status == TaskStatus.READY
+            assert refetched.arbiter_decision_id is None
         finally:
             await db.close()
