@@ -163,12 +163,14 @@ uses only the new, correct aggregator.
 - valid SQLite lacking `task_costs` **or missing a required column** (e.g. an
   old DB without `reported_cost_usd`) → exit `2` (not "No cost records", not a
   later row-conversion crash).
-- **Filesystem-immutability:** run `costs` against a seeded, compatible DB and
-  assert the **set** of files in the directory and each file's metadata
-  (mtime/size) are unchanged before vs after — i.e. **no new files and no
-  modification**. The test compares the before/after file set, it does **not**
-  require the absence of `-wal`/`-shm` (a WAL DB may legitimately already have
-  them; §7/§8).
+- **DB-immutability (isolated WAL fixture):** seed a compatible WAL DB, let it
+  go quiescent (writer closed), snapshot the **main `.db`** file's
+  hash+size+mtime, run `costs`, and assert the main `.db` is byte-identical
+  (hash/size/mtime unchanged) and `sqlite_master` + `schema_migrations` are
+  unchanged. The test **allows** `-wal`/`-shm` to appear or change — their
+  presence is not a violation (§7/§8). It does **not** assert the directory file
+  set is unchanged (SQLite may add service files) and does **not** run against a
+  live DB (a concurrent writer could change the main mtime).
 
 ## 7. Read-only connection contract (boundary enforcement)
 
@@ -200,13 +202,21 @@ async with open_costs_read_only(path) as reader:   # or Database.connect_read_on
 - never modifies the DB or schema and issues no write PRAGMA / checkpoint;
 - fails to open a missing/invalid/non-SQLite target with `OperationalError`.
 
-**WAL nuance (do not over-constrain).** Maestro opens the DB with
-`PRAGMA journal_mode=WAL` (database.py:346). A read of a WAL database *may*
-consult **existing** `-wal`/`-shm` sidecars to see committed data — `mode=ro`
-does not mean the sidecars are uninvolved. The invariant is therefore "creates
-**no new** files and modifies nothing", **not** "no sidecars exist" (§8). Use
-`mode=ro`, **not** `immutable=1`: `immutable=1` on a potentially-live DB can
-ignore WAL contents and hand back a stale/incorrect snapshot.
+**WAL nuance (allowed SQLite service files).** Maestro opens the DB with
+`PRAGMA journal_mode=WAL` (database.py:346). Reading a WAL database read-only
+requires SQLite to build the shared-memory index: opening `mode=ro` and running
+even a single `PRAGMA`/`SELECT` **may create, modify, or leave** the
+`-wal`/`-shm` service files (verified empirically — a `journal_mode=DELETE` DB
+creates none, a WAL DB does). This is SQLite's read mechanism, **not** a
+modification of the database's data. `-wal`/`-shm` are therefore treated as
+**allowed SQLite service files** — their creation/modification/persistence is
+**not** a boundary violation, and we do **not** promise to remove them.
+
+The invariant that actually holds (§8): `maestro costs` performs **no writes to
+the database itself** — no data change, no schema change, no migrations, and a
+missing path is never created as a database. `mode=ro` is **mandatory**;
+`immutable=1` is **rejected** — it would avoid the sidecars but can hand back a
+stale/inconsistent snapshot of a live WAL DB (or read garbage), which is unsafe.
 
 `ro_uri(path)` builds the URI from the **absolute** path with proper
 percent-quoting (spaces / special chars).
@@ -231,11 +241,14 @@ during row conversion. A valid schema whose `task_costs` is merely empty is
 | valid Maestro DB, **empty** `task_costs` | **exit 0**, "No cost records." |
 | valid Maestro DB with cost rows | **exit 0**, populated tables |
 
-**Invariant:** the command **creates no new files** and **modifies nothing** —
-no new DB file, no *new* `-wal`/`-shm`, no journal, no migration writes; the DB
-and its schema are untouched. It may **read** pre-existing `-wal`/`-shm`
-sidecars (WAL nuance, §7) — their presence before the command is allowed and
-they are left unmodified.
+**Invariant (no writes *to the database*, not "no files"):** `maestro costs`
+writes nothing to the database — its **data**, **schema**, and
+`schema_migrations` are unchanged, and a missing path is never created as a
+database. SQLite's `-wal`/`-shm` service files **may** be created/modified/left
+behind to read a WAL DB (§7) — that is **not** a violation. For a **live** DB a
+concurrent writer can change the main file's mtime, so the byte/mtime
+immutability check is asserted only on an **isolated (quiescent) WAL fixture**;
+the guarantee for a live DB is "no writes originate from `maestro costs`".
 
 ## 9. Architecture summary
 
