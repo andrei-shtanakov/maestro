@@ -1245,6 +1245,150 @@ class Database:
         return await self.get_task(task_id)
 
     # =========================================================================
+    # Execution Handles (Docker Isolation Phase 1)
+    # =========================================================================
+
+    async def start_execution(
+        self,
+        *,
+        entity_kind: str,
+        entity_id: str,
+        expected_status: str,
+        running_status: str,
+        execution_id: str,
+        backend_id: str,
+        transport_ref: str,
+        attempt: int,
+    ) -> None:
+        """Atomically CAS the entity to `running_status` and record a handle.
+
+        Single transaction: CAS-UPDATE the entity's status row, then insert
+        the `execution_handles` row in state `'prepared'`. If the CAS matches
+        no row (entity already left `expected_status`), the transaction is
+        rolled back and `ConcurrentModificationError` is raised — no
+        `execution_handles` row is left behind.
+
+        Args:
+            entity_kind: `"task"` or `"workstream"`.
+            entity_id: ID of the task/workstream being started.
+            expected_status: Status the entity must currently have.
+            running_status: Status to CAS the entity into.
+            execution_id: Unique ID for this execution attempt.
+            backend_id: Backend that will run the execution (e.g. `"docker"`).
+            transport_ref: Backend-specific handle (e.g. container name).
+            attempt: Attempt number for this entity.
+
+        Raises:
+            DatabaseError: If database not connected.
+            ConcurrentModificationError: If the entity's status is not
+                `expected_status`.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        table = "tasks" if entity_kind == "task" else "workstreams"
+        cursor = await self._connection.execute(
+            f"UPDATE {table} SET status = ? WHERE id = ? AND status = ?",
+            (running_status, entity_id, expected_status),
+        )
+        if cursor.rowcount == 0:
+            await self._connection.rollback()
+            msg = (
+                f"{entity_kind} '{entity_id}': status is not "
+                f"'{expected_status}' (expected for start_execution)"
+            )
+            raise ConcurrentModificationError(msg)
+
+        await self._connection.execute(
+            """
+            INSERT INTO execution_handles
+              (execution_id, entity_kind, entity_id, attempt, backend_id,
+               transport_ref, state, created_at, finished_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, NULL)
+            """,
+            (
+                execution_id,
+                entity_kind,
+                entity_id,
+                attempt,
+                backend_id,
+                transport_ref,
+                _format_datetime(datetime.now(UTC)),
+            ),
+        )
+        await self._connection.commit()
+
+    async def mark_execution_state(
+        self,
+        execution_id: str,
+        new_state: str,
+        *,
+        allowed_from: list[str],
+    ) -> None:
+        """Monotonically update an execution handle's state.
+
+        The update only applies when the handle's current state is one of
+        `allowed_from` — a handle can never regress (e.g. `cleaned` ->
+        `running` is a no-op, not an error). `finished_at` is stamped only
+        when transitioning into a terminal state (`"terminal"` or
+        `"cleaned"`); otherwise it is left unchanged.
+
+        Args:
+            execution_id: The execution handle to update.
+            new_state: Target state (`prepared`/`running`/`terminal`/`cleaned`).
+            allowed_from: States from which this transition is permitted.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        placeholders = ",".join("?" for _ in allowed_from)
+        finished_at = (
+            _format_datetime(datetime.now(UTC))
+            if new_state in ("terminal", "cleaned")
+            else None
+        )
+        await self._connection.execute(
+            f"""
+            UPDATE execution_handles
+            SET state = ?, finished_at = COALESCE(?, finished_at)
+            WHERE execution_id = ? AND state IN ({placeholders})
+            """,
+            (new_state, finished_at, execution_id, *allowed_from),
+        )
+        await self._connection.commit()
+
+    async def get_open_execution_handles(self) -> list[dict[str, Any]]:
+        """Return execution handles a recovery pass must reconcile.
+
+        Rows with `state IN ('prepared', 'running', 'terminal')` and
+        `backend_id != 'local'` — non-cleaned, non-local handles that may
+        correspond to a live backend process/container.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            SELECT execution_id, entity_kind, entity_id, attempt, backend_id,
+                   transport_ref, state, created_at, finished_at
+            FROM execution_handles
+            WHERE state IN ('prepared', 'running', 'terminal')
+              AND backend_id != 'local'
+            """
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    # =========================================================================
     # Query by Status
     # =========================================================================
 

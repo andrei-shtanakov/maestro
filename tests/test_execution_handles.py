@@ -7,7 +7,8 @@ import sqlite3
 
 import pytest
 
-from maestro.database import Database
+from maestro.database import ConcurrentModificationError, Database
+from maestro.models import Task, TaskStatus
 
 
 @pytest.mark.anyio
@@ -80,4 +81,78 @@ async def test_execution_handles_check_constraints(tmp_path):
             "VALUES ('e1', 'not-a-kind', 'task-1', 1, 'local', 'ref', "
             "'prepared', '2026-07-23T00:00:00+00:00')"
         )
+    await db.close()
+
+
+async def _seed_task(db, task_id="t1", status=TaskStatus.READY):
+    task = Task(id=task_id, title="T", prompt="p", workdir="/tmp", status=status)
+    await db.create_task(task)
+    return task
+
+
+@pytest.mark.anyio
+async def test_start_execution_atomic_cas_and_insert(tmp_path):
+    db = Database(str(tmp_path / "m.db"))
+    await db.connect()
+    await _seed_task(db)
+    await db.start_execution(
+        entity_kind="task",
+        entity_id="t1",
+        expected_status="ready",
+        running_status="running",
+        execution_id="e1",
+        backend_id="docker",
+        transport_ref="docker:maestro-e1",
+        attempt=1,
+    )
+    got = await db.get_task("t1")
+    assert got.status is TaskStatus.RUNNING
+    rows = await db.get_open_execution_handles()
+    assert any(r["execution_id"] == "e1" and r["state"] == "prepared" for r in rows)
+    await db.close()
+
+
+@pytest.mark.anyio
+async def test_start_execution_cas_mismatch_raises_and_writes_nothing(tmp_path):
+    db = Database(str(tmp_path / "m.db"))
+    await db.connect()
+    await _seed_task(db, status=TaskStatus.DONE)  # not READY
+    with pytest.raises(ConcurrentModificationError):
+        await db.start_execution(
+            entity_kind="task",
+            entity_id="t1",
+            expected_status="ready",
+            running_status="running",
+            execution_id="e1",
+            backend_id="docker",
+            transport_ref="docker:maestro-e1",
+            attempt=1,
+        )
+    assert await db.get_open_execution_handles() == []  # no orphan row
+    await db.close()
+
+
+@pytest.mark.anyio
+async def test_mark_execution_state_is_monotonic(tmp_path):
+    db = Database(str(tmp_path / "m.db"))
+    await db.connect()
+    await _seed_task(db)
+    await db.start_execution(
+        entity_kind="task",
+        entity_id="t1",
+        expected_status="ready",
+        running_status="running",
+        execution_id="e1",
+        backend_id="docker",
+        transport_ref="docker:maestro-e1",
+        attempt=1,
+    )
+    await db.mark_execution_state(
+        "e1", "terminal", allowed_from=["prepared", "running"]
+    )
+    # cleaned -> running must be impossible
+    await db.mark_execution_state("e1", "cleaned", allowed_from=["terminal"])
+    await db.mark_execution_state("e1", "running", allowed_from=["prepared"])  # no-op
+    rows = {r["execution_id"]: r for r in await db.get_open_execution_handles()}
+    assert "e1" not in rows  # 'cleaned' is filtered out of the open set
     await db.close()
