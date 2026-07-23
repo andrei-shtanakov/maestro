@@ -54,6 +54,7 @@ from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConf
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
 from maestro.decomposer import ProjectDecomposer
+from maestro.event_log import create_event_logger
 from maestro.git import GitManager
 from maestro.logging_bridge import setup_logging
 from maestro.models import ArbiterMode, OrchestratorConfig, TaskStatus, WorkstreamStatus
@@ -482,6 +483,16 @@ async def _run_scheduler(
 
     try:
         routing = await make_routing_strategy(arbiter_cfg)
+
+        # Determine the log directory and activate the structured event log
+        # BEFORE any resume/recovery work: StateRecovery.recover() emits events
+        # via get_event_logger() (e.g. RECOVERY_ARBITER_DECISIONS_CLOSED), so
+        # activating the logger later would drop recovery events on --resume.
+        workdir = Path(config.repo).expanduser()  # noqa: ASYNC240
+        if log_dir is None:
+            log_dir = workdir / "logs"
+        create_event_logger(log_dir)
+
         # Check if resuming
         if resume:
             existing_tasks = await db.get_all_tasks()
@@ -523,12 +534,6 @@ async def _run_scheduler(
             "announce": AnnounceSpawner(),
             "opencode": OpencodeSpawner(),
         }
-
-        # Determine log directory
-        # Note: Path operations are fast sync I/O, acceptable in async context
-        workdir = Path(config.repo).expanduser()  # noqa: ASYNC240
-        if log_dir is None:
-            log_dir = workdir / "logs"
 
         # Setup notifications
         notifications = create_notification_manager(config.notifications)
@@ -1325,6 +1330,12 @@ async def _run_orchestrator(
                 await db.delete_workstream(workstream.id)
 
     repo_path, workspace_base, log_dir = _resolve_orchestrator_paths(config, log_dir)
+
+    # Activate the structured event log (events.jsonl) — without this the
+    # module-global logger is None and every workstream lifecycle event is
+    # dropped (the dispatcher's event_logger_getter returns None).
+    create_event_logger(log_dir)
+
     lock_fd: int | None = None
 
     try:

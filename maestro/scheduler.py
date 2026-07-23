@@ -304,22 +304,6 @@ class Scheduler:
         notification = Notification.from_task(task, event, message)
         await self._notifications.notify(notification)
 
-    def _report_status_change(
-        self,
-        task_id: str,
-        old_status: str,
-        new_status: str,
-    ) -> None:
-        """Report a task status change via callback.
-
-        Args:
-            task_id: ID of the task.
-            old_status: Previous status value.
-            new_status: New status value.
-        """
-        if self._on_status_change is not None:
-            self._on_status_change(task_id, old_status, new_status)
-
     async def _transition(
         self,
         task_id: str,
