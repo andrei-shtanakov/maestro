@@ -56,8 +56,17 @@ class _FakeDockerCli:
     async def rm(self, name: str) -> None:
         self.removed.append(name)
 
+    def set_absent(self) -> None:
+        """Flip a subsequent `inspect()` to report the container gone."""
+        self._labels = None
 
-def _handle(local, docker, cleanup_paths=None) -> DockerTaskHandle:
+
+def _handle(
+    local,
+    docker,
+    cleanup_paths=None,
+    expected_labels: dict[str, str] | None = None,
+) -> DockerTaskHandle:
     ref = ExecutionHandleRef(
         backend_id="docker",
         run_id="t1",
@@ -67,7 +76,11 @@ def _handle(local, docker, cleanup_paths=None) -> DockerTaskHandle:
     return DockerTaskHandle(
         local=local,
         container_name="maestro-e1",
-        expected_labels={"maestro.execution_id": "e1"},
+        expected_labels=(
+            {"maestro.execution_id": "e1"}
+            if expected_labels is None
+            else expected_labels
+        ),
         cleanup_paths=cleanup_paths or [],
         docker=docker,
         ref=ref,
@@ -134,4 +147,65 @@ async def test_cleanup_absent_container_still_unlinks(tmp_path: Path) -> None:
     )
     await h.cleanup()
     assert docker.removed == []
+    assert not f.exists()
+
+
+@pytest.mark.anyio
+async def test_cleanup_raises_when_no_expected_label_but_present() -> None:
+    # Handle built without maestro.execution_id in expected_labels (e.g. a
+    # caller-assembled plan missing the label). A present, unlabeled
+    # container must NOT be treated as owned just because `None == None`
+    # would otherwise pass the equality check.
+    docker = _FakeDockerCli(inspect_labels={})
+    h = _handle(
+        _FakeLocal(ExecutionResult(exit_code=0, output_log_path=Path("/l"))),
+        docker,
+        expected_labels={},
+    )
+    with pytest.raises(RuntimeError):
+        await h.cleanup()
+    assert docker.removed == []
+
+
+@pytest.mark.anyio
+async def test_terminate_targets_this_container_by_name() -> None:
+    local = _FakeLocal(ExecutionResult(exit_code=0, output_log_path=Path("/l")))
+    docker = _FakeDockerCli()
+    h = _handle(local, docker)
+    await h.terminate(5.0)
+    assert local.terminated is True
+    assert docker.stopped == ["maestro-e1"]
+    assert docker.killed == ["maestro-e1"]  # stop then kill, both targeted
+
+
+@pytest.mark.anyio
+async def test_kill_targets_this_container_by_name_kill_only() -> None:
+    local = _FakeLocal(ExecutionResult(exit_code=0, output_log_path=Path("/l")))
+    docker = _FakeDockerCli()
+    h = _handle(local, docker)
+    await h.kill()
+    assert local.killed is True
+    assert docker.killed == ["maestro-e1"]
+    assert docker.stopped == []  # kill path never calls stop
+
+
+@pytest.mark.anyio
+async def test_cleanup_is_idempotent_present_then_absent(tmp_path: Path) -> None:
+    f = tmp_path / "env"
+    f.write_text("X=1")
+    docker = _FakeDockerCli(inspect_labels={"maestro.execution_id": "e1"})
+    h = _handle(
+        _FakeLocal(ExecutionResult(exit_code=0, output_log_path=Path("/l"))),
+        docker,
+        [f],
+    )
+    await h.cleanup()
+    assert docker.removed == ["maestro-e1"]
+    assert not f.exists()
+
+    # Second call: the container is already gone and the files are already
+    # unlinked. Must not raise, and must not re-remove or re-touch anything.
+    docker.set_absent()
+    await h.cleanup()
+    assert docker.removed == ["maestro-e1"]
     assert not f.exists()

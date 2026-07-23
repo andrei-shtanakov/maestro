@@ -96,7 +96,11 @@ class DockerTaskHandle:
             labels = (info.get("Config") or {}).get("Labels") or {}
             expected_id = self._expected.get("maestro.execution_id")
             actual_id = labels.get("maestro.execution_id")
-            if actual_id != expected_id:
+            # expected_id is None (handle built without the label) must
+            # also fail the check — otherwise a foreign, unlabeled
+            # container with a matching name (actual_id None too) would
+            # satisfy `actual_id == expected_id` and get rm'd.
+            if expected_id is None or actual_id != expected_id:
                 raise RuntimeError(
                     f"refusing to rm {self._name}: label mismatch "
                     f"(expected maestro.execution_id={expected_id!r}, "
