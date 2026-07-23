@@ -61,10 +61,7 @@ WORKSTREAM_EFFECTS: dict[WorkstreamStatus, StatusEffect] = {
         event=EventType.WORKSTREAM_DONE,
         notification=NotificationEvent.WORKSTREAM_COMPLETED,
     ),
-    WorkstreamStatus.FAILED: StatusEffect(
-        event=EventType.WORKSTREAM_FAILED,
-        notification=NotificationEvent.WORKSTREAM_FAILED,
-    ),
+    WorkstreamStatus.FAILED: StatusEffect(event=EventType.WORKSTREAM_FAILED),
     WorkstreamStatus.NEEDS_REVIEW: StatusEffect(
         event=EventType.WORKSTREAM_NEEDS_REVIEW,
         notification=NotificationEvent.WORKSTREAM_NEEDS_REVIEW,

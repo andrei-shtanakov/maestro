@@ -28,7 +28,6 @@ class NotificationEvent(StrEnum):
     TASK_AWAITING_APPROVAL = "task_awaiting_approval"
     WORKSTREAM_STARTED = "workstream_started"
     WORKSTREAM_COMPLETED = "workstream_completed"
-    WORKSTREAM_FAILED = "workstream_failed"
     WORKSTREAM_NEEDS_REVIEW = "workstream_needs_review"
 
 
@@ -146,7 +145,6 @@ class Notification:
             NotificationEvent.TASK_AWAITING_APPROVAL: "Approval Required",
             NotificationEvent.WORKSTREAM_STARTED: "Workstream Started",
             NotificationEvent.WORKSTREAM_COMPLETED: "Workstream Completed",
-            NotificationEvent.WORKSTREAM_FAILED: "Workstream Failed",
             NotificationEvent.WORKSTREAM_NEEDS_REVIEW: "Workstream Needs Review",
         }
         fallback = "Task" if self.entity_kind == "task" else "Workstream"

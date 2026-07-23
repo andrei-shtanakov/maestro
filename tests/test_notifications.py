@@ -99,7 +99,7 @@ class TestNotificationEvent:
 
     def test_event_count(self) -> None:
         """Test that all expected events are defined."""
-        assert len(NotificationEvent) == 10
+        assert len(NotificationEvent) == 9
 
 
 # =============================================================================
@@ -218,15 +218,19 @@ class TestNotificationFormatting:
         n = Notification.from_workstream(ws, NotificationEvent.WORKSTREAM_STARTED)
         assert n.entity_kind == "workstream" and n.subject_id == "w1"
 
-    def test_four_workstream_notification_events_exist(self) -> None:
-        """Test that all four WORKSTREAM_* notification events are defined."""
+    def test_three_workstream_notification_events_exist(self) -> None:
+        """Test that all three WORKSTREAM_* notification events are defined.
+
+        FAILED is intentionally absent: it's a transient retryable status
+        (spec §0), so it fires an event only, never a notification.
+        """
         for name in [
             "WORKSTREAM_STARTED",
             "WORKSTREAM_COMPLETED",
-            "WORKSTREAM_FAILED",
             "WORKSTREAM_NEEDS_REVIEW",
         ]:
             assert hasattr(NotificationEvent, name)
+        assert not hasattr(NotificationEvent, "WORKSTREAM_FAILED")
 
 
 # =============================================================================

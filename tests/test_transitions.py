@@ -46,10 +46,10 @@ def test_task_failed_event_but_no_notification():
     assert e.notification is None  # transient failures don't notify (spec §0)
 
 
-def test_workstream_failed_notifies():
+def test_workstream_failed_event_but_no_notification():
     e = WORKSTREAM_EFFECTS[WorkstreamStatus.FAILED]
     assert e.event == EventType.WORKSTREAM_FAILED
-    assert e.notification == NotificationEvent.WORKSTREAM_FAILED
+    assert e.notification is None  # transient failures don't notify (spec §0)
 
 
 def test_pr_created_has_no_notification():

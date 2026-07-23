@@ -3051,7 +3051,7 @@ class TestOrchestratorTransitionDispatchWiring:
             await db.close()
 
     @pytest.mark.anyio
-    async def test_failed_fires_event_and_failed_notification(
+    async def test_failed_fires_event_but_no_notification(
         self,
         tmp_path: Path,
         mock_workspace_mgr: MagicMock,
@@ -3059,8 +3059,9 @@ class TestOrchestratorTransitionDispatchWiring:
         mock_pr_manager: MagicMock,
         captured_events: _CapturingEventLogger,
     ) -> None:
-        """Unlike a task's FAILED (transient, no notif), a workstream's
-        FAILED is coarse-grained and DOES notify (spec §0)."""
+        """A workstream's FAILED is transient/retryable (always followed by
+        FAILED->READY retry or FAILED->NEEDS_REVIEW), so it fires an event
+        only, mirroring the task-side rationale (spec §0)."""
         manager, channel = _capturing_notification_manager()
         orch, db = await self._orch_db(
             tmp_path,
@@ -3084,7 +3085,7 @@ class TestOrchestratorTransitionDispatchWiring:
                 EventType.WORKSTREAM_FAILED
             ]
             notified = [call.args[0].event for call in channel.send.await_args_list]
-            assert notified == [NotificationEvent.WORKSTREAM_FAILED]
+            assert notified == []
         finally:
             await db.close()
 

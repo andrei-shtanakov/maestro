@@ -23,18 +23,23 @@ deliberate and covered by a **contract test** (§9), not a parity test:
 - **New task lifecycle events.** Transitions like `READY`, `RUNNING`, `DONE`,
   `NEEDS_REVIEW`, `ABANDONED` did not emit `_emit_event` records before; they do
   now. Pure observability gain.
-- **`FAILED` — deliberate task/workstream asymmetry.** For **tasks**, `FAILED`
-  is transient and frequently auto-retried; it emits a `TASK_FAILED` event but
-  **no notification** (matches today — the scheduler never notified on `FAILED`),
-  so retry churn doesn't storm the human; the actionable notification stays at
-  `NEEDS_REVIEW`. For **workstreams**, `FAILED` is a coarse-grained event (a
-  whole workstream failed) an operator wants to know about, so it emits both the
-  event **and** a `WORKSTREAM_FAILED` notification (§6 decision). The asymmetry
-  is intentional and reflects granularity, not an oversight.
+- **`FAILED` — event-only, symmetric for tasks and workstreams.** `FAILED` is
+  transient and never terminal for either entity: a task's `FAILED` is always
+  followed by `FAILED → READY` (retry) or `FAILED → NEEDS_REVIEW`, and a
+  workstream's `FAILED` is always followed by the same pair. Both emit a
+  `TASK_FAILED`/`WORKSTREAM_FAILED` event but **no notification** (matches
+  today for tasks — the scheduler never notified on `FAILED`); a notification
+  on `FAILED` would storm on every retry and double-notify once the status
+  routes on to `NEEDS_REVIEW`. The actionable notification stays at
+  `NEEDS_REVIEW`. *(This reverses an earlier draft of this section, which gave
+  workstream `FAILED` its own notification on the theory that it was
+  coarse-grained enough to be actionable on its own — final review concluded
+  the transient/never-terminal argument dominates, so the two entities are
+  symmetric.)*
 - **`TASK_TIMEOUT` stays a call-site notification** (scheduler.py:1499) — it is
   an operation result (the monitor killed the process), not a bare transition;
   it is not moved into the table (§5.2).
-- **Mode 2 gains events + four notifications** where it had none.
+- **Mode 2 gains events + three notifications** where it had none.
 
 These are documented in the changelog on merge.
 
@@ -406,19 +411,23 @@ deferred-emit).
   `WORKSTREAM_DONE`, `WORKSTREAM_FAILED`, `WORKSTREAM_NEEDS_REVIEW`,
   `WORKSTREAM_ABANDONED`, `WORKSTREAM_RETRYING`, `WORKSTREAM_APPROVED`
   (`WORKSTREAM_APPROVED` is deferred-emit — §5.4).
-- **`notifications.NotificationEvent`** — **four** workstream notifications:
+- **`notifications.NotificationEvent`** — **three** workstream notifications:
   `WORKSTREAM_STARTED` (on `RUNNING`), `WORKSTREAM_COMPLETED` (on `DONE`),
-  `WORKSTREAM_FAILED` (on `FAILED` — see the granularity asymmetry in §0),
-  `WORKSTREAM_NEEDS_REVIEW` (on `NEEDS_REVIEW`). **No** `WORKSTREAM_PR_CREATED`
-  notification — `PR_CREATED` is an informational intermediate status the
+  `WORKSTREAM_NEEDS_REVIEW` (on `NEEDS_REVIEW`). **No** `WORKSTREAM_FAILED`
+  notification — `FAILED` is transient and never terminal (always followed by
+  `FAILED → READY` retry or `FAILED → NEEDS_REVIEW`), so it is event-only,
+  symmetric with the task side (§0). **No** `WORKSTREAM_PR_CREATED`
+  notification either — `PR_CREATED` is an informational intermediate status the
   automatic flow continues past; it is not an operator gate. `NEEDS_REVIEW`
   **is** a gate and notifies.
+  *(This reverses an earlier draft's four-notification decision, which gave
+  `FAILED` its own notification — see §0.)*
 - **`Notification.from_workstream(ws, event, message=None)`** convenience adapter
   → `from_subject` (§3.2).
 
 The workstream effect table (§5.1 total): `RUNNING →
 (WORKSTREAM_RUNNING event, WORKSTREAM_STARTED notif)`, `DONE → (WORKSTREAM_DONE,
-WORKSTREAM_COMPLETED)`, `FAILED → (WORKSTREAM_FAILED, WORKSTREAM_FAILED)`,
+WORKSTREAM_COMPLETED)`, `FAILED → (WORKSTREAM_FAILED, —)`,
 `NEEDS_REVIEW → (WORKSTREAM_NEEDS_REVIEW, WORKSTREAM_NEEDS_REVIEW)`, `MERGING →
 (WORKSTREAM_MERGING, —)`, `PR_CREATED → (WORKSTREAM_PR_CREATED, —)`,
 `DECOMPOSING → (WORKSTREAM_DECOMPOSING, —)`, `READY → (WORKSTREAM_READY, —)`,
@@ -471,9 +480,9 @@ new lifecycle events appear; `TASK_TIMEOUT` still fires at its call site.
 subject is built from the **re-read** task (§4.3).
 
 **Orchestrator:** each workstream transition fires its `WORKSTREAM_*` event; the
-four notifications fire on `RUNNING`/`DONE`/`FAILED`/`NEEDS_REVIEW` and **not**
-on `PR_CREATED`/`MERGING`/`DECOMPOSING`; `_update_fields` (generation_pid clear,
-`orchestrator.py:550`) fires nothing.
+three notifications fire on `RUNNING`/`DONE`/`NEEDS_REVIEW` and **not** on
+`FAILED` (event-only, transient — §0) or `PR_CREATED`/`MERGING`/`DECOMPOSING`;
+`_update_fields` (generation_pid clear, `orchestrator.py:550`) fires nothing.
 
 **Envelope back-compat:** an existing `events.jsonl` consumer keying on `task_id`
 still reads task events unchanged.

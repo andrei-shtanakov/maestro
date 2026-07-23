@@ -1344,6 +1344,27 @@ async def _run_orchestrator(
         )
         pr_manager = PRManager(git_manager=git_mgr)
 
+        # Setup notifications (mirrors mode-1's `run` wiring above)
+        notifications = create_notification_manager(config.notifications)
+
+        def _on_status_change(
+            workstream_id: str,
+            old_status: str,
+            new_status: str,
+        ) -> None:
+            timestamp = datetime.now(UTC).strftime("%H:%M:%S")
+            style = {
+                "running": "yellow",
+                "done": "green",
+                "failed": "red",
+                "needs_review": "red",
+            }.get(new_status, "white")
+            console.print(
+                f"[dim]{timestamp}[/dim] "
+                f"[cyan]{workstream_id}[/cyan]: "
+                f"[{style}]{new_status.upper()}[/{style}]"
+            )
+
         # Create orchestrator
         orchestrator = Orchestrator(
             db=db,
@@ -1352,6 +1373,8 @@ async def _run_orchestrator(
             pr_manager=pr_manager,
             config=config,
             log_dir=log_dir,
+            notifier=notifications,
+            on_status_change=_on_status_change,
         )
 
         # Acquire PID lock
