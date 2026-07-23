@@ -2,19 +2,28 @@
 
 import asyncio
 import subprocess
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
 
 from maestro.dag import DAG
 from maestro.database import Database, create_database
+from maestro.event_log import (
+    Event,
+    EventLogger,
+    EventType,
+    get_event_logger,
+    set_event_logger,
+)
 from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.models import AgentType, Task, TaskConfig, TaskStatus
+from maestro.notifications.base import NotificationChannel, NotificationEvent
+from maestro.notifications.manager import NotificationManager
 from maestro.retry import RetryManager
 from maestro.scheduler import (
     BaseSpawner,
@@ -2267,5 +2276,391 @@ class TestCatalogFaultHandling:
 
             assert not any(e["event"] == "agent.routed_model_empty" for e in logs)
             assert spawner.spawn_count == 1
+        finally:
+            await db.close()
+
+
+# =============================================================================
+# Contract Tests: Transition Dispatcher Wiring (Task 6, feat/transition-hooks)
+# =============================================================================
+#
+# These assert the NEW contract from
+# docs/superpowers/specs/2026-07-23-maestro-transition-hooks-design.md §0 —
+# a deliberate behavior change, not parity with the pre-dispatcher scheduler.
+
+
+_TASK_TRANSITION_EVENTS = frozenset(
+    {
+        EventType.TASK_READY,
+        EventType.TASK_STARTED,
+        EventType.TASK_COMPLETED,
+        EventType.TASK_FAILED,
+        EventType.TASK_RETRYING,
+        EventType.TASK_NEEDS_REVIEW,
+        EventType.TASK_APPROVED,
+        EventType.TASK_ABANDONED,
+    }
+)
+
+
+class _CapturingEventLogger(EventLogger):
+    """`EventLogger` double that records `Event`s in memory (no disk I/O).
+
+    Subclasses `EventLogger` (rather than a bare structural double) so it
+    can be installed via `set_event_logger`, which is typed to that class.
+    """
+
+    def __init__(self) -> None:  # intentionally skips EventLogger.__init__
+        self.events: list[Event] = []
+
+    def log(self, event: Event) -> None:
+        self.events.append(event)
+
+    def transition_event_types(self) -> list[EventType]:
+        """Recorded events restricted to the dispatcher's transition table.
+
+        Non-transition sites (arbiter routing/outcome events, validation,
+        ticks) share the same global logger in these tests; filtering keeps
+        assertions about the dispatcher's own output from being coupled to
+        unrelated events a given call path happens to also emit.
+        """
+        return [
+            e.event_type for e in self.events if e.event_type in _TASK_TRANSITION_EVENTS
+        ]
+
+
+@pytest.fixture
+def captured_events() -> Generator[_CapturingEventLogger, None, None]:
+    """Install a capturing EventLogger as the process-global default.
+
+    `TransitionDispatcher` resolves its event sink via `get_event_logger()`
+    at fire-time, so the double must be installed as the global rather than
+    handed to the scheduler directly.
+    """
+    logger = _CapturingEventLogger()
+    set_event_logger(logger)
+    assert get_event_logger() is logger
+    yield logger
+    set_event_logger(None)
+
+
+def _capturing_notification_manager() -> tuple[NotificationManager, AsyncMock]:
+    """A NotificationManager with one always-available capturing channel."""
+    manager = NotificationManager()
+    channel = AsyncMock(spec=NotificationChannel)
+    channel.channel_type = "capture"
+    channel.is_available.return_value = True
+    manager.register(channel)
+    return manager, channel
+
+
+class TestTransitionDispatchWiring:
+    """Task 6 contract: scheduler status sites route through the dispatcher."""
+
+    @pytest.mark.anyio
+    async def test_running_fires_started_before_launch_even_if_launch_fails(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+        captured_events: _CapturingEventLogger,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """TASK_STARTED now fires on entering RUNNING (before the launch
+        attempt), not after a successful `backend.run()` — it still fires
+        even when the launch itself then fails. The eventual FAILED also
+        fires its event with no notification, and the callback reports
+        both transitions with plain strings (frm/to), proving
+        `_handle_spawn_error` re-read the *actual* prior status (RUNNING,
+        not a hardcoded guess) to satisfy the CAS.
+        """
+        configs = [TaskConfig(id="t1", title="T1", prompt="do it")]
+        db = await create_database(temp_db_path)
+        try:
+            await db.create_task(Task.from_config(configs[0], str(temp_dir)))
+            manager, channel = _capturing_notification_manager()
+            changes: list[tuple[str, str, str]] = []
+
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG(configs),
+                spawners={"claude_code": MockSpawner()},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                notification_manager=manager,
+                on_status_change=lambda tid, old, new: changes.append((tid, old, new)),
+            )
+
+            async def _raise_on_run(request: object) -> None:
+                raise RuntimeError("launch boom")
+
+            monkeypatch.setattr(scheduler._backend, "run", _raise_on_run)
+
+            await scheduler._spawn_ready_tasks(["t1"])
+
+            # Filtered to the dispatcher's own transition events: the route
+            # through `_spawn_ready_tasks` also emits an (unrelated, kept
+            # at its own site) ARBITER_ROUTE_DECIDED event.
+            event_types = captured_events.transition_event_types()
+            # PENDING->READY (auto-promoted) also fires TASK_READY — a new
+            # event under the total table, not part of this test's focus.
+            assert event_types == [
+                EventType.TASK_READY,
+                EventType.TASK_STARTED,
+                EventType.TASK_FAILED,
+            ]
+
+            notified = [call.args[0].event for call in channel.send.await_args_list]
+            assert notified == [NotificationEvent.TASK_STARTED]
+
+            assert changes == [
+                ("t1", "pending", "ready"),
+                ("t1", "ready", "running"),
+                ("t1", "running", "failed"),
+            ]
+
+            task = await db.get_task("t1")
+            assert task.status == TaskStatus.FAILED
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_failed_retry_fires_failed_event_then_retrying_no_notification(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        """Entering FAILED fires TASK_FAILED with NO notification (transient,
+        auto-retried). The subsequent `reset_for_retry_atomic` success fires
+        TASK_RETRYING — and only can if it dispatches from a freshly re-read
+        task: `fire()` no-ops when `frm == subject.status`, so if the stale
+        (still-FAILED) task object had been used instead of a re-read
+        (READY) one, this event would not appear at all.
+        """
+        configs = [
+            TaskConfig(id="t1", title="T1", prompt="do it", max_retries=1),
+        ]
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(configs[0], str(temp_dir))
+            await db.create_task(task)
+            await db.update_task_status(
+                "t1", TaskStatus.READY, expected_status=TaskStatus.PENDING
+            )
+            await db.update_task_status(
+                "t1", TaskStatus.RUNNING, expected_status=TaskStatus.READY
+            )
+            running_task = await db.get_task("t1")
+            manager, channel = _capturing_notification_manager()
+
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG(configs),
+                spawners={"claude_code": MockSpawner()},
+                config=SchedulerConfig(
+                    log_dir=temp_dir / "logs",
+                    poll_interval=0.05,
+                ),
+                notification_manager=manager,
+                retry_manager=RetryManager(base_delay=0.0),
+            )
+
+            await scheduler._handle_task_failure(
+                "t1", running_task, "boom: process failed"
+            )
+
+            event_types = [e.event_type for e in captured_events.events]
+            assert event_types == [EventType.TASK_FAILED, EventType.TASK_RETRYING]
+            assert channel.send.await_args_list == []
+
+            task = await db.get_task("t1")
+            assert task.status == TaskStatus.READY
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_reset_for_retry_atomic_ok_false_fires_nothing(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+        captured_events: _CapturingEventLogger,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A guard-rejected reset (`ok=False`) fires neither TASK_RETRYING
+        nor the status callback for that (non-)transition — only the
+        (non-transition) ARBITER_RETRY_RESET_SKIPPED event, unchanged."""
+        configs = [
+            TaskConfig(id="t1", title="T1", prompt="do it", max_retries=1),
+        ]
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(configs[0], str(temp_dir))
+            await db.create_task(task)
+            await db.update_task_status(
+                "t1", TaskStatus.READY, expected_status=TaskStatus.PENDING
+            )
+            await db.update_task_status(
+                "t1", TaskStatus.RUNNING, expected_status=TaskStatus.READY
+            )
+            running_task = await db.get_task("t1")
+
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG(configs),
+                spawners={"claude_code": MockSpawner()},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                retry_manager=RetryManager(base_delay=0.0),
+            )
+            monkeypatch.setattr(
+                scheduler._db,
+                "reset_for_retry_atomic",
+                AsyncMock(return_value=False),
+            )
+
+            await scheduler._handle_task_failure("t1", running_task, "boom")
+
+            event_types = [e.event_type for e in captured_events.events]
+            assert event_types == [
+                EventType.TASK_FAILED,
+                EventType.ARBITER_RETRY_RESET_SKIPPED,
+            ]
+            assert EventType.TASK_RETRYING not in event_types
+
+            task = await db.get_task("t1")
+            assert task.status == TaskStatus.FAILED
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_done_fires_completed_event_and_notification(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        """Entering DONE fires TASK_COMPLETED as both event and notification."""
+        configs = [TaskConfig(id="t1", title="T1", prompt="do it")]
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(configs[0], str(temp_dir))
+            await db.create_task(task)
+            await db.update_task_status(
+                "t1", TaskStatus.READY, expected_status=TaskStatus.PENDING
+            )
+            await db.update_task_status(
+                "t1", TaskStatus.RUNNING, expected_status=TaskStatus.READY
+            )
+            running_task = await db.get_task("t1")
+            manager, channel = _capturing_notification_manager()
+
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG(configs),
+                spawners={"claude_code": MockSpawner()},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                notification_manager=manager,
+            )
+
+            await scheduler._handle_task_completion(
+                "t1",
+                RunningTask(running_task, MagicMock(), datetime.now(UTC), Path()),
+                0,
+            )
+
+            event_types = [e.event_type for e in captured_events.events]
+            assert event_types == [EventType.TASK_COMPLETED]
+            notified = [call.args[0].event for call in channel.send.await_args_list]
+            assert notified == [NotificationEvent.TASK_COMPLETED]
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_needs_review_fires_event_and_notification_after_exhausted_retries(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        """Exhausted retries: FAILED (event, no notif) then NEEDS_REVIEW
+        (event + notification)."""
+        configs = [
+            TaskConfig(id="t1", title="T1", prompt="do it", max_retries=0),
+        ]
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(configs[0], str(temp_dir))
+            await db.create_task(task)
+            await db.update_task_status(
+                "t1", TaskStatus.READY, expected_status=TaskStatus.PENDING
+            )
+            await db.update_task_status(
+                "t1", TaskStatus.RUNNING, expected_status=TaskStatus.READY
+            )
+            running_task = await db.get_task("t1")
+            manager, channel = _capturing_notification_manager()
+
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG(configs),
+                spawners={"claude_code": MockSpawner()},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                notification_manager=manager,
+            )
+
+            await scheduler._handle_task_failure("t1", running_task, "boom")
+
+            event_types = [e.event_type for e in captured_events.events]
+            assert event_types == [
+                EventType.TASK_FAILED,
+                EventType.TASK_NEEDS_REVIEW,
+            ]
+            notified = [call.args[0].event for call in channel.send.await_args_list]
+            assert notified == [NotificationEvent.TASK_NEEDS_REVIEW]
+
+            task = await db.get_task("t1")
+            assert task.status == TaskStatus.NEEDS_REVIEW
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_awaiting_approval_fires_notification_no_event(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        """New site: READY->AWAITING_APPROVAL now fires the (previously
+        dead) TASK_AWAITING_APPROVAL notification; the entry has no event."""
+        configs = [
+            TaskConfig(id="t1", title="T1", prompt="do it", requires_approval=True),
+        ]
+        db = await create_database(temp_db_path)
+        try:
+            await db.create_task(Task.from_config(configs[0], str(temp_dir)))
+            # The requires_approval gate only checks on entry with status
+            # already READY (a fresh PENDING task's first `_spawn_task` call
+            # promotes PENDING->READY and falls through to routing in the
+            # same pass) — promote first so this call actually hits the gate.
+            await db.update_task_status(
+                "t1", TaskStatus.READY, expected_status=TaskStatus.PENDING
+            )
+            manager, channel = _capturing_notification_manager()
+
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG(configs),
+                spawners={"claude_code": MockSpawner()},
+                config=SchedulerConfig(log_dir=temp_dir / "logs"),
+                notification_manager=manager,
+            )
+
+            launched = await scheduler._spawn_task("t1")
+
+            assert launched is False
+            assert captured_events.events == []
+            notified = [call.args[0].event for call in channel.send.await_args_list]
+            assert notified == [NotificationEvent.TASK_AWAITING_APPROVAL]
+
+            task = await db.get_task("t1")
+            assert task.status == TaskStatus.AWAITING_APPROVAL
         finally:
             await db.close()
