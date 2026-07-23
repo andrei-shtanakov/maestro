@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from maestro.execution.isolators import BareIsolator
+import pytest as _pytest
+
+from maestro.execution.exec_config import DockerConfig
+from maestro.execution.isolators import BareIsolator, DockerIsolator
 from maestro.execution.models import CollectPolicy, ExecutionRequest
 
 
@@ -14,6 +17,11 @@ def _req(**kw) -> ExecutionRequest:
     }
     base.update(kw)
     return ExecutionRequest(**base)
+
+
+def _docker_iso(**cfg_kw) -> DockerIsolator:  # type: ignore[misc]
+    cfg = DockerConfig(image="maestro-runner:x", **cfg_kw)
+    return DockerIsolator(cfg)
 
 
 def test_bare_inherit_env_merges_host_then_trace():
@@ -50,3 +58,53 @@ def test_bare_materialize_is_noop_and_transport_ref_is_local_pid():
     assert prepared.env_file is None
     assert prepared.cleanup_paths == []
     assert iso.transport_ref(prepared, 4242) == "local_pid:4242"
+
+
+def test_docker_prepare_requires_execution_id() -> None:
+    with _pytest.raises(ValueError):
+        _docker_iso().prepare(_req(), trace_env={}, host_env={})
+
+
+def test_docker_prepare_builds_run_argv_with_mounts_labels() -> None:
+    iso = _docker_iso(network="none", memory="8g", cpus="2", user="1000:1000")
+    req = _req(
+        execution_id="e-123",
+        entity_kind="task",
+        attempt=2,
+        argv=["claude", "-p", "hi"],
+    )
+    plan = iso.prepare(req, trace_env={"TRACEPARENT": "tp"}, host_env={})
+    assert plan.container_name == "maestro-e-123"
+    assert plan.argv[0:2] == ["docker", "run"]
+    assert "--name" in plan.argv and "maestro-e-123" in plan.argv
+    # workspace bind mount is the only -v; docker socket never mounted
+    assert plan.argv.count("-v") == 1
+    assert f"{req.workdir}:/work" in plan.argv
+    assert "-w" in plan.argv and "/work" in plan.argv
+    assert "--network" in plan.argv and "none" in plan.argv
+    assert "--memory" in plan.argv and "8g" in plan.argv
+    assert "--user" in plan.argv and "1000:1000" in plan.argv
+    assert "--rm" not in plan.argv  # execution containers never use --rm
+    # identity labels
+    joined = " ".join(plan.argv)
+    assert "maestro.execution_id=e-123" in joined
+    assert "maestro.entity_kind=task" in joined
+    assert "maestro.attempt=2" in joined
+    # trace env inlined via -e; original argv preserved at the tail
+    assert "TRACEPARENT=tp" in joined
+    assert plan.argv[-3:] == ["claude", "-p", "hi"]
+    # secret names planned but no --env-file yet when there are no secrets
+    assert plan.env_file_keys == []
+
+
+def test_docker_prepare_plans_env_file_for_secrets() -> None:
+    iso = _docker_iso(secret_env=["ANTHROPIC_API_KEY"])
+    plan = iso.prepare(
+        _req(execution_id="e-9"),
+        trace_env={},
+        host_env={"ANTHROPIC_API_KEY": "sk-secret-key-xyz"},
+    )
+    assert plan.env_file_keys == ["ANTHROPIC_API_KEY"]
+    assert "--env-file" in plan.argv
+    # the value never appears in argv
+    assert "sk-secret-key-xyz" not in " ".join(plan.argv)
