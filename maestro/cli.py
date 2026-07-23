@@ -483,6 +483,16 @@ async def _run_scheduler(
 
     try:
         routing = await make_routing_strategy(arbiter_cfg)
+
+        # Determine the log directory and activate the structured event log
+        # BEFORE any resume/recovery work: StateRecovery.recover() emits events
+        # via get_event_logger() (e.g. RECOVERY_ARBITER_DECISIONS_CLOSED), so
+        # activating the logger later would drop recovery events on --resume.
+        workdir = Path(config.repo).expanduser()  # noqa: ASYNC240
+        if log_dir is None:
+            log_dir = workdir / "logs"
+        create_event_logger(log_dir)
+
         # Check if resuming
         if resume:
             existing_tasks = await db.get_all_tasks()
@@ -524,16 +534,6 @@ async def _run_scheduler(
             "announce": AnnounceSpawner(),
             "opencode": OpencodeSpawner(),
         }
-
-        # Determine log directory
-        # Note: Path operations are fast sync I/O, acceptable in async context
-        workdir = Path(config.repo).expanduser()  # noqa: ASYNC240
-        if log_dir is None:
-            log_dir = workdir / "logs"
-
-        # Activate the structured event log (events.jsonl) — without this the
-        # module-global logger is None and every lifecycle event is dropped.
-        create_event_logger(log_dir)
 
         # Setup notifications
         notifications = create_notification_manager(config.notifications)

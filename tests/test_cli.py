@@ -24,6 +24,7 @@ from maestro.cli import (
     _read_pid_file,
     _release_pid_lock,
     _run_orchestrator,
+    _run_scheduler,
     app,
 )
 from maestro.database import create_database
@@ -65,6 +66,23 @@ def _write_orchestrator_config(base_dir: Path) -> Path:
     }
 
     config_path = base_dir / "project.yaml"
+    with config_path.open("w") as f:
+        yaml.safe_dump(config, f)
+    return config_path
+
+
+def _write_scheduler_config(base_dir: Path) -> Path:
+    """Create a minimal scheduler (mode-1) config file for testing."""
+    repo_dir = base_dir / "sched-repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    config = {
+        "project": "scheduler-test",
+        "repo": str(repo_dir),
+        "tasks": [
+            {"id": "t1", "title": "T1", "prompt": "do work"},
+        ],
+    }
+    config_path = base_dir / "tasks.yaml"
     with config_path.open("w") as f:
         yaml.safe_dump(config, f)
     return config_path
@@ -403,6 +421,72 @@ class TestOrchestratorResumeFlag:
             )
 
             mock_create_logger.assert_called_once()
+
+    async def test_run_scheduler_activates_event_logger_before_recovery(
+        self,
+        temp_dir: Path,
+    ) -> None:
+        """On `run --resume`, the event logger must be active BEFORE
+        StateRecovery runs — recovery emits events via get_event_logger(), so
+        activating the logger later would silently drop them (Copilot #96)."""
+        config_path = _write_scheduler_config(temp_dir)
+        # A non-empty DB makes the resume branch reach recovery.
+        db_path = temp_dir / "sched.db"
+        db = await create_database(db_path)
+        await db.create_task(
+            Task(
+                id="test-task",
+                title="T1",
+                prompt="do work",
+                workdir=str(temp_dir),
+                status=TaskStatus.PENDING,
+            )
+        )
+        await db.close()
+
+        order: list[str] = []
+
+        recovery_instance = MagicMock()
+        recovery_instance.needs_recovery = AsyncMock(return_value=True)
+
+        async def _recover(*_a: object, **_k: object) -> SimpleNamespace:
+            order.append("recover")
+            return SimpleNamespace(
+                running_recovered=0,
+                validating_recovered=0,
+                total_recovered=0,
+                tasks_done=0,
+            )
+
+        recovery_instance.recover = _recover
+
+        scheduler_instance = MagicMock()
+        scheduler_instance.run = AsyncMock(return_value=None)
+
+        with (
+            patch(
+                "maestro.cli.create_event_logger",
+                side_effect=lambda *_a, **_k: order.append("logger"),
+            ),
+            patch("maestro.cli.StateRecovery", return_value=recovery_instance),
+            patch("maestro.cli.make_routing_strategy", new_callable=AsyncMock),
+            patch(
+                "maestro.cli.create_scheduler_from_config",
+                new_callable=AsyncMock,
+                return_value=scheduler_instance,
+            ),
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=db_path,
+                resume=True,
+                log_dir=None,
+                clean=False,
+            )
+
+        assert order == ["logger", "recover"]  # logger activated before recovery
 
 
 # =============================================================================
