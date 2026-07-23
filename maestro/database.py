@@ -2144,6 +2144,8 @@ async def create_database(db_path: str | Path) -> Database:
 
 _REQUIRED_TASK_COST_COLUMNS = frozenset(
     {
+        "id",  # _row_to_task_cost reads row["id"]; require it so a table missing
+        # it fails the schema gate cleanly (exit 2) instead of a later KeyError.
         "task_id",
         "agent_type",
         "input_tokens",

@@ -57,6 +57,22 @@ async def test_missing_required_column_raises(tmp_path):
         await read_all_costs_readonly(p)
 
 
+async def test_missing_id_column_raises(tmp_path):
+    # `_row_to_task_cost` reads row["id"]; a table with every other required
+    # column but no `id` must fail the schema gate (exit 2), not KeyError later.
+    p = tmp_path / "no_id.db"
+    conn = sqlite3.connect(p)
+    conn.execute(
+        "CREATE TABLE task_costs (task_id TEXT, agent_type TEXT, "
+        "input_tokens INT, output_tokens INT, estimated_cost_usd REAL, "
+        "reported_cost_usd REAL, attempt INT, created_at TIMESTAMP)"
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(DatabaseError):
+        await read_all_costs_readonly(p)
+
+
 async def test_reads_seeded_db(tmp_path):
     p = tmp_path / "state.db"
     await _seed(p)
