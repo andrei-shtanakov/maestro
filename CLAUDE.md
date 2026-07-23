@@ -55,6 +55,7 @@ uv run maestro benchmark swe-mini --agent opencode --json        # Machine outpu
 
 # === Log utilities ===
 uv run maestro merge-logs <pipeline-dir>     # Time-sort per-pid JSONL into merged.jsonl
+uv run maestro costs --db maestro.db   # database-wide cost summary (read-only; TOTAL / by-harness / by-task; unpriced = UNKNOWN, not $0)
 
 # === Tests ===
 uv run pytest
@@ -87,7 +88,7 @@ uv add --dev <package>
 - **database.py**: SQLite layer with async CRUD, WAL mode (tasks + workstreams tables)
 - **dag.py**: DAG building, cycle detection, topological sort, scope overlap warnings
 - **git.py**: Git operations (branch, rebase, push, worktree, merge)
-- **cli.py**: Typer CLI (run, status, retry, stop, approve, orchestrate, workstreams, workstream-approve, check-scope, workspaces, merge-logs, models)
+- **cli.py**: Typer CLI (run, status, retry, stop, approve, orchestrate, workstreams, workstream-approve, check-scope, workspaces, merge-logs, costs, models)
 - **scheduler.py**: Main scheduler loop — polls DAG, spawns agents, monitors completion
 - **validator.py**: Post-task validation (run validation_cmd)
 - **retry.py**: Exponential backoff retry logic with jitter
