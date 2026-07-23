@@ -217,5 +217,16 @@ class DockerIsolator:
         prepared: PreparedRun,
         ref: ExecutionHandleRef,
     ) -> TaskHandle:
-        """Wrap local handle (not implemented yet; Task 12)."""
-        raise NotImplementedError("Task 12")
+        """Wrap the local `docker run` handle with container lifecycle ops."""
+        # Lazy import: avoids an import cycle (docker_handle imports
+        # LocalTaskHandle from local.py, which this module also imports).
+        from maestro.execution.docker_handle import DockerTaskHandle
+
+        return DockerTaskHandle(
+            local=local,
+            container_name=prepared.plan.container_name or "",
+            expected_labels=prepared.plan.labels,
+            cleanup_paths=prepared.cleanup_paths,
+            docker=self._docker,
+            ref=ref,
+        )
