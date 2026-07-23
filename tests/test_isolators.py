@@ -108,3 +108,25 @@ def test_docker_prepare_plans_env_file_for_secrets() -> None:
     assert "--env-file" in plan.argv
     # the value never appears in argv
     assert "sk-secret-key-xyz" not in " ".join(plan.argv)
+
+
+def test_docker_prepare_env_includes_host_env_for_docker_cli() -> None:
+    iso = _docker_iso(secret_env=["ANTHROPIC_API_KEY"])
+    host_env_input = {
+        "PATH": "/usr/bin",
+        "DOCKER_HOST": "unix:///x",
+        "ANTHROPIC_API_KEY": "sk-secret-key-xyz",
+    }
+    plan = iso.prepare(
+        _req(execution_id="e-9"),
+        trace_env={},
+        host_env=host_env_input,
+    )
+    # env dict for docker CLI subprocess needs host env
+    assert plan.env["PATH"] == "/usr/bin"
+    assert plan.env["DOCKER_HOST"] == "unix:///x"
+    # secret value appears in env dict (ok for CLI's host env) but not in argv
+    assert plan.env["ANTHROPIC_API_KEY"] == "sk-secret-key-xyz"
+    assert "sk-secret-key-xyz" not in " ".join(plan.argv)
+    # secret is tracked for env-file, not inlined into argv
+    assert plan.env_file_keys == ["ANTHROPIC_API_KEY"]

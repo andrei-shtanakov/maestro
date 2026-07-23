@@ -150,7 +150,9 @@ class DockerIsolator:
 
         return PreparedRunPlan(
             argv=argv,
-            env={},  # container env comes from -e / --env-file, not docker CLI env
+            env=dict(
+                host_env
+            ),  # env for docker CLI subprocess (needs PATH/DOCKER_HOST/HOME); container env set via -e / --env-file in argv
             container_name=name,
             labels=labels,
             env_file_keys=secret_keys,
