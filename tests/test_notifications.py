@@ -5,7 +5,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from maestro.models import AgentType, Task, TaskStatus
+from maestro.models import (
+    AgentType,
+    Task,
+    TaskStatus,
+    TransitionSubject,
+    Workstream,
+    WorkstreamStatus,
+)
 from maestro.notifications.base import (
     Notification,
     NotificationChannel,
@@ -41,8 +48,9 @@ def sample_notification() -> Notification:
     """Provide a sample notification."""
     return Notification(
         event=NotificationEvent.TASK_COMPLETED,
-        task_id="task-001",
-        task_title="Implement Feature X",
+        subject_id="task-001",
+        subject_title="Implement Feature X",
+        entity_kind="task",
         status=TaskStatus.DONE,
     )
 
@@ -52,8 +60,9 @@ def failed_notification() -> Notification:
     """Provide a failure notification with message."""
     return Notification(
         event=NotificationEvent.TASK_FAILED,
-        task_id="task-002",
-        task_title="Fix Bug Y",
+        subject_id="task-002",
+        subject_title="Fix Bug Y",
+        entity_kind="task",
         status=TaskStatus.FAILED,
         message="Process exited with code 1",
     )
@@ -90,7 +99,7 @@ class TestNotificationEvent:
 
     def test_event_count(self) -> None:
         """Test that all expected events are defined."""
-        assert len(NotificationEvent) == 6
+        assert len(NotificationEvent) == 10
 
 
 # =============================================================================
@@ -132,8 +141,9 @@ class TestNotificationFormatting:
         """Test title formatting for all event types."""
         notification = Notification(
             event=event,
-            task_id="task-001",
-            task_title="Test Task",
+            subject_id="task-001",
+            subject_title="Test Task",
+            entity_kind="task",
             status=TaskStatus.RUNNING,
         )
         assert notification.format_title() == expected_title
@@ -168,8 +178,9 @@ class TestNotificationFormatting:
             NotificationEvent.TASK_COMPLETED,
             message="All tests passed",
         )
-        assert notification.task_id == "task-001"
-        assert notification.task_title == "Implement Feature X"
+        assert notification.subject_id == "task-001"
+        assert notification.subject_title == "Implement Feature X"
+        assert notification.entity_kind == "task"
         assert notification.status == TaskStatus.DONE
         assert notification.event == NotificationEvent.TASK_COMPLETED
         assert notification.message == "All tests passed"
@@ -180,6 +191,42 @@ class TestNotificationFormatting:
             sample_task, NotificationEvent.TASK_STARTED
         )
         assert notification.message is None
+
+    def test_from_subject_task(self) -> None:
+        """Test creating a notification from a task TransitionSubject."""
+        s = TransitionSubject(
+            kind="task", id="t1", title="T", status=TaskStatus.RUNNING
+        )
+        n = Notification.from_subject(s, NotificationEvent.TASK_STARTED)
+        assert n.subject_id == "t1" and n.subject_title == "T"
+        assert n.entity_kind == "task" and n.status == TaskStatus.RUNNING
+        assert "Task" in n.format_title()
+        assert "[t1] T" in n.format_body()
+
+    def test_from_subject_workstream_wording(self) -> None:
+        """Test that a workstream subject formats title with 'Workstream'."""
+        s = TransitionSubject(
+            kind="workstream", id="w1", title="W", status=WorkstreamStatus.DONE
+        )
+        n = Notification.from_subject(s, NotificationEvent.WORKSTREAM_COMPLETED)
+        assert n.entity_kind == "workstream"
+        assert "Workstream" in n.format_title()  # channel never guesses the kind
+
+    def test_from_workstream_adapter_delegates(self) -> None:
+        """Test that from_workstream builds a TransitionSubject and delegates."""
+        ws = Workstream(id="w1", title="W", description="d", branch="feature/w1")
+        n = Notification.from_workstream(ws, NotificationEvent.WORKSTREAM_STARTED)
+        assert n.entity_kind == "workstream" and n.subject_id == "w1"
+
+    def test_four_workstream_notification_events_exist(self) -> None:
+        """Test that all four WORKSTREAM_* notification events are defined."""
+        for name in [
+            "WORKSTREAM_STARTED",
+            "WORKSTREAM_COMPLETED",
+            "WORKSTREAM_FAILED",
+            "WORKSTREAM_NEEDS_REVIEW",
+        ]:
+            assert hasattr(NotificationEvent, name)
 
 
 # =============================================================================
@@ -417,8 +464,9 @@ class TestDesktopNotifier:
 
         notification = Notification(
             event=NotificationEvent.TASK_COMPLETED,
-            task_id="task-001",
-            task_title='Task with "quotes"',
+            subject_id="task-001",
+            subject_title='Task with "quotes"',
+            entity_kind="task",
             status=TaskStatus.DONE,
         )
 
@@ -479,8 +527,9 @@ class TestNotificationManager:
 
         notification = Notification(
             event=NotificationEvent.TASK_COMPLETED,
-            task_id="task-001",
-            task_title="Test",
+            subject_id="task-001",
+            subject_title="Test",
+            entity_kind="task",
             status=TaskStatus.DONE,
         )
         results = await manager.notify(notification)
@@ -502,8 +551,9 @@ class TestNotificationManager:
 
         notification = Notification(
             event=NotificationEvent.TASK_COMPLETED,
-            task_id="task-001",
-            task_title="Test",
+            subject_id="task-001",
+            subject_title="Test",
+            entity_kind="task",
             status=TaskStatus.DONE,
         )
         results = await manager.notify(notification)
@@ -531,8 +581,9 @@ class TestNotificationManager:
 
         notification = Notification(
             event=NotificationEvent.TASK_FAILED,
-            task_id="task-001",
-            task_title="Test",
+            subject_id="task-001",
+            subject_title="Test",
+            entity_kind="task",
             status=TaskStatus.FAILED,
         )
         results = await manager.notify(notification)
@@ -546,8 +597,9 @@ class TestNotificationManager:
         manager = NotificationManager()
         notification = Notification(
             event=NotificationEvent.TASK_COMPLETED,
-            task_id="task-001",
-            task_title="Test",
+            subject_id="task-001",
+            subject_title="Test",
+            entity_kind="task",
             status=TaskStatus.DONE,
         )
         results = await manager.notify(notification)
