@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -31,6 +31,19 @@ class EventType(StrEnum):
     TASK_NEEDS_REVIEW = "task_needs_review"
     TASK_APPROVED = "task_approved"
     TASK_ABANDONED = "task_abandoned"
+
+    # Workstream lifecycle (mode 2)
+    WORKSTREAM_READY = "workstream_ready"
+    WORKSTREAM_DECOMPOSING = "workstream_decomposing"
+    WORKSTREAM_RUNNING = "workstream_running"
+    WORKSTREAM_MERGING = "workstream_merging"
+    WORKSTREAM_PR_CREATED = "workstream_pr_created"
+    WORKSTREAM_DONE = "workstream_done"
+    WORKSTREAM_FAILED = "workstream_failed"
+    WORKSTREAM_NEEDS_REVIEW = "workstream_needs_review"
+    WORKSTREAM_ABANDONED = "workstream_abandoned"
+    WORKSTREAM_RETRYING = "workstream_retrying"
+    WORKSTREAM_APPROVED = "workstream_approved"  # deferred-emit (spec §5.4)
 
     # Validation events
     VALIDATION_STARTED = "validation_started"
@@ -61,6 +74,8 @@ class Event(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     event_type: EventType
     task_id: str | None = None
+    entity_type: Literal["task", "workstream"] = "task"
+    entity_id: str | None = None
     agent_type: str | None = None
     message: str | None = None
     details: dict[str, Any] = Field(default_factory=dict)
@@ -70,9 +85,15 @@ class Event(BaseModel):
         data: dict[str, Any] = {
             "timestamp": self.timestamp.isoformat(),
             "event": self.event_type.value,
+            "entity_type": self.entity_type,
         }
-        if self.task_id:
+        # task_id stays optional for task events (backward compat with the
+        # pre-envelope contract) but is always emitted for non-task entities,
+        # where its absence would otherwise be ambiguous with "field missing".
+        if self.task_id or self.entity_type != "task":
             data["task_id"] = self.task_id
+        if self.entity_id:
+            data["entity_id"] = self.entity_id
         if self.agent_type:
             data["agent_type"] = self.agent_type
         if self.message:

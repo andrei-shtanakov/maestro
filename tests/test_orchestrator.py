@@ -6,12 +6,20 @@ PR body formatting, and shutdown behavior.
 """
 
 import contextlib
+from collections.abc import Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
+from maestro.event_log import (
+    Event,
+    EventLogger,
+    EventType,
+    get_event_logger,
+    set_event_logger,
+)
 from maestro.execution.models import (
     BackendHealth,
     CapabilityResult,
@@ -25,11 +33,14 @@ from maestro.models import (
     WorkstreamConfig,
     WorkstreamStatus,
 )
-from maestro.orchestrator import Orchestrator, OrchestratorError
+from maestro.notifications.base import NotificationChannel, NotificationEvent
+from maestro.notifications.manager import NotificationManager
+from maestro.orchestrator import Orchestrator, OrchestratorError, StatusChangeCallback
 from tests.fakes.fake_execution_backend import FakeTaskHandle
 
 
 if TYPE_CHECKING:
+    from maestro.database import Database
     from maestro.execution.local import LocalBackend
 
 
@@ -113,14 +124,35 @@ def orch_config() -> OrchestratorConfig:
 
 @pytest.fixture
 def mock_db() -> MagicMock:
-    """Provide a mock Database with async methods."""
+    """Provide a mock Database with async methods.
+
+    `update_workstream_status` returns a `Workstream` reflecting the write
+    (base fetched via `get_workstream`, `status`/`**fields` overlaid) rather
+    than a bare `AsyncMock()` default: `Orchestrator._transition` reads the
+    return value to build the dispatcher's `TransitionSubject`, which needs
+    a real `WorkstreamStatus` enum, not a MagicMock attribute. Falls back to
+    a fresh default workstream when `get_workstream` isn't configured by the
+    test (still unconfigured itself, so its own default is unchanged).
+    """
     db = MagicMock()
     type(db).is_connected = PropertyMock(return_value=True)
     db.get_all_workstreams = AsyncMock(return_value=[])
     db.get_workstreams_by_status = AsyncMock(return_value=[])
     db.create_workstream = AsyncMock()
     db.get_workstream = AsyncMock()
-    db.update_workstream_status = AsyncMock()
+
+    async def _update_workstream_status(
+        workstream_id: str,
+        new_status: WorkstreamStatus,
+        expected_status: WorkstreamStatus | None = None,
+        **fields: object,
+    ) -> Workstream:
+        base = await db.get_workstream(workstream_id)
+        if not isinstance(base, Workstream):
+            base = _make_workstream(workstream_id)
+        return base.model_copy(update={"status": new_status, **fields})
+
+    db.update_workstream_status = AsyncMock(side_effect=_update_workstream_status)
     return db
 
 
@@ -1083,7 +1115,10 @@ class TestBackgroundGeneration:
             if kwargs.get("process_pid") == fake_backend.pid:
                 reached.set()
                 await asyncio.sleep(3600)  # hang here until cancelled
-            return None
+            # Every other transition/field-patch on the way here must return
+            # a real Workstream: `_transition`/`_update_fields` now read the
+            # return value to build the dispatcher subject.
+            return _ws(args[0], args[1])
 
         mock_db.update_workstream_status = AsyncMock(side_effect=hang_on_pid)
 
@@ -2852,5 +2887,313 @@ class TestDurableApprovalMemory:
             await orch._recover_stranded_workstreams()
             w = await db.get_workstream("z4")
             assert w.status == WorkstreamStatus.NEEDS_REVIEW
+        finally:
+            await db.close()
+
+
+# =============================================================================
+# Contract Tests: Transition Dispatcher Wiring (Task 7, feat/transition-hooks)
+# =============================================================================
+#
+# These assert the NEW contract from
+# docs/superpowers/specs/2026-07-23-maestro-transition-hooks-design.md §6/§9 —
+# mode 2 (the orchestrator) gains events/notifications where it previously
+# emitted none at all.
+
+
+class _CapturingEventLogger(EventLogger):
+    """`EventLogger` double that records `Event`s in memory (no disk I/O).
+
+    Subclasses `EventLogger` (rather than a bare structural double) so it
+    can be installed via `set_event_logger`, which is typed to that class.
+    """
+
+    def __init__(self) -> None:  # intentionally skips EventLogger.__init__
+        self.events: list[Event] = []
+
+    def log(self, event: Event) -> None:
+        self.events.append(event)
+
+
+@pytest.fixture
+def captured_events() -> Generator[_CapturingEventLogger, None, None]:
+    """Install a capturing EventLogger as the process-global default.
+
+    `TransitionDispatcher` resolves its event sink via `get_event_logger()`
+    at fire-time, so the double must be installed as the global rather than
+    handed to the orchestrator directly.
+    """
+    logger = _CapturingEventLogger()
+    set_event_logger(logger)
+    assert get_event_logger() is logger
+    yield logger
+    set_event_logger(None)
+
+
+def _capturing_notification_manager() -> tuple[NotificationManager, AsyncMock]:
+    """A NotificationManager with one always-available capturing channel."""
+    manager = NotificationManager()
+    channel = AsyncMock(spec=NotificationChannel)
+    channel.channel_type = "capture"
+    channel.is_available.return_value = True
+    manager.register(channel)
+    return manager, channel
+
+
+class TestOrchestratorTransitionDispatchWiring:
+    """Task 7 contract: workstream status sites route through the dispatcher."""
+
+    async def _orch_db(
+        self,
+        tmp_path: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+        notifier: NotificationManager | None = None,
+        on_status_change: StatusChangeCallback | None = None,
+    ) -> tuple[Orchestrator, "Database"]:
+        from maestro.database import Database
+
+        db = Database(tmp_path / "o.db")
+        await db.connect()
+        cfg = OrchestratorConfig(
+            project="p",
+            repo_url="https://github.com/t/r",
+            repo_path="/tmp/r",
+            workspace_base="/tmp/ws",
+            workstreams=[],
+        )
+        orch = Orchestrator(
+            db=db,
+            workspace_mgr=mock_workspace_mgr,
+            decomposer=mock_decomposer,
+            config=cfg,
+            pr_manager=mock_pr_manager,
+            notifier=notifier,
+            on_status_change=on_status_change,
+        )
+        return orch, db
+
+    def _seed(self, zid: str, status: WorkstreamStatus) -> Workstream:
+        return Workstream(
+            id=zid,
+            title=f"Workstream {zid}",
+            description="d",
+            branch=f"feature/{zid}",
+            status=status,
+            scope=["src/**"],
+        )
+
+    @pytest.mark.anyio
+    async def test_running_fires_event_and_started_notification(
+        self,
+        tmp_path: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        manager, channel = _capturing_notification_manager()
+        orch, db = await self._orch_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            notifier=manager,
+        )
+        try:
+            await db.create_workstream(self._seed("z1", WorkstreamStatus.READY))
+
+            await orch._transition(
+                "z1", WorkstreamStatus.RUNNING, expected_status=WorkstreamStatus.READY
+            )
+
+            assert [e.event_type for e in captured_events.events] == [
+                EventType.WORKSTREAM_RUNNING
+            ]
+            notified = [call.args[0].event for call in channel.send.await_args_list]
+            assert notified == [NotificationEvent.WORKSTREAM_STARTED]
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_done_fires_event_and_completed_notification(
+        self,
+        tmp_path: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        manager, channel = _capturing_notification_manager()
+        orch, db = await self._orch_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            notifier=manager,
+        )
+        try:
+            await db.create_workstream(self._seed("z1", WorkstreamStatus.PR_CREATED))
+
+            await orch._transition(
+                "z1",
+                WorkstreamStatus.DONE,
+                expected_status=WorkstreamStatus.PR_CREATED,
+            )
+
+            assert [e.event_type for e in captured_events.events] == [
+                EventType.WORKSTREAM_DONE
+            ]
+            notified = [call.args[0].event for call in channel.send.await_args_list]
+            assert notified == [NotificationEvent.WORKSTREAM_COMPLETED]
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_failed_fires_event_but_no_notification(
+        self,
+        tmp_path: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        """A workstream's FAILED is transient/retryable (always followed by
+        FAILED->READY retry or FAILED->NEEDS_REVIEW), so it fires an event
+        only, mirroring the task-side rationale (spec §0)."""
+        manager, channel = _capturing_notification_manager()
+        orch, db = await self._orch_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            notifier=manager,
+        )
+        try:
+            await db.create_workstream(self._seed("z1", WorkstreamStatus.RUNNING))
+
+            await orch._transition(
+                "z1",
+                WorkstreamStatus.FAILED,
+                expected_status=WorkstreamStatus.RUNNING,
+                message="boom",
+                error_message="boom",
+            )
+
+            assert [e.event_type for e in captured_events.events] == [
+                EventType.WORKSTREAM_FAILED
+            ]
+            notified = [call.args[0].event for call in channel.send.await_args_list]
+            assert notified == []
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_needs_review_fires_event_and_notification(
+        self,
+        tmp_path: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        manager, channel = _capturing_notification_manager()
+        orch, db = await self._orch_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            notifier=manager,
+        )
+        try:
+            await db.create_workstream(self._seed("z1", WorkstreamStatus.FAILED))
+
+            await orch._transition(
+                "z1",
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=WorkstreamStatus.FAILED,
+            )
+
+            assert [e.event_type for e in captured_events.events] == [
+                EventType.WORKSTREAM_NEEDS_REVIEW
+            ]
+            notified = [call.args[0].event for call in channel.send.await_args_list]
+            assert notified == [NotificationEvent.WORKSTREAM_NEEDS_REVIEW]
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_merging_and_pr_created_fire_events_but_no_notification(
+        self,
+        tmp_path: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        """PR_CREATED is an informational intermediate the automatic flow
+        continues past, not an operator gate — no notification (spec §6)."""
+        manager, channel = _capturing_notification_manager()
+        orch, db = await self._orch_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            notifier=manager,
+        )
+        try:
+            await db.create_workstream(self._seed("z1", WorkstreamStatus.RUNNING))
+
+            await orch._transition(
+                "z1",
+                WorkstreamStatus.MERGING,
+                expected_status=WorkstreamStatus.RUNNING,
+            )
+            await orch._transition(
+                "z1",
+                WorkstreamStatus.PR_CREATED,
+                expected_status=WorkstreamStatus.MERGING,
+            )
+
+            assert [e.event_type for e in captured_events.events] == [
+                EventType.WORKSTREAM_MERGING,
+                EventType.WORKSTREAM_PR_CREATED,
+            ]
+            assert channel.send.await_args_list == []
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_update_fields_fires_nothing(
+        self,
+        tmp_path: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        """The generation_pid clear (orchestrator.py:~620, same-state write)
+        must not dispatch any event, notification, or status-change callback."""
+        manager, channel = _capturing_notification_manager()
+        changes: list[tuple[str, str, str]] = []
+        orch, db = await self._orch_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            notifier=manager,
+            on_status_change=lambda wid, old, new: changes.append((wid, old, new)),
+        )
+        try:
+            await db.create_workstream(self._seed("z1", WorkstreamStatus.DECOMPOSING))
+
+            updated = await orch._update_fields("z1", generation_pid=None)
+
+            assert updated.generation_pid is None
+            assert updated.status == WorkstreamStatus.DECOMPOSING
+            assert captured_events.events == []
+            assert channel.send.await_args_list == []
+            assert changes == []
         finally:
             await db.close()

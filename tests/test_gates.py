@@ -520,13 +520,27 @@ async def test_orchestrator_ex_ante_block_routes_to_needs_review(
     from unittest.mock import AsyncMock, MagicMock
 
     from maestro.orchestrator import Orchestrator
+    from maestro.transitions import TransitionDispatcher
 
     orch = Orchestrator.__new__(Orchestrator)
     orch._gates = _FakeKeeper(allow=False)  # type: ignore[assignment]
     orch._db = MagicMock()
-    orch._db.update_workstream_status = AsyncMock()
+
+    async def _update_workstream_status(
+        workstream_id: str, new_status: WorkstreamStatus, **kw: object
+    ):
+        # `_transition` reads the return value to build the dispatcher
+        # subject — must be a real Workstream, not a bare AsyncMock.
+        return _workstream(new_status)
+
+    orch._db.update_workstream_status = AsyncMock(side_effect=_update_workstream_status)
     orch._db.list_gate_approvals = AsyncMock(return_value=set())
     orch._logger = MagicMock()
+    # `_transition` fires through the dispatcher (Task 7 wiring) — a
+    # no-op one here since this test only asserts the DB write.
+    orch._dispatcher = TransitionDispatcher(
+        notifier=None, event_logger_getter=lambda: None, status_change_cb=None
+    )
     allowed = await orch._gate_ex_ante("ws-1", _workstream(WorkstreamStatus.READY))
     assert allowed is False
     kwargs = orch._db.update_workstream_status.call_args.kwargs

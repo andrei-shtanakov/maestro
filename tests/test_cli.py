@@ -327,6 +327,45 @@ class TestOrchestratorResumeFlag:
         finally:
             await db.close()
 
+    @pytest.mark.anyio
+    async def test_run_orchestrator_wires_notifier_and_status_callback(
+        self,
+        temp_dir: Path,
+    ) -> None:
+        """`orchestrate` must deliver mode-2 lifecycle events/notifications,
+        not build an inert dispatcher: `Orchestrator` needs a real notifier
+        and an on_status_change callback, mirroring mode-1's `run` wiring."""
+        config_path = _write_orchestrator_config(temp_dir)
+        db_path = temp_dir / "state.db"
+
+        with (
+            patch("maestro.cli.GitManager") as mock_git_mgr,
+            patch("maestro.cli.WorkspaceManager"),
+            patch("maestro.cli.ProjectDecomposer"),
+            patch("maestro.cli.PRManager"),
+            patch("maestro.cli.Orchestrator") as mock_orchestrator,
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            mock_git_mgr.return_value.repo_path = config_path.parent
+            stats = SimpleNamespace(
+                total_workstreams=0, completed=0, failed=0, prs_created=0
+            )
+            orchestrator_instance = MagicMock()
+            orchestrator_instance.run = AsyncMock(return_value=stats)
+            mock_orchestrator.return_value = orchestrator_instance
+
+            await _run_orchestrator(
+                config_path=config_path,
+                db_path=db_path,
+                resume=False,
+                log_dir=None,
+            )
+
+            _, kwargs = mock_orchestrator.call_args
+            assert kwargs["notifier"] is not None
+            assert callable(kwargs["on_status_change"])
+
 
 # =============================================================================
 # Test: Run Command
