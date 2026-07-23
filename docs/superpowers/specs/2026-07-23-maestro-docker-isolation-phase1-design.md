@@ -75,10 +75,10 @@ stays deterministic and unit-testable, and all filesystem/secret side effects
 happen in one place immediately before spawn.
 
 `prepare` is **deterministic w.r.t. its arguments, not pure w.r.t. process
-globals**: it must not read `os.environ` / `child_env()` itself (`BareIsolator`
-needs the inherited env; both isolators need the trace env). Those are passed in
-explicitly so a test controls the whole plan with no monkeypatching. Secret
-**values** are still read only in `materialize`.
+globals**: it must not read `os.environ` / `child_env()` itself. Both are passed
+in explicitly (`host_env`, `trace_env`) so a test controls the whole plan with no
+monkeypatching. `host_env` is a snapshot of the center environment; `BareIsolator`
+needs it in **both** `inherit_env` modes (see below), so it is not optional.
 
 ```python
 class Isolator(Protocol):
@@ -88,7 +88,7 @@ class Isolator(Protocol):
         req: ExecutionRequest,
         *,
         trace_env: Mapping[str, str],             # child_env(): TRACEPARENT, ORCHESTRA_*
-        inherited_env: Mapping[str, str] | None,  # os.environ snapshot; None for docker
+        host_env: Mapping[str, str],              # os.environ snapshot
     ) -> PreparedRunPlan: ...
     def materialize(self, plan: PreparedRunPlan) -> PreparedRun: ...   # I/O, just before spawn
     def wrap(self, local: LocalTaskHandle, prepared: PreparedRun,
@@ -109,18 +109,32 @@ class PreparedRun(BaseModel):          # after materialize: paths that now exist
     cleanup_paths: list[Path]          # tmp_dir/env-file/cidfile to unlink
 ```
 
-- **`BareIsolator`** — identity. `prepare` returns today's argv and
-  `{**inherited_env, **trace_env}` (honoring `inherit_env`); `materialize` is a
-  no-op; `wrap` returns the `LocalTaskHandle` unchanged. Behavior-compatible with
-  today.
+- **`BareIsolator`** — identity. `prepare` returns today's argv and reproduces
+  `build_local_env` exactly (`env.py:15-20`) from the injected snapshots:
+
+  ```python
+  if req.inherit_env:
+      env = {**host_env, **trace_env}
+  else:
+      allowed = {k: host_env[k] for k in req.secret_env if k in host_env}
+      env = {**allowed, **req.env, **trace_env}
+  ```
+
+  `materialize` is a no-op; `wrap` returns the `LocalTaskHandle` unchanged.
+  Behavior-compatible with today. **Note:** the "secret values read only in
+  `materialize`" rule (§3) is a **Docker-path** property; the bare path must, for
+  back-compat, resolve allowed `secret_env` values from `host_env` at planning
+  time — which stays deterministic because `host_env` is an explicit argument,
+  not a global read.
 - **`DockerIsolator(cfg)`** — `prepare` builds the `docker run` argv (§4), the
-  identity labels (§5) and the env split (§3, `trace_env` inlined via `-e`,
-  `inherited_env` ignored), naming secret keys only. `materialize` creates the
-  `0700` tmp dir, writes the `0600` env-file, and fixes the `--cidfile` path.
-  `wrap` returns a `DockerTaskHandle`.
+  identity labels (§5) and the env split (§3, `trace_env` inlined via `-e`;
+  `host_env` used **only** to name which `secret_env` keys exist, never their
+  values), naming secret keys only. `materialize` creates the `0700` tmp dir,
+  writes the `0600` env-file, and fixes the `--cidfile` path. `wrap` returns a
+  `DockerTaskHandle`.
 
 `LocalBackend.run(req)` becomes: `plan = isolator.prepare(req, trace_env=…,
-inherited_env=…)` → `prepared = isolator.materialize(plan)` → spawn
+host_env=…)` → `prepared = isolator.materialize(plan)` → spawn
 `prepared.plan.argv` via the existing asyncio path → build `ExecutionHandleRef`
 (docker `transport_ref = "docker:maestro-<execution_id>"`) →
 `isolator.wrap(local_handle, prepared, ref)`. On spawn failure, `materialize`'d
@@ -239,18 +253,25 @@ serves both entity kinds; `ExecutionHandleRef` already models this). A dedicated
 table also preserves orphan-attempt history for diagnosis and avoids duplicating
 columns across `tasks` and `workstreams`.
 
+```sql
+CREATE TABLE execution_handles (
+  execution_id   TEXT PRIMARY KEY,             -- uuid4
+  entity_kind    TEXT NOT NULL CHECK (entity_kind IN ('task','workstream')),
+  entity_id      TEXT NOT NULL,
+  attempt        INTEGER NOT NULL,             -- = retry_count + 1
+  backend_id     TEXT NOT NULL,                -- what this attempt actually ran with
+  transport_ref  TEXT NOT NULL,                -- 'docker:maestro-<execution_id>' | 'local_pid:<pid>'
+  state          TEXT NOT NULL CHECK (state IN ('prepared','running','terminal','cleaned')),
+  created_at     TEXT NOT NULL,
+  finished_at    TEXT
+);
+CREATE INDEX ix_exec_state_backend ON execution_handles (state, backend_id);
+CREATE INDEX ix_exec_entity ON execution_handles (entity_kind, entity_id, attempt);
 ```
-execution_handles
-  execution_id   TEXT PK              -- uuid4
-  entity_kind    TEXT                 -- 'task' | 'workstream'
-  entity_id      TEXT
-  attempt        INTEGER
-  backend_id     TEXT                 -- what this attempt actually ran with
-  transport_ref  TEXT                 -- 'docker:maestro-<execution_id>' | 'local_pid:<pid>'
-  state          TEXT                 -- 'prepared' | 'running' | 'terminal' | 'cleaned'
-  created_at     TEXT
-  finished_at    TEXT NULL
-```
+
+State transitions are **monotonic** (`prepared → running → terminal → cleaned`);
+the update path guards against regressions (e.g. `cleaned → running` is
+impossible) via a state-aware `WHERE` clause on each update.
 
 Added via the existing linear `schema_migrations` runner (LABS-85). A separate
 `backend` field is **also** added to `TaskConfig`/`WorkstreamConfig` and threaded
@@ -317,57 +338,71 @@ sentinel.
 ### 7. Finalization — single owner, no new protocol method
 
 The Phase-0 protocol already has `wait()` / `collect()` / `cleanup()`; **no
-`finalize()` is added to the protocol.** Instead a shared helper enforces order
-and never lets a `collect`/`cleanup` fault swallow the run result:
+`finalize()` is added to the protocol.** Instead a shared helper returns a
+**structured** result so the monitor — not the helper — drives row state and so a
+resource-cleanup fault never mutates the agent's business outcome:
 
 ```python
-async def finalize_handle(handle: TaskHandle) -> ExecutionResult:
-    result = await handle.wait()                 # reap; the authoritative outcome
-    errors: list[str] = []
+@dataclass
+class FinalizationResult:
+    execution: ExecutionResult          # the authoritative agent outcome (exit code)
+    collect_error: str | None = None
+    cleanup_error: str | None = None
+
+    @property
+    def cleaned(self) -> bool:
+        return self.cleanup_error is None
+
+async def finalize_handle(handle: TaskHandle) -> FinalizationResult:
+    execution = await handle.wait()                      # reap
+    collect_error = cleanup_error = None
     try:
-        await handle.collect()                   # docker: no-op, still called
-    except Exception as e:                        # collect must not hide the result
-        errors.append(f"collect: {e}")
-    try:
-        # Shield so an external cancellation cannot abort a targeted
-        # container stop/rm or leave secret files on disk.
-        await asyncio.shield(handle.cleanup())   # raises on ownership/daemon failure
+        await handle.collect()                           # docker: no-op, still called
     except Exception as e:
-        errors.append(f"cleanup: {e}")           # row stays 'terminal', NOT 'cleaned'
-    if errors:
-        result.error_message = "; ".join(
-            filter(None, [result.error_message, *errors])
-        )
-    return result
+        collect_error = f"{e}"
+    try:
+        await handle.cleanup()                           # raises on ownership/daemon failure
+    except Exception as e:
+        cleanup_error = f"{e}"
+    return FinalizationResult(execution, collect_error, cleanup_error)
 ```
 
-Contract this pins down:
+The monitor owns the row-state transitions around it:
 
-- **Exactly one finalization task per running entity.** The monitor records the
-  in-flight finalize `Task` on the running-entity record; any second caller
-  (shutdown loop, a re-tick) awaits that same task and its result rather than
-  starting a second finalize. `cleanup` idempotency is the safety net, not the
-  primary mechanism.
-- **`collect`/`cleanup` errors are recorded, not fatal.** They fold into
-  `ExecutionResult.error_message`; terminal entity processing (cost parse, status
-  transition) still runs on the reaped `result`.
-- **`cleanup` is cancellation-shielded** enough to finish the targeted
-  `docker stop`/`rm` and unlink the env-file / cidfile / tmp dir.
-- **`execution_handles.state = "cleaned"` is set only after a confirmed
-  successful cleanup.** A daemon/ownership failure leaves the row `terminal`, so
-  recovery (§11) can still find it and GC the possibly-leftover container (the
-  entity's maestro status is already settled — this is a resource sweep, not a
-  status change).
-- **`cleanup()` signals a fail-closed ownership refusal by raising** (the
-  protocol returns `None`; a structured `CleanupResult` is deferred). The helper
-  catches and records it — it does not crash the monitor.
+1. reap → obtain `FinalizationResult`;
+2. mark `execution_handles.state = "terminal"`;
+3. **iff `fin.cleaned`** → `state = "cleaned"` (a cleanup fault leaves it
+   `terminal` for the recovery GC sweep, §11b);
+4. pass **only** `fin.execution` to the existing status handler — a successful
+   agent run with a failed `docker rm` is a success **plus** a resource fault,
+   never an execution failure, so the exit code is never rewritten;
+5. record `collect_error` / `cleanup_error` in observability/diagnostics
+   (`ExecutionResult.exit_code` is left untouched).
 
-**Ownership is singular at the monitor.** The monitor loop is the one caller that
-finalizes, then dispatches to the existing status handlers with the reaped
-result:
+**Ownership = one shared finalization task, not a bare `shield`.**
+`await asyncio.shield(handle.cleanup())` does **not** make an awaiter wait for
+cleanup: on cancellation the outer await raises `CancelledError` at once while
+cleanup continues as an untracked task, so the owner can finish before cleanup
+does. Instead the finalization *task itself* is the ownership unit:
 
-- Normal completion (`poll()` returns non-None): call `finalize_handle` directly
-  — `wait()` returns at once.
+```python
+running.finalize_task = running.finalize_task or asyncio.create_task(
+    finalize_handle(handle)
+)
+fin = await asyncio.shield(running.finalize_task)   # awaiter cancel ≠ task cancel
+```
+
+- The task is created **once** and stored on the running-entity record.
+- If the awaiting monitor is cancelled, the task is **not** cancelled; the
+  shutdown / recovery path finds the same task and awaits it.
+- No second `finalize` is ever created; `cleanup` idempotency is the safety net,
+  not the primary mechanism.
+
+**The monitor is the single owner.** It finalizes, then dispatches to the
+existing status handlers with `fin.execution`:
+
+- Normal completion (`poll()` returns non-None): finalize directly — `wait()`
+  returns at once.
 - Timeout / cancellation / shutdown (process still live): the owner first
   `terminate(grace)` / `kill()` the handle, **then** finalizes (now `wait()`
   reaps immediately and the container-stop is targeted).
@@ -375,13 +410,14 @@ result:
 Finalization is **not** scattered across `_handle_task_completion`,
 `_handle_task_failure`, and `_handle_task_timeout`. The same single-owner
 refactor is applied to the Mode-2 orchestrator monitor. Cost parsing and (local)
-validation run after `finalize_handle` returns; because `collect` is a bind-mount
-no-op and the log is already on the host, ordering is preserved.
+validation run after finalization on `fin.execution`; because `collect` is a
+bind-mount no-op and the log is already on the host, ordering is preserved.
 
 **Safe cleanup (ownership check).** Before `docker rm -f <name>`, `inspect` the
 container and confirm its `maestro.execution_id` label matches the expected id.
-On mismatch, do **not** remove and **raise** a fail-closed ownership error (the
-helper records it; the row stays `terminal`). If the container is already absent,
+On mismatch, do **not** remove and **raise** a fail-closed ownership error
+(captured as `FinalizationResult.cleanup_error`; the row stays `terminal`). If the
+container is already absent,
 cleanup still unlinks the local env-file / cidfile / tmp dir and succeeds. UUID
 collisions are effectively impossible, but a destructive op still verifies
 ownership.
