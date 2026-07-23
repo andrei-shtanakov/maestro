@@ -1,8 +1,34 @@
 import pytest
 
+from maestro.execution.docker_cli import DockerCli
 from maestro.execution.exec_config import DockerConfig, ExecutionConfig
+from maestro.execution.isolators import DockerIsolator
 from maestro.execution.local import LocalBackend
+from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.execution.resolver import BackendResolver, ExecutionConfigError
+
+
+class FakeDockerCli(DockerCli):
+    """Scripted `DockerCli` double: no subprocess, no daemon.
+
+    Subclasses the real `DockerCli` (rather than duck-typing a bare class)
+    so it satisfies `LocalBackend`'s/`DockerIsolator`'s `DockerCli`-typed
+    parameters under nominal typing. Deliberately skips
+    `DockerCli.__init__` (which wires up a real subprocess `run_cmd`) and
+    overrides only `version_ok`/`image_exists` — the two methods
+    `LocalBackend`'s docker-aware `healthcheck`/`can_run` call.
+    """
+
+    def __init__(self, *, version_ok: bool = True, image_exists: bool = True) -> None:
+        self._version_ok = version_ok
+        self._image_exists = image_exists
+
+    async def version_ok(self) -> bool:
+        return self._version_ok
+
+    async def image_exists(self, image: str) -> bool:
+        del image
+        return self._image_exists
 
 
 def test_no_execution_config_resolves_local():
@@ -54,3 +80,78 @@ async def test_docker_healthcheck_rejects_ssh_docker_host(monkeypatch):
     health = await backend.healthcheck()
     assert health.reachable is False
     assert "DOCKER_HOST" in health.detail
+
+
+@pytest.mark.anyio
+async def test_docker_healthcheck_rejects_tcp_docker_host(monkeypatch):
+    """Mirrors the ssh:// test — tcp:// is remote too, Phase 1 is local only."""
+    monkeypatch.setenv("DOCKER_HOST", "tcp://gpu-box:2375")
+    docker = FakeDockerCli()
+    cfg = DockerConfig(image="maestro-runner:x")
+    backend = LocalBackend(
+        DockerIsolator(cfg, docker=docker), backend_id="docker", docker=docker
+    )
+    health = await backend.healthcheck()
+    assert health.reachable is False
+    assert "DOCKER_HOST" in health.detail
+
+
+@pytest.mark.anyio
+async def test_docker_healthcheck_daemon_unreachable(monkeypatch):
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    docker = FakeDockerCli(version_ok=False)
+    cfg = DockerConfig(image="maestro-runner:x")
+    backend = LocalBackend(
+        DockerIsolator(cfg, docker=docker), backend_id="docker", docker=docker
+    )
+    health = await backend.healthcheck()
+    assert health.reachable is False
+    assert "daemon" in health.detail
+
+
+@pytest.mark.anyio
+async def test_docker_healthcheck_reachable_when_daemon_ok(monkeypatch):
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    docker = FakeDockerCli(version_ok=True)
+    cfg = DockerConfig(image="maestro-runner:x")
+    backend = LocalBackend(
+        DockerIsolator(cfg, docker=docker), backend_id="docker", docker=docker
+    )
+    health = await backend.healthcheck()
+    assert health.reachable is True
+
+
+def _minimal_request(tmp_path) -> ExecutionRequest:
+    """A request with the image-gated docker `can_run` path never inspects
+    workdir/argv/etc, but the model requires them.
+    """
+    return ExecutionRequest(
+        run_id="t1",
+        argv=["true"],
+        workdir=tmp_path,
+        log_path=tmp_path / "log.txt",
+        collect=CollectPolicy(mode="none"),
+    )
+
+
+@pytest.mark.anyio
+async def test_docker_can_run_missing_image(tmp_path):
+    docker = FakeDockerCli(image_exists=False)
+    cfg = DockerConfig(image="maestro-runner:x")
+    backend = LocalBackend(
+        DockerIsolator(cfg, docker=docker), backend_id="docker", docker=docker
+    )
+    cap = await backend.can_run(_minimal_request(tmp_path))
+    assert cap.ok is False
+    assert cap.missing_tools == ["image:maestro-runner:x"]
+
+
+@pytest.mark.anyio
+async def test_docker_can_run_image_present(tmp_path):
+    docker = FakeDockerCli(image_exists=True)
+    cfg = DockerConfig(image="maestro-runner:x")
+    backend = LocalBackend(
+        DockerIsolator(cfg, docker=docker), backend_id="docker", docker=docker
+    )
+    cap = await backend.can_run(_minimal_request(tmp_path))
+    assert cap.ok is True

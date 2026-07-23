@@ -188,6 +188,10 @@ class LocalBackend:
         # in-image tool probe (a --rm helper container) is exercised by
         # integration tests. `self._docker is not None` here implies the
         # resolver paired this backend with a DockerIsolator (resolver.py).
+        # `cast` only affects static typing: if that invariant is ever
+        # violated (e.g. a BareIsolator passed alongside a non-None
+        # `docker`), this raises AttributeError at call time — not a silent
+        # type lie — since `_cfg` genuinely doesn't exist on other isolators.
         image = cast("DockerIsolator", self._isolator)._cfg.image
         if not await self._docker.image_exists(image):
             return CapabilityResult(ok=False, missing_tools=[f"image:{image}"])
