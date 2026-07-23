@@ -7,6 +7,7 @@ orchestration with workstreams (independent work units).
 """
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal, Self
@@ -977,6 +978,20 @@ class WorkstreamStatus(StrEnum):
     def is_terminal(self) -> bool:
         """Check if this is a terminal state."""
         return self in (WorkstreamStatus.DONE, WorkstreamStatus.ABANDONED)
+
+
+@dataclass(frozen=True)
+class TransitionSubject:
+    """Entity-agnostic view of a committed status transition's subject.
+
+    Lives here (not in transitions.py) so notifications/base.py can reference it
+    without a transitions <-> notifications import cycle.
+    """
+
+    kind: Literal["task", "workstream"]
+    id: str
+    title: str
+    status: "TaskStatus | WorkstreamStatus"
 
 
 class WorkstreamConfig(BaseModel):
