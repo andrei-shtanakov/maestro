@@ -139,6 +139,23 @@ CREATE TABLE IF NOT EXISTS gate_approvals (
     UNIQUE (workstream_id, phase, sha)
 );
 
+-- Docker Isolation Phase 1: durable execution identity. One row per spawned
+-- backend execution attempt (task or workstream); survives orchestrator
+-- restarts so a live/orphaned execution can be recognized on recovery.
+CREATE TABLE IF NOT EXISTS execution_handles (
+    execution_id   TEXT PRIMARY KEY,
+    entity_kind    TEXT NOT NULL CHECK (entity_kind IN ('task','workstream')),
+    entity_id      TEXT NOT NULL,
+    attempt        INTEGER NOT NULL,
+    backend_id     TEXT NOT NULL,
+    transport_ref  TEXT NOT NULL,
+    state          TEXT NOT NULL CHECK (state IN ('prepared','running','terminal','cleaned')),
+    created_at     TEXT NOT NULL,
+    finished_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_exec_state_backend ON execution_handles (state, backend_id);
+CREATE INDEX IF NOT EXISTS ix_exec_entity ON execution_handles (entity_kind, entity_id, attempt);
+
 -- Mini-R: Linear migration journal. Every applied schema migration inserts
 -- exactly one row here so future connects can skip already-applied work
 -- without PRAGMA scanning every startup.
@@ -411,6 +428,8 @@ class Database:
                 self._migrate_workstreams_generation_pid,
             ),
             (6, "gates_v13_gate_approvals", self._migrate_gate_approvals),
+            (7, "execution_handles", self._migrate_execution_handles),
+            (8, "entity_backend_columns", self._migrate_entity_backend_columns),
         ]
 
         for version, name, fn in ordered:
@@ -609,6 +628,49 @@ class Database:
             )
             """
         )
+
+    async def _migrate_execution_handles(self) -> None:
+        """Migration 7: Docker Isolation Phase 1 durable execution identity.
+
+        `CREATE TABLE IF NOT EXISTS` (+ its indexes) — a no-op on databases
+        whose SCHEMA_SQL already created the table; creates it for
+        pre-v7 databases. Mirrors `_migrate_gate_approvals` (migration 6).
+        """
+        assert self._connection is not None
+        await self._connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS execution_handles (
+                execution_id   TEXT PRIMARY KEY,
+                entity_kind    TEXT NOT NULL CHECK (entity_kind IN ('task','workstream')),
+                entity_id      TEXT NOT NULL,
+                attempt        INTEGER NOT NULL,
+                backend_id     TEXT NOT NULL,
+                transport_ref  TEXT NOT NULL,
+                state          TEXT NOT NULL CHECK (state IN ('prepared','running','terminal','cleaned')),
+                created_at     TEXT NOT NULL,
+                finished_at    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_exec_state_backend
+                ON execution_handles (state, backend_id);
+            CREATE INDEX IF NOT EXISTS ix_exec_entity
+                ON execution_handles (entity_kind, entity_id, attempt);
+            """
+        )
+
+    async def _migrate_entity_backend_columns(self) -> None:
+        """Migration 8: add nullable `backend` to `tasks` and `workstreams`.
+
+        NULL for all pre-existing rows (backend unknown/legacy). Idempotent
+        via PRAGMA table_info, same shape as `_migrate_tasks_arbiter_columns`.
+        """
+        assert self._connection is not None
+        for table in ("tasks", "workstreams"):
+            cursor = await self._connection.execute(f"PRAGMA table_info({table})")
+            columns = {row["name"] for row in await cursor.fetchall()}
+            if "backend" not in columns:
+                await self._connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN backend TEXT"
+                )
 
     @asynccontextmanager
     async def transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:
