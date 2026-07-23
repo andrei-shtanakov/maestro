@@ -37,6 +37,7 @@ from maestro.dag import DAG
 from maestro.database import Database
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
 from maestro.execution.backend import TaskHandle
+from maestro.execution.finalize import ensure_finalize_task
 from maestro.execution.local import LocalBackend
 from maestro.execution.models import ExecutionRequest
 from maestro.models import (
@@ -164,12 +165,14 @@ class RunningTask:
         handle: Execution handle (poll/wait/terminate/kill/collect/cleanup).
         started_at: When the task started.
         log_file: Path to the log file.
+        finalize_task: The single finalization task for this run, if started.
     """
 
     task: Task
     handle: TaskHandle
     started_at: datetime
     log_file: Path
+    finalize_task: "asyncio.Task | None" = None
 
 
 @dataclass
@@ -1202,8 +1205,19 @@ class Scheduler:
             return_code = running_task.handle.poll()
 
             if return_code is not None:
-                # Process finished
-                await self._handle_task_completion(task_id, running_task, return_code)
+                # Process finished — finalize (reap/collect/cleanup) exactly
+                # once before dispatching on the outcome.
+                fin = await asyncio.shield(ensure_finalize_task(running_task))
+                if fin.collect_error or fin.cleanup_error:
+                    _obs_log.warning(
+                        "execution.finalize.resource_fault",
+                        task_id=task_id,
+                        collect_error=fin.collect_error,
+                        cleanup_error=fin.cleanup_error,
+                    )
+                await self._handle_task_completion(
+                    task_id, running_task, fin.execution.exit_code
+                )
                 completed.append(task_id)
             else:
                 # Check for timeout
@@ -1211,6 +1225,8 @@ class Scheduler:
                 timeout_seconds = running_task.task.timeout_minutes * 60
 
                 if elapsed.total_seconds() > timeout_seconds:
+                    await running_task.handle.terminate(grace_seconds=10.0)
+                    await asyncio.shield(ensure_finalize_task(running_task))
                     await self._handle_task_timeout(task_id, running_task)
                     completed.append(task_id)
 
@@ -1222,14 +1238,15 @@ class Scheduler:
         self,
         task_id: str,
         running_task: RunningTask,
-        return_code: int,
+        return_code: int | None,
     ) -> None:
         """Handle task completion.
 
         Args:
             task_id: ID of the completed task.
             running_task: The running task info.
-            return_code: Process exit code.
+            return_code: Process exit code (``None`` is treated as failure —
+                it never compares equal to 0).
         """
         task = running_task.task
 

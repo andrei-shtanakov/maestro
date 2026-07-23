@@ -1,9 +1,12 @@
+import asyncio
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from maestro.execution.finalize import finalize_handle
+from maestro.execution.backend import TaskHandle
+from maestro.execution.finalize import ensure_finalize_task, finalize_handle
 from maestro.execution.models import (
     CollectResult,
     ExecutionHandleRef,
@@ -76,3 +79,19 @@ async def test_cleanup_error_marks_not_cleaned():
     assert fin.cleaned is False
     assert "rm boom" in (fin.cleanup_error or "")
     assert fin.execution.exit_code == 0
+
+
+@dataclass
+class _Running:
+    handle: TaskHandle
+    finalize_task: asyncio.Task | None = None
+
+
+@pytest.mark.anyio
+async def test_ensure_finalize_task_created_once():
+    running = _Running(handle=_FakeHandle())
+    t1 = ensure_finalize_task(running)
+    t2 = ensure_finalize_task(running)
+    assert t1 is t2  # exactly one task per entity
+    fin = await asyncio.shield(t1)
+    assert fin.cleaned is True
