@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.request import pathname2url
 
 import aiosqlite
@@ -1251,7 +1251,7 @@ class Database:
     async def start_execution(
         self,
         *,
-        entity_kind: str,
+        entity_kind: Literal["task", "workstream"],
         entity_id: str,
         expected_status: str,
         running_status: str,
@@ -1265,11 +1265,16 @@ class Database:
         Single transaction: CAS-UPDATE the entity's status row, then insert
         the `execution_handles` row in state `'prepared'`. If the CAS matches
         no row (entity already left `expected_status`), the transaction is
-        rolled back and `ConcurrentModificationError` is raised — no
-        `execution_handles` row is left behind.
+        rolled back and `ConcurrentModificationError` is raised. If the
+        subsequent INSERT fails for any reason, the transaction is also
+        rolled back before re-raising — the whole operation is all-or-
+        nothing: either the CAS and the insert both apply, or neither does.
+        No `execution_handles` row (and no CAS'd status) is ever left behind
+        on failure.
 
         Args:
-            entity_kind: `"task"` or `"workstream"`.
+            entity_kind: `"task"` or `"workstream"` — selects the table the
+                CAS applies to.
             entity_id: ID of the task/workstream being started.
             expected_status: Status the entity must currently have.
             running_status: Status to CAS the entity into.
@@ -1300,24 +1305,28 @@ class Database:
             )
             raise ConcurrentModificationError(msg)
 
-        await self._connection.execute(
-            """
-            INSERT INTO execution_handles
-              (execution_id, entity_kind, entity_id, attempt, backend_id,
-               transport_ref, state, created_at, finished_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, NULL)
-            """,
-            (
-                execution_id,
-                entity_kind,
-                entity_id,
-                attempt,
-                backend_id,
-                transport_ref,
-                _format_datetime(datetime.now(UTC)),
-            ),
-        )
-        await self._connection.commit()
+        try:
+            await self._connection.execute(
+                """
+                INSERT INTO execution_handles
+                  (execution_id, entity_kind, entity_id, attempt, backend_id,
+                   transport_ref, state, created_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, NULL)
+                """,
+                (
+                    execution_id,
+                    entity_kind,
+                    entity_id,
+                    attempt,
+                    backend_id,
+                    transport_ref,
+                    _format_datetime(datetime.now(UTC)),
+                ),
+            )
+            await self._connection.commit()
+        except Exception:
+            await self._connection.rollback()
+            raise
 
     async def mark_execution_state(
         self,
@@ -1333,6 +1342,12 @@ class Database:
         `running` is a no-op, not an error). `finished_at` is stamped only
         when transitioning into a terminal state (`"terminal"` or
         `"cleaned"`); otherwise it is left unchanged.
+
+        Caveat: this is a silent no-op — it does not raise or report which
+        rows changed — both when `execution_id` matches no row at all and
+        when it matches a row whose current state is not in `allowed_from`.
+        Callers that need to distinguish "already in the target state" from
+        "not found" from "blocked transition" must query separately.
 
         Args:
             execution_id: The execution handle to update.

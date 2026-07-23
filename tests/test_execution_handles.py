@@ -156,3 +156,50 @@ async def test_mark_execution_state_is_monotonic(tmp_path):
     rows = {r["execution_id"]: r for r in await db.get_open_execution_handles()}
     assert "e1" not in rows  # 'cleaned' is filtered out of the open set
     await db.close()
+
+
+@pytest.mark.anyio
+async def test_start_execution_rolls_back_cas_when_insert_fails(tmp_path):
+    """If the INSERT after a successful CAS fails, the whole transaction
+    (including the CAS) must roll back — no half-applied state."""
+    db = Database(str(tmp_path / "m.db"))
+    await db.connect()
+    await _seed_task(db)
+    assert db._connection is not None
+
+    # Pre-seed a row with the execution_id we're about to reuse, so the
+    # INSERT in start_execution collides on the PRIMARY KEY and raises.
+    await db._connection.execute(
+        "INSERT INTO execution_handles "
+        "(execution_id, entity_kind, entity_id, attempt, backend_id, "
+        "transport_ref, state, created_at, finished_at) "
+        "VALUES ('e1', 'task', 'other-entity', 1, 'local', 'ref', "
+        "'cleaned', '2026-07-23T00:00:00+00:00', NULL)"
+    )
+    await db._connection.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.start_execution(
+            entity_kind="task",
+            entity_id="t1",
+            expected_status="ready",
+            running_status="running",
+            execution_id="e1",
+            backend_id="docker",
+            transport_ref="docker:maestro-e1",
+            attempt=1,
+        )
+
+    # The CAS must have been rolled back along with the failed insert.
+    got = await db.get_task("t1")
+    assert got.status is TaskStatus.READY
+
+    # Only the pre-existing row survives — no partial/duplicate row.
+    cur = await db._connection.execute(
+        "SELECT entity_id, state FROM execution_handles WHERE execution_id = 'e1'"
+    )
+    rows = await cur.fetchall()
+    assert [dict(r) for r in rows] == [
+        {"entity_id": "other-entity", "state": "cleaned"}
+    ]
+    await db.close()
