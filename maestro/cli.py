@@ -54,6 +54,7 @@ from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConf
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
 from maestro.decomposer import ProjectDecomposer
+from maestro.event_log import create_event_logger
 from maestro.git import GitManager
 from maestro.logging_bridge import setup_logging
 from maestro.models import ArbiterMode, OrchestratorConfig, TaskStatus, WorkstreamStatus
@@ -529,6 +530,10 @@ async def _run_scheduler(
         workdir = Path(config.repo).expanduser()  # noqa: ASYNC240
         if log_dir is None:
             log_dir = workdir / "logs"
+
+        # Activate the structured event log (events.jsonl) — without this the
+        # module-global logger is None and every lifecycle event is dropped.
+        create_event_logger(log_dir)
 
         # Setup notifications
         notifications = create_notification_manager(config.notifications)
@@ -1325,6 +1330,12 @@ async def _run_orchestrator(
                 await db.delete_workstream(workstream.id)
 
     repo_path, workspace_base, log_dir = _resolve_orchestrator_paths(config, log_dir)
+
+    # Activate the structured event log (events.jsonl) — without this the
+    # module-global logger is None and every workstream lifecycle event is
+    # dropped (the dispatcher's event_logger_getter returns None).
+    create_event_logger(log_dir)
+
     lock_fd: int | None = None
 
     try:

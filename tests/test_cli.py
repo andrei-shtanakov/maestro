@@ -366,6 +366,44 @@ class TestOrchestratorResumeFlag:
             assert kwargs["notifier"] is not None
             assert callable(kwargs["on_status_change"])
 
+    async def test_run_orchestrator_activates_event_logger(
+        self,
+        temp_dir: Path,
+    ) -> None:
+        """`orchestrate` must activate the structured event log — otherwise
+        the module-global logger is None and every workstream lifecycle event
+        is silently dropped (the dispatcher's event_logger_getter returns
+        None)."""
+        config_path = _write_orchestrator_config(temp_dir)
+        db_path = temp_dir / "state.db"
+
+        with (
+            patch("maestro.cli.GitManager") as mock_git_mgr,
+            patch("maestro.cli.WorkspaceManager"),
+            patch("maestro.cli.ProjectDecomposer"),
+            patch("maestro.cli.PRManager"),
+            patch("maestro.cli.Orchestrator") as mock_orchestrator,
+            patch("maestro.cli.create_event_logger") as mock_create_logger,
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            mock_git_mgr.return_value.repo_path = config_path.parent
+            stats = SimpleNamespace(
+                total_workstreams=0, completed=0, failed=0, prs_created=0
+            )
+            orchestrator_instance = MagicMock()
+            orchestrator_instance.run = AsyncMock(return_value=stats)
+            mock_orchestrator.return_value = orchestrator_instance
+
+            await _run_orchestrator(
+                config_path=config_path,
+                db_path=db_path,
+                resume=False,
+                log_dir=None,
+            )
+
+            mock_create_logger.assert_called_once()
+
 
 # =============================================================================
 # Test: Run Command
