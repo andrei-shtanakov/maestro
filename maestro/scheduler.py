@@ -13,6 +13,7 @@ import contextlib
 import logging
 import signal
 import subprocess
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -167,6 +168,8 @@ class RunningTask:
         started_at: When the task started.
         log_file: Path to the log file.
         finalize_task: The single finalization task for this run, if started.
+        execution_id: The minted execution-handle id for non-local backends,
+            or ``None`` for the local path (no `execution_handles` row).
     """
 
     task: Task
@@ -174,6 +177,7 @@ class RunningTask:
     started_at: datetime
     log_file: Path
     finalize_task: "asyncio.Task | None" = None
+    execution_id: str | None = None
 
 
 @dataclass
@@ -1095,11 +1099,44 @@ class Scheduler:
             # notification here (§0: the notification now means "status is
             # running", not "process launched"; it fires even if the
             # launch below fails).
-            task = await self._transition(
-                task_id,
-                TaskStatus.RUNNING,
-                expected_status=TaskStatus.READY,
-            )
+            #
+            # Non-local backends mint a durable execution identity first: the
+            # READY->RUNNING CAS and the execution_handles insert are one
+            # atomic DB transaction (start_execution), so the committed
+            # transition is dispatched afterward via
+            # _dispatch_committed_transition rather than the plain
+            # _transition helper (mirrors the reset_for_retry_atomic idiom
+            # used elsewhere for atomically-committed writes). The local path
+            # is unchanged — still the plain _transition call.
+            if backend.id != "local":
+                execution_id = str(uuid.uuid4())
+                attempt = task.retry_count + 1
+                request = request.model_copy(
+                    update={
+                        "execution_id": execution_id,
+                        "entity_kind": "task",
+                        "attempt": attempt,
+                    }
+                )
+                await self._db.start_execution(
+                    entity_kind="task",
+                    entity_id=task_id,
+                    expected_status=TaskStatus.READY.value,
+                    running_status=TaskStatus.RUNNING.value,
+                    execution_id=execution_id,
+                    backend_id=backend.id,
+                    transport_ref=f"{backend.id}:maestro-{execution_id}",
+                    attempt=attempt,
+                )
+                task = await self._db.get_task(task_id)
+                await self._dispatch_committed_transition(task, frm=TaskStatus.READY)
+            else:
+                execution_id = None
+                task = await self._transition(
+                    task_id,
+                    TaskStatus.RUNNING,
+                    expected_status=TaskStatus.READY,
+                )
             self._retry_ready_times.pop(task_id, None)
 
             handle = await backend.run(request)
@@ -1110,6 +1147,7 @@ class Scheduler:
                 handle=handle,
                 started_at=datetime.now(UTC),
                 log_file=log_file,
+                execution_id=execution_id,
             )
 
             return True
@@ -1220,6 +1258,15 @@ class Scheduler:
                 # Process finished — finalize (reap/collect/cleanup) exactly
                 # once before dispatching on the outcome.
                 fin = await asyncio.shield(ensure_finalize_task(running_task))
+                exec_id = running_task.execution_id
+                if exec_id is not None:
+                    await self._db.mark_execution_state(
+                        exec_id, "terminal", allowed_from=["prepared", "running"]
+                    )
+                    if fin.cleaned:
+                        await self._db.mark_execution_state(
+                            exec_id, "cleaned", allowed_from=["terminal"]
+                        )
                 if fin.collect_error or fin.cleanup_error:
                     _obs_log.warning(
                         "execution.finalize.resource_fault",
@@ -1239,6 +1286,16 @@ class Scheduler:
                 if elapsed.total_seconds() > timeout_seconds:
                     await running_task.handle.terminate(grace_seconds=10.0)
                     await asyncio.shield(ensure_finalize_task(running_task))
+                    timeout_exec_id = running_task.execution_id
+                    if timeout_exec_id is not None:
+                        # Container was force-stopped: mark terminal only —
+                        # cleanup may not have been confirmed, so `cleaned`
+                        # would overclaim.
+                        await self._db.mark_execution_state(
+                            timeout_exec_id,
+                            "terminal",
+                            allowed_from=["prepared", "running"],
+                        )
                     await self._handle_task_timeout(task_id, running_task)
                     completed.append(task_id)
 

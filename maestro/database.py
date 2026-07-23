@@ -1262,15 +1262,18 @@ class Database:
     ) -> None:
         """Atomically CAS the entity to `running_status` and record a handle.
 
-        Single transaction: CAS-UPDATE the entity's status row, then insert
-        the `execution_handles` row in state `'prepared'`. If the CAS matches
-        no row (entity already left `expected_status`), the transaction is
-        rolled back and `ConcurrentModificationError` is raised. If the
-        subsequent INSERT fails for any reason, the transaction is also
-        rolled back before re-raising — the whole operation is all-or-
-        nothing: either the CAS and the insert both apply, or neither does.
-        No `execution_handles` row (and no CAS'd status) is ever left behind
-        on failure.
+        Single transaction: CAS-UPDATE the entity's status row (also
+        stamping `started_at` via `COALESCE`, mirroring `update_task_status`'s
+        RUNNING-transition behavior so a later terminal-status write can set
+        `completed_at` without failing the model's "completed_at requires
+        started_at" invariant), then insert the `execution_handles` row in
+        state `'prepared'`. If the CAS matches no row (entity already left
+        `expected_status`), the transaction is rolled back and
+        `ConcurrentModificationError` is raised. If the subsequent INSERT
+        fails for any reason, the transaction is also rolled back before
+        re-raising — the whole operation is all-or-nothing: either the CAS
+        and the insert both apply, or neither does. No `execution_handles`
+        row (and no CAS'd status) is ever left behind on failure.
 
         Args:
             entity_kind: `"task"` or `"workstream"` — selects the table the
@@ -1294,8 +1297,17 @@ class Database:
 
         table = "tasks" if entity_kind == "task" else "workstreams"
         cursor = await self._connection.execute(
-            f"UPDATE {table} SET status = ? WHERE id = ? AND status = ?",
-            (running_status, entity_id, expected_status),
+            f"""
+            UPDATE {table}
+            SET status = ?, started_at = COALESCE(started_at, ?)
+            WHERE id = ? AND status = ?
+            """,
+            (
+                running_status,
+                _format_datetime(datetime.now(UTC)),
+                entity_id,
+                expected_status,
+            ),
         )
         if cursor.rowcount == 0:
             await self._connection.rollback()
