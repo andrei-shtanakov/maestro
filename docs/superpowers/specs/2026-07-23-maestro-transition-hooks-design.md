@@ -1,9 +1,42 @@
 # Transition hooks — design
 
 - **Date:** 2026-07-23
-- **Status:** approved-in-review (brainstorming; architectural vector confirmed, corrections folded in)
+- **Status:** in review (brainstorming; architectural vector confirmed; r2 corrections folded in)
 - **Scope:** idea #10 from `../prograph-vault/authored/notes/2026-07-22-ideas-from-ai-repos-research.md`
   ("unified Phase enum + phase-transition hooks") — the **transition-hooks / anti-desync** half.
+
+> **This is an intentional behavior change, not a refactor.** Effects bind to
+> committed status transitions. That moves the moment of `TASK_STARTED`, adds
+> task lifecycle events that were never emitted, and adds workstream
+> events/notifications. See §0. Do not read any section as "1:1 parity".
+
+## 0. Behavior changes (intentional)
+
+Binding effects to committed transitions changes observable behavior. Each is
+deliberate and covered by a **contract test** (§9), not a parity test:
+
+- **`TASK_STARTED` notification timing.** Today it fires *after* a successful
+  `backend.run()` (scheduler.py:1049) — it means "process launched". After this
+  change it fires on entering `RUNNING` (before the launch attempt) — it means
+  "status is running". A launch that fails immediately will now still have
+  produced a `TASK_STARTED` notification.
+- **New task lifecycle events.** Transitions like `READY`, `RUNNING`, `DONE`,
+  `NEEDS_REVIEW`, `ABANDONED` did not emit `_emit_event` records before; they do
+  now. Pure observability gain.
+- **`FAILED` — deliberate task/workstream asymmetry.** For **tasks**, `FAILED`
+  is transient and frequently auto-retried; it emits a `TASK_FAILED` event but
+  **no notification** (matches today — the scheduler never notified on `FAILED`),
+  so retry churn doesn't storm the human; the actionable notification stays at
+  `NEEDS_REVIEW`. For **workstreams**, `FAILED` is a coarse-grained event (a
+  whole workstream failed) an operator wants to know about, so it emits both the
+  event **and** a `WORKSTREAM_FAILED` notification (§6 decision). The asymmetry
+  is intentional and reflects granularity, not an oversight.
+- **`TASK_TIMEOUT` stays a call-site notification** (scheduler.py:1499) — it is
+  an operation result (the monitor killed the process), not a bare transition;
+  it is not moved into the table (§5.2).
+- **Mode 2 gains events + four notifications** where it had none.
+
+These are documented in the changelog on merge.
 
 ## 1. Problem
 
@@ -85,13 +118,32 @@ about its type.
   working; new consumers read `entity_type`/`entity_id`. Workstream events set
   `entity_type="workstream"`, `entity_id=<ws id>`, `task_id=None`.
 - **`notifications.Notification`** is generalized: `status: TaskStatus |
-  WorkstreamStatus`, plus an `entity_kind: Literal["task","workstream"]` and
-  entity-neutral `subject_id` / `subject_title`. `from_task` is kept and
-  `from_workstream` added as the second factory. Channels format from the
-  entity-neutral fields and the title reads "Workstream …" vs "Task …" from
-  `entity_kind` — a channel never guesses the entity type. (Notification is a
-  transient in-process object, not a persisted contract, so renaming the two
-  fields is safe; the channel touch-points are updated in the same task.)
+  WorkstreamStatus`, plus `entity_kind: Literal["task","workstream"]` and
+  entity-neutral `subject_id` / `subject_title` (replacing `task_id` /
+  `task_title`). Channels format from the entity-neutral fields and the title
+  reads "Workstream …" vs "Task …" from `entity_kind` — a channel never guesses
+  the entity type. (Notification is a transient in-process object, not a
+  persisted contract, so renaming the two fields is safe; the channel
+  touch-points are updated in the same task.)
+
+**One construction contract — `from_subject`.** The dispatcher is
+entity-agnostic and must not pick a factory by kind at call time. The single
+constructor it calls is:
+
+```python
+@classmethod
+def from_subject(
+    cls,
+    subject: TransitionSubject,
+    event: NotificationEvent,
+    message: str | None = None,
+) -> Notification: ...
+```
+
+`from_task(task, event, message)` and `from_workstream(ws, event, message)` are
+kept as convenience adapters that build a `TransitionSubject` and delegate to
+`from_subject`. Same pattern for the event: the dispatcher builds the `Event`
+from the `subject`, never from a raw `Task`/`Workstream`.
 
 ### 3.3 The dispatcher
 
@@ -110,19 +162,50 @@ class TransitionDispatcher:
 ```
 
 `fire` is **async** (`NotificationManager.notify()` is async). It looks up the
-effect for `(frm, subject.status)` (§5), then, for each configured subscriber
-(all optional / None-safe):
+effect for `(frm, subject.status)` (§5) and drives the subscribers.
 
-- **event log** — logs `Event(event_type=effect.event, entity_type=subject.kind,
+### 3.3.1 Subscriber contract (resolves the empty-effect vs callback case)
+
+The status-change callback is **orthogonal to the effect table** — it reports
+*that* a transition happened, independent of whether the transition emits an
+event/notification. Precise contract:
+
+| condition | status callback | event sink | notification sink |
+|---|---|---|---|
+| `frm == to` (not a transition) | — | — | — |
+| real transition, **empty** effect | ✅ called | — | — |
+| real transition, effect has event/notif | ✅ called | ✅ if `effect.event` | ✅ if `effect.notification` |
+
+Total tables (§5.1) guarantee there is no fourth "unknown" combination. So
+`VALIDATING`/`PENDING` (empty effects) still fire the dashboard callback on a
+real transition — they just emit no event/notification.
+
+- **status-change callback** — `_on_status_change(id, frm, to)` (dashboard
+  feed), called on every real transition.
+- **event log** — `Event(event_type=effect.event, entity_type=subject.kind,
   entity_id=subject.id, task_id=<id if task else None>, message=message,
   details=details or {})` when `effect.event` is set.
-- **notification** — `notifier.notify(Notification.from_<kind>(subject, effect.notification, message))` when `effect.notification` is set.
-- **status-change callback** — the existing `_on_status_change(id, frm, to)`
-  hook (dashboard feed), always called on a real transition.
+- **notification** — `notifier.notify(Notification.from_subject(subject,
+  effect.notification, message))` when `effect.notification` is set.
 
 `details`/`message` (error text, retry count, exit code, …) are supplied by the
 call site — the table says *which* effect, the caller supplies *what data*.
-No-op when `frm == subject.status` (not a transition) or the effect is empty.
+
+### 3.3.2 Fail-isolation (subscribers run after commit)
+
+`fire` runs **after** the DB commit, so a subscriber raising must not corrupt the
+already-committed transition:
+
+- each subscriber is invoked in its **own** `try/except`;
+- an exception is logged and **swallowed** — the remaining subscribers still run;
+- `fire` never propagates a subscriber exception to its caller after a committed
+  transition (a raise there would make the caller think the transition failed,
+  and a retry would hit the CAS);
+- `asyncio.CancelledError` is the one exception **re-raised**, never swallowed —
+  cooperative cancellation must not be masked.
+
+This matters most for the status callback, which today is called directly and
+could throw (scheduler.py:295).
 
 ## 4. Transition primitives (per orchestration class)
 
@@ -130,13 +213,20 @@ No-op when `frm == subject.status` (not a transition) or the effect is empty.
 
 ```python
 async def _transition(
-    self, entity_id, to_status, *, expected_status, **fields
+    self,
+    entity_id,
+    to_status,
+    *,
+    expected_status,
+    details: dict | None = None,   # keyword-only: for the effect, NOT the DB
+    message: str | None = None,    # keyword-only: for the effect, NOT the DB
+    **fields,                      # DB columns only (error_message, pr_url, …)
 ) -> Entity:
     entity = await self._db.update_*_status(
         entity_id, to_status, expected_status=expected_status, **fields
     )
     await self._dispatcher.fire(
-        subject_of(entity), frm=expected_status, details=..., message=...
+        subject_of(entity), frm=expected_status, details=details, message=message
     )
     return entity
 ```
@@ -144,9 +234,10 @@ async def _transition(
 `expected_status` is **required**. `update_*_status(expected_status=…)` is a CAS;
 on success `expected_status` **is** the true `frm` (a plain pre-`get` would be
 unreliable under concurrent writes). If the CAS does not apply (row already
-moved), no effect fires. `**fields` (e.g. `error_message`, `pr_url`) pass
-through to the write. Optional `details`/`message` for the effect are threaded
-in by the caller.
+moved), no effect fires. `details`/`message` are **explicit keyword-only**
+parameters for the effect — kept out of `**fields` so they can never leak into
+the DB column patch. `**fields` (e.g. `error_message`, `pr_url`) pass through to
+the write only.
 
 ### 4.2 `_update_fields` — same-state patches (write, no dispatch)
 
@@ -178,14 +269,21 @@ async def _dispatch_committed_transition(self, entity, *, frm) -> None:
     await self._dispatcher.fire(subject_of(entity), frm=frm)
 ```
 
-For `reset_for_retry_atomic`, the `TASK_RETRYING` effect fires only on `ok=True`.
+`reset_for_retry_atomic()` returns only a `bool`, so the caller must
+**re-read** the entity after `ok is True` (`entity = await
+self._db.get_task(task_id)`) to build an accurate `TransitionSubject` before
+dispatching. The `TASK_RETRYING` effect fires only on `ok=True`; on `ok=False`
+(guard rejected the reset) nothing fires.
 
 ### 4.4 Delivery semantics
 
-Effects fire after the DB commit — **at-most-once best effort**. A crash between
-commit and `fire` drops that one effect; no rollback of the status. This is an
-intentional limitation (outbox = non-goal, §2). Startup recovery already
-reconciles *state*; it does not replay missed effects.
+Effects fire after the DB commit — **best-effort, non-durable delivery**. A
+crash between commit and `fire` drops that one effect (no status rollback), and
+a re-run of the orchestration code over the same state can in principle
+re-deliver an effect — the system provides **no** strict at-most-once or
+exactly-once guarantee without a durable delivery marker. Guaranteed/deduped
+delivery would need an outbox (non-goal, §2). Startup recovery reconciles
+*state*; it does not replay or dedupe effects.
 
 ## 5. Effect tables (single source of truth)
 
@@ -220,58 +318,78 @@ validation outcome, not "entered DONE"), git events, and scheduler-lifecycle
 events (`SCHEDULER_STARTED/STOPPED`). The table is for "entity entered status X",
 nothing else.
 
-### 5.3 Task table (encodes current scheduler behavior 1:1)
+### 5.3 Task table (intentional behavior — see §0, NOT parity)
 
-Derived verbatim from today's call sites so behavior is unchanged, e.g.:
+This table binds effects to committed transitions. It is a deliberate behavior
+**expansion** over today's scattered emits (§0): every transition now emits an
+event; notifications are chosen for hygiene (no notification on the transient
+`FAILED`; the actionable notification stays at `NEEDS_REVIEW`).
 
-| status (entry) | event | notification |
-|---|---|---|
-| `READY` | `TASK_READY` | — |
-| `AWAITING_APPROVAL` | — | `TASK_AWAITING_APPROVAL` |
-| `RUNNING` | `TASK_STARTED` | `TASK_STARTED` |
-| `VALIDATING` | `StatusEffect()` (validation events fire at their own site) | — |
-| `DONE` | `TASK_COMPLETED` | `TASK_COMPLETED` |
-| `FAILED` | `TASK_FAILED` | `TASK_FAILED` |
-| `NEEDS_REVIEW` | `TASK_NEEDS_REVIEW` | `TASK_NEEDS_REVIEW` |
-| `ABANDONED` | `TASK_ABANDONED` | — |
-| `PENDING` | `StatusEffect()` | — |
+| status (entry) | event | notification | vs today |
+|---|---|---|---|
+| `PENDING` | `StatusEffect()` | — | unchanged (no effect) |
+| `READY` | `TASK_READY` | — | **new event** |
+| `AWAITING_APPROVAL` | `StatusEffect()` | `TASK_AWAITING_APPROVAL` | notif unchanged¹ |
+| `RUNNING` | `TASK_STARTED` | `TASK_STARTED` | **new event**; notif **timing shifts** to entry (§0) |
+| `VALIDATING` | `StatusEffect()` | — | unchanged (validation events fire at their own site) |
+| `DONE` | `TASK_COMPLETED` | `TASK_COMPLETED` | **new event**; notif unchanged |
+| `FAILED` | `TASK_FAILED` | — | **new event; deliberately NO notif** (§0) |
+| `NEEDS_REVIEW` | `TASK_NEEDS_REVIEW` | `TASK_NEEDS_REVIEW` | **new event**; notif unchanged |
+| `ABANDONED` | `TASK_ABANDONED` | — | **new event** |
 
-The exact per-status values are lifted from the current sites during
-implementation; the table above is the shape, and the scheduler behavior-parity
-tests (§9) pin that it matches today.
+¹ Where the `AWAITING_APPROVAL` transition occurs inside the scheduler loop;
+if it is CLI-driven it is out of scope for firing (§2), but the entry is the SSOT.
+
+`TASK_TIMEOUT` is **not** in the table (call-site notification, §0/§5.2). The
+exact "vs today" mapping is pinned by the contract tests (§9).
 
 ### 5.4 Pair overrides (from-aware)
 
 `TRANSITION_OVERRIDES: dict[tuple[frm, to], StatusEffect]`, consulted before the
-entry table:
+entry table. Every entry names concrete enums so the SSOT is complete:
 
-| (frm → to) | effect | note |
-|---|---|---|
-| `FAILED → READY` | `TASK_RETRYING` / `WORKSTREAM_RETRYING` | retry, not a plain re-ready; fires from `reset_for_retry_atomic` on ok=True |
-| `AWAITING_APPROVAL → READY` | `TASK_APPROVED` | approval, not plain ready (EventType already exists) |
-| `NEEDS_REVIEW → READY` | approval/requeue event | operator requeue, not plain ready |
+| (frm → to) | task effect | workstream effect | note |
+|---|---|---|---|
+| `FAILED → READY` | `StatusEffect(TASK_RETRYING)` | `StatusEffect(WORKSTREAM_RETRYING)` | retry, not plain re-ready; fires from `reset_for_retry_atomic` on ok=True |
+| `AWAITING_APPROVAL → READY` | `StatusEffect(TASK_APPROVED)` | — (workstreams have no `AWAITING_APPROVAL`) | approval before first run |
+| `NEEDS_REVIEW → READY` | `StatusEffect(TASK_APPROVED)` | `StatusEffect(WORKSTREAM_APPROVED)` | operator requeue after review |
 
-Overrides are **documented for all three** as the SSOT, but only fire where the
-transition occurs inside Scheduler/Orchestrator (§2). `FAILED → READY` (retry)
-fires from the scheduler. The two approval overrides currently transition in the
-CLI and therefore do not fire this iteration — the table records their intended
-effect for when the CLI/REST layers adopt the dispatcher. `WORKSTREAM_RETRYING`
-is added to `EventType` (§6).
+`TASK_APPROVED` already exists in `EventType`; `WORKSTREAM_RETRYING` and
+`WORKSTREAM_APPROVED` are added (§6).
+
+**Firing scope.** Overrides fire only where the transition occurs inside
+Scheduler/Orchestrator (§2). `FAILED → READY` (retry) fires from the scheduler.
+The two approval overrides currently transition in the **CLI** (`maestro
+approve`, `maestro workstream-approve`), so they do **not** fire this iteration —
+the table records their intended effect for when the CLI/REST layer adopts the
+dispatcher. The added `WORKSTREAM_APPROVED` event therefore has no emitter yet;
+it exists to keep the override SSOT concrete and complete (documented as
+deferred-emit).
 
 ## 6. Mode-2 additions
 
 - **`event_log.EventType`**: `WORKSTREAM_READY`, `WORKSTREAM_DECOMPOSING`,
   `WORKSTREAM_RUNNING`, `WORKSTREAM_MERGING`, `WORKSTREAM_PR_CREATED`,
   `WORKSTREAM_DONE`, `WORKSTREAM_FAILED`, `WORKSTREAM_NEEDS_REVIEW`,
-  `WORKSTREAM_ABANDONED`, `WORKSTREAM_RETRYING`.
+  `WORKSTREAM_ABANDONED`, `WORKSTREAM_RETRYING`, `WORKSTREAM_APPROVED`
+  (`WORKSTREAM_APPROVED` is deferred-emit — §5.4).
 - **`notifications.NotificationEvent`** — **four** workstream notifications:
   `WORKSTREAM_STARTED` (on `RUNNING`), `WORKSTREAM_COMPLETED` (on `DONE`),
-  `WORKSTREAM_FAILED` (on `FAILED`), `WORKSTREAM_NEEDS_REVIEW` (on
-  `NEEDS_REVIEW`). **No** `WORKSTREAM_PR_CREATED` notification — `PR_CREATED` is
-  an informational intermediate status the automatic flow continues past; it is
-  not an operator gate. `NEEDS_REVIEW` **is** a gate and notifies. (Symmetric
-  with tasks, which already notify on `TASK_NEEDS_REVIEW`.)
-- **`Notification.from_workstream(ws, event, message=None)`** factory (§3.2).
+  `WORKSTREAM_FAILED` (on `FAILED` — see the granularity asymmetry in §0),
+  `WORKSTREAM_NEEDS_REVIEW` (on `NEEDS_REVIEW`). **No** `WORKSTREAM_PR_CREATED`
+  notification — `PR_CREATED` is an informational intermediate status the
+  automatic flow continues past; it is not an operator gate. `NEEDS_REVIEW`
+  **is** a gate and notifies.
+- **`Notification.from_workstream(ws, event, message=None)`** convenience adapter
+  → `from_subject` (§3.2).
+
+The workstream effect table (§5.1 total): `RUNNING →
+(WORKSTREAM_RUNNING event, WORKSTREAM_STARTED notif)`, `DONE → (WORKSTREAM_DONE,
+WORKSTREAM_COMPLETED)`, `FAILED → (WORKSTREAM_FAILED, WORKSTREAM_FAILED)`,
+`NEEDS_REVIEW → (WORKSTREAM_NEEDS_REVIEW, WORKSTREAM_NEEDS_REVIEW)`, `MERGING →
+(WORKSTREAM_MERGING, —)`, `PR_CREATED → (WORKSTREAM_PR_CREATED, —)`,
+`DECOMPOSING → (WORKSTREAM_DECOMPOSING, —)`, `READY → (WORKSTREAM_READY, —)`,
+`ABANDONED → (WORKSTREAM_ABANDONED, —)`, `PENDING → StatusEffect()`.
 - Orchestrator: the ~35 `update_workstream_status` sites are split into
   `_transition` (real transitions) and `_update_fields` (patches like
   `orchestrator.py:550`), and wired through the dispatcher.
@@ -296,20 +414,33 @@ the declarative table.
 **`transitions.py` unit tests:**
 
 - Totality: `set(TASK_EFFECTS) == set(TaskStatus)` and the workstream analog.
-- `fire` invokes exactly the configured subscribers for a given effect; empty
-  effect / same-state → no subscriber called; each subscriber None-safe.
+- Subscriber contract (§3.3.1) — the full truth table:
+  - `frm == to` → **no** subscriber called (not even the callback).
+  - real transition + **empty** effect → **only** the status callback fires
+    (event/notification sinks silent). Assert this for `VALIDATING`/`PENDING`.
+  - real transition + event/notif effect → callback **plus** the matching sinks.
+  - each sink None-safe (unconfigured subscriber skipped).
 - Pair overrides beat the entry table for `(FAILED, READY)` etc.
+- **Fail-isolation (§3.3.2):** a subscriber that raises is logged and swallowed,
+  the other subscribers still fire, and `fire` does not propagate the exception;
+  a subscriber raising `asyncio.CancelledError` **is** re-raised (not swallowed).
 - Envelope: task event carries `task_id` + `entity_type="task"`; workstream
   event carries `entity_id` + `entity_type="workstream"` + `task_id=None`;
-  `from_workstream` sets `entity_kind` and a `WorkstreamStatus`.
+  `from_workstream`/`from_task` delegate to `from_subject` and set `entity_kind`
+  + the correct `Task|WorkstreamStatus`.
 
-**Scheduler behavior-parity:** for each transition, the same event(s) and
-notification(s) fire as before this change (pin the table against current
-behavior); `reset_for_retry_atomic` fires `TASK_RETRYING` only on `ok=True`.
+**Scheduler contract tests (behavior change — §0, NOT parity):** assert the
+*new* contract per transition — the intended event(s) and notification(s) fire,
+including the documented changes: `TASK_STARTED` notification now fires on
+entering `RUNNING`; `FAILED` emits `TASK_FAILED` event with **no** notification;
+new lifecycle events appear; `TASK_TIMEOUT` still fires at its call site.
+`reset_for_retry_atomic` fires `TASK_RETRYING` only on `ok=True`, and the
+subject is built from the **re-read** task (§4.3).
 
 **Orchestrator:** each workstream transition fires its `WORKSTREAM_*` event; the
 four notifications fire on `RUNNING`/`DONE`/`FAILED`/`NEEDS_REVIEW` and **not**
-on `PR_CREATED`; `_update_fields` (generation_pid clear) fires nothing.
+on `PR_CREATED`/`MERGING`/`DECOMPOSING`; `_update_fields` (generation_pid clear,
+`orchestrator.py:550`) fires nothing.
 
 **Envelope back-compat:** an existing `events.jsonl` consumer keying on `task_id`
 still reads task events unchanged.
