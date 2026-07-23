@@ -59,6 +59,44 @@ class TestEvent:
         assert "message" not in data
         assert "details" not in data
 
+    def test_event_has_entity_envelope_defaulting_to_task(self) -> None:
+        """Test that the entity envelope defaults to task and keeps task_id."""
+        e = Event(event_type=EventType.TASK_STARTED, task_id="t1")
+        assert e.entity_type == "task"
+        assert e.entity_id is None  # task events keep using task_id
+        line = json.loads(e.to_json_line())
+        assert line["task_id"] == "t1"
+        assert line["entity_type"] == "task"
+
+    def test_workstream_event_uses_entity_id(self) -> None:
+        """Test that workstream events carry entity_id and null task_id."""
+        e = Event(
+            event_type=EventType.WORKSTREAM_RUNNING,
+            entity_type="workstream",
+            entity_id="w1",
+        )
+        line = json.loads(e.to_json_line())
+        assert line["entity_type"] == "workstream"
+        assert line["entity_id"] == "w1"
+        assert line["task_id"] is None
+
+    def test_all_workstream_event_types_exist(self) -> None:
+        """Test that all WORKSTREAM_* EventType members are defined."""
+        for name in [
+            "WORKSTREAM_READY",
+            "WORKSTREAM_DECOMPOSING",
+            "WORKSTREAM_RUNNING",
+            "WORKSTREAM_MERGING",
+            "WORKSTREAM_PR_CREATED",
+            "WORKSTREAM_DONE",
+            "WORKSTREAM_FAILED",
+            "WORKSTREAM_NEEDS_REVIEW",
+            "WORKSTREAM_ABANDONED",
+            "WORKSTREAM_RETRYING",
+            "WORKSTREAM_APPROVED",
+        ]:
+            assert hasattr(EventType, name)
+
 
 class TestEventLogger:
     """Tests for EventLogger."""
