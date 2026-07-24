@@ -114,7 +114,18 @@ class FakeExecutionBackend:
 
     id = "fake"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        isolator: object | None = None,
+        *,
+        backend_id: str = "local",
+        docker: object | None = None,
+    ) -> None:
+        # Accepts (and ignores) the same construction kwargs the registry
+        # resolver now passes to `LocalBackend` (see `_build_local` in
+        # `maestro/execution/resolver.py`), so monkeypatching this class in
+        # for `LocalBackend` tolerates the resolver's call signature.
+        del isolator, backend_id, docker
         # Kept alive for the scheduler's whole lifetime (unlike
         # `_running_tasks`, which is cleared on completion/cleanup), so
         # tests can still inspect terminate/kill calls after a run finishes.
