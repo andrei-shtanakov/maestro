@@ -68,6 +68,7 @@ include = ["maestro*"]
 
 [tool.setuptools.package-data]
 "maestro.resources" = ["*.toml"]
+"maestro.execution.resources" = ["*.py"]
 
 [tool.pyrefly]
 project-includes = [

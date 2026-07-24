@@ -1394,6 +1394,7 @@ class TestSchemaMigrationsJournal:
                 (6, "gates_v13_gate_approvals"),
                 (7, "execution_handles"),
                 (8, "entity_backend_columns"),
+                (9, "ssh_handle_columns"),
             ]
         finally:
             await db.close()
@@ -1417,7 +1418,7 @@ class TestSchemaMigrationsJournal:
             )
             row = await cursor.fetchone()
             assert row is not None
-            assert row["n"] == 8
+            assert row["n"] == 9
         finally:
             await db2.close()
 
@@ -1498,6 +1499,7 @@ class TestSchemaMigrationsJournal:
                 (6, "gates_v13_gate_approvals"),
                 (7, "execution_handles"),
                 (8, "entity_backend_columns"),
+                (9, "ssh_handle_columns"),
             ]
             # Sanity: the idempotent ALTERs must not have fired twice.
             cursor = await db._connection.execute("PRAGMA table_info(tasks)")

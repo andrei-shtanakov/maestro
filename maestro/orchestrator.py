@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.changed_paths import changed_paths_since
@@ -29,12 +29,21 @@ from maestro.execution.docker_cli import DockerCli
 from maestro.execution.docker_recovery import (
     GC_CLEAN_OUTCOMES,
     DockerProbe,
+    RecoveryVerdict,
     gc_terminal_handle,
     probe_execution,
 )
 from maestro.execution.finalize import ensure_finalize_task
-from maestro.execution.models import CollectPolicy, ExecutionRequest
+from maestro.execution.models import (
+    CollectPolicy,
+    ExecutionHandleRef,
+    ExecutionRequest,
+    ProgressMirrorPolicy,
+)
 from maestro.execution.resolver import BackendResolver
+from maestro.execution.ssh_backend import SshBackend
+from maestro.execution.ssh_launch import decode_transport_ref
+from maestro.execution.ssh_recovery import gc_ssh_terminal, probe_ssh
 from maestro.gates import (
     BLOCK_REASON_PREFIX,
     ApprovalMarker,
@@ -121,6 +130,59 @@ _STRANDED_INFLIGHT = (
     WorkstreamStatus.PR_CREATED,
 )
 
+_SSH_GC_CLEAN_OUTCOMES = frozenset({"removed", "no owner marker; skipped"})
+"""`gc_ssh_terminal` outcomes after which a `collected` handle is safe to
+mark `cleaned` — nothing remote is left to account for."""
+
+
+def build_ssh_execution_request(
+    *,
+    workstream_id: str,
+    workspace: str,
+    log_file: str,
+    cmd: list[str],
+    execution_id: str,
+    attempt: int,
+    mirror_dir: str,
+) -> ExecutionRequest:
+    """ExecutionRequest for a remote (ssh) Mode-2 workstream: whole-worktree
+    collect + WAL-safe progress mirror. Secrets flow via the backend's
+    secret_env allowlist (env-file), never inherit_env."""
+    return ExecutionRequest(
+        run_id=workstream_id,
+        argv=cmd,
+        workdir=Path(workspace),
+        log_path=Path(log_file),
+        inherit_env=False,
+        collect=CollectPolicy(
+            mode="whole_worktree", conflict_policy="fail", on_failure="collect"
+        ),
+        progress_mirror=ProgressMirrorPolicy(
+            kind="spec_runner_sqlite",
+            remote_globs=[f".executor-{SPEC_PREFIX}state.db"],
+            local_dir=Path(mirror_dir),
+            interval_seconds=2.0,
+        ),
+        required_tools=["spec-runner"],
+        execution_id=execution_id,
+        entity_kind="workstream",
+        attempt=attempt,
+        backend_id="",  # set by the caller via model_copy (existing pattern)
+    )
+
+
+def _handle_ref_from_row(row: dict[str, Any]) -> ExecutionHandleRef:
+    """Rebuild an ExecutionHandleRef from an execution_handles DB row."""
+    return ExecutionHandleRef(
+        backend_id=row["backend_id"],
+        run_id=row["entity_id"],
+        transport_ref=row["transport_ref"],
+        status_marker=row.get("status_marker"),
+        started_at=datetime.fromisoformat(row["created_at"]),
+        workdir_mirror_path=None,
+        state_mirror_path=None,
+    )
+
 
 @dataclass
 class RunningWorkstream:
@@ -131,7 +193,10 @@ class RunningWorkstream:
     starting a duplicate. ``execution_id`` is the durable execution-handle id
     for a non-local backend (``None`` for the local path, which persists no
     handle). ``backend_id`` is the resolved execution backend id (e.g.
-    "local", "docker") this workstream was spawned on.
+    "local", "docker") this workstream was spawned on. ``mirror_dir`` is the
+    local WAL-mirror directory `_update_progress` reads from for an ssh
+    execution (``None`` for local/docker, which read the live workspace
+    ``spec`` dir directly).
     """
 
     workstream: Workstream
@@ -142,6 +207,7 @@ class RunningWorkstream:
     finalize_task: "asyncio.Task | None" = None
     execution_id: str | None = None
     backend_id: str = "local"
+    mirror_dir: Path | None = None
 
 
 @dataclass
@@ -319,11 +385,12 @@ class Orchestrator:
         can advance them. In-flight strands reset to READY (no retry, no
         error_message); a RUNNING workstream whose recorded process is still
         alive goes to NEEDS_REVIEW instead (never re-run over a live orphan);
-        a RUNNING workstream whose process looks dead but whose docker-backed
-        execution_handles row can't rule out a live/leftover container (Task
-        18: `probe_execution`, fail-closed) also goes to NEEDS_REVIEW; FAILED
-        workstreams reconcile by the retry rule. Best-effort per workstream;
-        never raises. `terminal`-state handles (any entity) are swept for
+        a RUNNING workstream whose process looks dead but whose non-local
+        execution_handles row can't rule out a live/leftover execution
+        (Task 18: docker `probe_execution`; Task 16: ssh `probe_ssh`, both
+        fail-closed) also goes to NEEDS_REVIEW; FAILED workstreams reconcile
+        by the retry rule. Best-effort per workstream; never raises.
+        `terminal`/`collected`-state handles (any entity) are swept for
         ownership-checked GC as a side effect — see `_gc_terminal_handles`."""
         recovered = 0
         open_handles = await self._db.get_open_execution_handles()
@@ -333,10 +400,33 @@ class Orchestrator:
             if h["entity_kind"] == "workstream"
             and h["state"] in ("prepared", "running")
         }
+        # Parallel lookup for handles that already reached the terminal/collected
+        # window: finalize's `on_terminal` persisted the marker, but the center
+        # crashed before `collect` confirmed the remote diff was applied. For SSH
+        # these must NOT be silently re-run (spec §G/§J) — see the pre-empt check
+        # at the top of the loop. (Rows in these states are returned by
+        # `get_open_execution_handles` alongside prepared/running.)
+        workstream_terminal_handles = {
+            h["entity_id"]: h
+            for h in open_handles
+            if h["entity_kind"] == "workstream"
+            and h["state"] in ("terminal", "collected")
+        }
 
         for state in _STRANDED_INFLIGHT:
             for w in await self._db.get_workstreams_by_status(state):
                 try:
+                    # SSH terminal/collect window (spec §G/§J): an ssh execution
+                    # stranded after its terminal marker but before collect must
+                    # never re-run over uncollected remote changes — park it for
+                    # review with the remote tmp preserved, BEFORE the generic
+                    # pid/reset logic (SSH os_pid is None, so live-orphan detection
+                    # would otherwise let it fall through to FAILED->READY).
+                    term_row = workstream_terminal_handles.get(w.id)
+                    if term_row is not None and self._is_ssh_terminal_strand(term_row):
+                        await self._route_ssh_terminal_strand(w.id, state, term_row)
+                        recovered += 1
+                        continue
                     orphan_pid = (
                         w.process_pid
                         if state is WorkstreamStatus.RUNNING
@@ -345,15 +435,15 @@ class Orchestrator:
                         else None
                     )
                     live_orphan = _maybe_live_orphan(orphan_pid)
-                    docker_needs_review = False
+                    handle_needs_review = False
                     if not live_orphan and state is WorkstreamStatus.RUNNING:
-                        docker_needs_review = await self._probe_docker_workstream(
+                        handle_needs_review = await self._probe_open_handle(
                             w.id, workstream_handles
                         )
-                    if docker_needs_review:
+                    if handle_needs_review:
                         self._logger.warning(
                             "Workstream '%s' stranded in RUNNING with a "
-                            "possibly-live container after restart — sending "
+                            "possibly-live execution after restart — sending "
                             "to NEEDS_REVIEW; verify and clean it up before "
                             "resume",
                             w.id,
@@ -502,25 +592,93 @@ class Orchestrator:
 
         return recovered
 
-    async def _probe_docker_workstream(
+    def _is_ssh_terminal_strand(self, handle_row: dict[str, Any]) -> bool:
+        """True if `handle_row` is an SSH-resolved execution stranded in the
+        terminal/collected window — the case that must route to NEEDS_REVIEW
+        rather than silently re-run (spec §G/§J). Docker rows return False
+        (docker `collect` is a no-op, so its reset-and-rerun stays safe)."""
+        if handle_row["state"] not in ("terminal", "collected"):
+            return False
+        try:
+            backend = self._backends.resolve(handle_row["backend_id"])
+        except Exception:
+            return False
+        return isinstance(backend, SshBackend)
+
+    async def _route_ssh_terminal_strand(
+        self,
+        workstream_id: str,
+        state: WorkstreamStatus,
+        handle_row: dict[str, Any],
+    ) -> None:
+        """Park an SSH workstream stranded in the terminal/collect window for
+        review, preserving the remote tmp. A crash between the terminal marker
+        and collect cannot prove the remote diff was applied, so re-running
+        would discard uncollected remote changes — route to NEEDS_REVIEW
+        (the `collected`-row remote tmp is GC'd separately by the ownership-
+        checked `_gc_terminal_handles` sweep; a `terminal` row is left intact)."""
+        remote_dir = handle_row.get("remote_dir") or "<unknown>"
+        reason = (
+            f"ssh execution stranded in '{handle_row['state']}' after restart "
+            f"(crash between terminal marker and collect); remote workspace "
+            f"preserved at {remote_dir} — verify/collect before resuming"
+        )
+        self._logger.warning(
+            "Workstream '%s' stranded in %s with an ssh execution in the "
+            "terminal/collect window — sending to NEEDS_REVIEW; %s",
+            workstream_id,
+            state.value,
+            reason,
+        )
+        await self._transition(
+            workstream_id, WorkstreamStatus.FAILED, expected_status=state
+        )
+        await self._transition(
+            workstream_id,
+            WorkstreamStatus.NEEDS_REVIEW,
+            expected_status=WorkstreamStatus.FAILED,
+            process_pid=None,
+            generation_pid=None,
+            message=reason,
+            error_message=reason,
+        )
+        self._stats.failed += 1
+
+    async def _probe_open_handle(
         self, workstream_id: str, workstream_handles: dict[str, dict[str, Any]]
     ) -> bool:
-        """Probe a docker-backed workstream's open handle for a possibly-
-        live container (Task 18: `probe_execution`, fail-closed).
+        """Probe a non-local workstream's open handle for a possibly-live
+        execution (Task 18: docker `probe_execution`; Task 16: ssh
+        `probe_ssh`, both fail-closed).
 
         No-op (returns False) when there is no open, non-cleaned handle row
         for this workstream — a local-backed workstream (or one whose
-        handle already reached `terminal`/`cleaned`) is always unaffected,
-        preserving pre-Task-18 recovery behavior exactly.
+        handle already reached `terminal`/`collected`/`cleaned`) is always
+        unaffected, preserving pre-Task-18 recovery behavior exactly.
 
-        When the verdict confirms no container is left, the open handle row
-        is closed (terminal -> cleaned) here so it doesn't linger open and
-        shadow the workstream's next attempt after it's recovered to READY.
+        SSH is fail-closed by design: `probe_ssh` always returns
+        `needs_review=True` (a remote terminal marker cannot prove collect
+        already applied), so an SSH-backed row here is never silently
+        reclaimed. When the docker verdict confirms no container is left,
+        the open handle row is closed (terminal -> cleaned) here so it
+        doesn't linger open and shadow the workstream's next attempt after
+        it's recovered to READY.
         """
         row = workstream_handles.get(workstream_id)
         if row is None:
             return False
-        verdict = await probe_execution(row["execution_id"], self._docker)
+        backend_id = row["backend_id"]
+        if backend_id == "docker":
+            verdict = await probe_execution(row["execution_id"], self._docker)
+        else:
+            backend = self._backends.resolve(backend_id)
+            if isinstance(backend, SshBackend):
+                ref = _handle_ref_from_row(row)
+                verdict = await probe_ssh(backend._ssh, ref)
+            else:
+                verdict = RecoveryVerdict(
+                    True, f"unsupported backend {backend_id!r} for recovery probe"
+                )
         if not verdict.needs_review:
             await self._db.mark_execution_state(
                 row["execution_id"], "terminal", allowed_from=["prepared", "running"]
@@ -531,30 +689,78 @@ class Orchestrator:
         return verdict.needs_review
 
     async def _gc_terminal_handles(self, handles: list[dict[str, Any]]) -> int:
-        """Best-effort, ownership-checked GC sweep for `terminal` handles.
+        """Best-effort, ownership-checked GC sweep for settled handles.
 
         Mirrors `StateRecovery._gc_terminal_handles` (Mode 1): a `terminal`
-        handle means the entity behind it already reached a settled status
-        (finalize ran) but container cleanup was never confirmed. This only
-        removes the leftover container (if any) and marks the handle
-        `cleaned` — it never touches entity status. Swept across all entity
-        kinds since the handle table is shared. A row whose outcome is
-        ambiguous (multiple matches / label mismatch / probe error) is left
-        as `terminal` for the next sweep or a human to resolve.
+        (docker) or `collected` (ssh) handle means the entity behind it
+        already reached — or passed through — a settled point (finalize
+        ran) but the resource-cleanup confirmation was never persisted.
+        This only removes the leftover container/remote artifacts and marks
+        the handle `cleaned` — it never touches entity status. Swept across
+        all entity kinds since the handle table is shared.
+
+        Docker accepts either `terminal` or `collected`: `collect()` is a
+        no-op for docker, so both states are equally safe to sweep (the
+        phased finalize wiring, Task 16, can leave a docker row at either
+        depending on exactly when a crash lands). SSH only ever sweeps
+        `collected` — a `terminal`-but-not-`collected` SSH row means the
+        remote diff was never confirmed applied, so it is left for human
+        review (`ssh_recovery.probe_ssh` is fail-closed) rather than
+        silently removed here — this is the SSH parallel of docker's
+        terminal -> cleaned GC sweep.
+
+        A row whose outcome is ambiguous (multiple container matches /
+        label mismatch / probe error / no owner marker / resolve failure)
+        is left in place for the next sweep or a human to resolve.
         """
         swept = 0
         for row in handles:
-            if row["state"] != "terminal":
+            state = row["state"]
+            backend_id = row["backend_id"]
+            if backend_id == "docker":
+                if state not in ("terminal", "collected"):
+                    continue
+                outcome = await gc_terminal_handle(row, self._docker)
+                if outcome in GC_CLEAN_OUTCOMES:
+                    await self._db.mark_execution_state(
+                        row["execution_id"], "cleaned", allowed_from=[state]
+                    )
+                    swept += 1
+                else:
+                    self._logger.warning(
+                        "recovery: GC left handle %s (%s %s) as %s: %s",
+                        row["execution_id"],
+                        row["entity_kind"],
+                        row["entity_id"],
+                        state,
+                        outcome,
+                    )
                 continue
-            outcome = await gc_terminal_handle(row, self._docker)
-            if outcome in GC_CLEAN_OUTCOMES:
+            if state != "collected":
+                continue
+            try:
+                backend = self._backends.resolve(backend_id)
+                if not isinstance(backend, SshBackend):
+                    continue
+                ref = _handle_ref_from_row(row)
+                outcome = await gc_ssh_terminal(backend._ssh, ref)
+            except Exception as e:
+                self._logger.warning(
+                    "recovery: ssh GC failed for handle %s (%s %s): %s",
+                    row["execution_id"],
+                    row["entity_kind"],
+                    row["entity_id"],
+                    e,
+                )
+                continue
+            if outcome in _SSH_GC_CLEAN_OUTCOMES:
                 await self._db.mark_execution_state(
-                    row["execution_id"], "cleaned", allowed_from=["terminal"]
+                    row["execution_id"], "cleaned", allowed_from=["collected"]
                 )
                 swept += 1
             else:
                 self._logger.warning(
-                    "recovery: GC left handle %s (%s %s) as terminal: %s",
+                    "recovery: GC left handle %s (%s %s) as collected: %s",
                     row["execution_id"],
                     row["entity_kind"],
                     row["entity_id"],
@@ -867,7 +1073,44 @@ class Orchestrator:
                 )
                 return
 
+        # SSH capability gate (spec C.4): reachability (healthcheck) does not
+        # prove the remote host actually has `spec-runner` on PATH. Probe it
+        # BEFORE the READY->RUNNING CAS so a missing remote tool routes READY
+        # -> NEEDS_REVIEW (mirroring the healthcheck-failure block) instead of
+        # spawning a supervisor whose workload can never exec. SSH-only;
+        # local/docker are unaffected.
+        if isinstance(backend, SshBackend):
+            cap = await backend.can_run(
+                ExecutionRequest(
+                    run_id=workstream_id,
+                    argv=["spec-runner"],
+                    workdir=workspace,
+                    log_path=self._log_dir / f"{workstream_id}.log",
+                    collect=CollectPolicy(mode="none"),
+                    required_tools=["spec-runner"],
+                )
+            )
+            if not cap.ok:
+                reason = (
+                    f"backend {backend.id} missing required tools on remote: "
+                    f"{cap.missing_tools}"
+                )
+                self._logger.warning(
+                    "Workstream '%s' backend can_run gate failed: %s",
+                    workstream_id,
+                    reason,
+                )
+                await self._transition(
+                    workstream_id,
+                    WorkstreamStatus.NEEDS_REVIEW,
+                    expected_status=WorkstreamStatus.READY,
+                    message=reason,
+                    error_message=reason,
+                )
+                return
+
         execution_id: str | None = None
+        attempt: int = 1
         request_launch_fields: dict[str, object] = {}
 
         if backend.id != "local":
@@ -915,15 +1158,32 @@ class Orchestrator:
         if self._config.callback_url:
             cmd.extend(["--callback-url", self._config.callback_url])
 
-        request = ExecutionRequest(
-            run_id=workstream_id,
-            argv=cmd,
-            workdir=workspace,
-            log_path=log_file,
-            inherit_env=True,
-            collect=CollectPolicy(mode="none"),
-            required_tools=["spec-runner"],
-        )
+        mirror_dir: Path | None = None
+        if isinstance(backend, SshBackend):
+            # Remote (ssh) execution: whole-worktree collect on completion,
+            # plus a live progress mirror — spec-runner's sqlite state lives
+            # only on the remote host while the run is in flight, so
+            # `_update_progress` reads from the mirror instead (Task 16).
+            mirror_dir = self._log_dir / f"{workstream_id}.mirror"
+            request = build_ssh_execution_request(
+                workstream_id=workstream_id,
+                workspace=str(workspace),
+                log_file=str(log_file),
+                cmd=cmd,
+                execution_id=cast("str", execution_id),
+                attempt=attempt,
+                mirror_dir=str(mirror_dir),
+            )
+        else:
+            request = ExecutionRequest(
+                run_id=workstream_id,
+                argv=cmd,
+                workdir=workspace,
+                log_path=log_file,
+                inherit_env=True,
+                collect=CollectPolicy(mode="none"),
+                required_tools=["spec-runner"],
+            )
 
         request = request.model_copy(
             update={"backend_id": backend.id, **request_launch_fields}
@@ -949,7 +1209,23 @@ class Orchestrator:
             log_file=log_file,
             execution_id=execution_id,
             backend_id=backend.id,
+            mirror_dir=mirror_dir,
         )
+
+        if isinstance(backend, SshBackend):
+            # Persist the coordinates SshBackend.run() actually minted (the
+            # JSON transport_ref, remote_dir, status_marker) — start_execution
+            # only seeded a plain-string placeholder before the launch, so
+            # without this write ssh_recovery can never locate the remote
+            # workspace (Task 16b).
+            info = decode_transport_ref(handle.ref.transport_ref)
+            await self._db.update_execution_handle_launch(
+                cast("str", execution_id),
+                transport_ref=handle.ref.transport_ref,
+                remote_host=info.get("host"),
+                remote_dir=info.get("remote_dir"),
+                status_marker=handle.ref.status_marker,
+            )
 
         # Update PID in DB (same-state field patch, no dispatch). Docker
         # recovery uses execution_handles, not pid (Task 18) — leaving the
@@ -1054,20 +1330,37 @@ class Orchestrator:
 
             if return_code is not None:
                 # Process finished — finalize (reap/collect/cleanup) exactly
-                # once before dispatching on the outcome.
-                fin = await asyncio.shield(ensure_finalize_task(running))
-                if running.execution_id is not None:
-                    await self._db.mark_execution_state(
-                        running.execution_id,
-                        "terminal",
-                        allowed_from=["prepared", "running"],
-                    )
-                    if fin.cleaned:
+                # once. Callbacks persist the "terminal"/"collected" phases
+                # BETWEEN wait/collect/cleanup (Task 16), so a crash mid-
+                # finalize can never leave durable state that lies. Docker/
+                # local: collect() no-ops and always succeeds, so this is
+                # functionally unchanged — only the intermediate DB phase
+                # now persists earlier.
+                eid = running.execution_id
+
+                async def _mark_terminal(eid: str | None = eid) -> None:
+                    if eid is not None:
                         await self._db.mark_execution_state(
-                            running.execution_id,
-                            "cleaned",
-                            allowed_from=["terminal"],
+                            eid, "terminal", allowed_from=["prepared", "running"]
                         )
+
+                async def _mark_collected(eid: str | None = eid) -> None:
+                    if eid is not None:
+                        await self._db.mark_execution_state(
+                            eid, "collected", allowed_from=["terminal"]
+                        )
+
+                fin = await asyncio.shield(
+                    ensure_finalize_task(
+                        running,
+                        on_terminal=_mark_terminal,
+                        on_collected=_mark_collected,
+                    )
+                )
+                if eid is not None and fin.cleaned:
+                    await self._db.mark_execution_state(
+                        eid, "cleaned", allowed_from=["collected"]
+                    )
                 if fin.collect_error or fin.cleanup_error:
                     self._logger.warning(
                         "execution.finalize.resource_fault workstream=%s "
@@ -1076,6 +1369,19 @@ class Orchestrator:
                         fin.collect_error,
                         fin.cleanup_error,
                     )
+                if not fin.collect_succeeded:
+                    # Remote tmp + staging preserved; do NOT enter PR/gate
+                    # flow — a human must inspect/resolve the collect
+                    # conflict before this workstream can proceed.
+                    await self._transition(
+                        zid,
+                        WorkstreamStatus.NEEDS_REVIEW,
+                        expected_status=WorkstreamStatus.RUNNING,
+                        message="collect failed/conflict; remote workspace preserved",
+                        error_message=(fin.collect_error or "collect failed"),
+                    )
+                    completed.append(zid)
+                    continue
                 await self._handle_completion(zid, running, fin.execution.exit_code)
                 completed.append(zid)
 
@@ -1092,8 +1398,18 @@ class Orchestrator:
         Delegates to `maestro.spec_runner.read_executor_state()` so SQLite
         (spec-runner 2.0) and JSON (legacy) are handled uniformly. Runs the
         blocking read in a thread so the orchestrator loop stays responsive.
+
+        For an ssh execution, `running.mirror_dir` points at the local
+        WAL-mirror of the remote spec dir (Task 16) — the live remote spec
+        dir isn't locally readable while the run is in flight. Local/docker
+        runs have no mirror and read the live workspace `spec` dir directly,
+        unchanged.
         """
-        spec_dir = running.workspace_path / "spec"
+        spec_dir = (
+            running.mirror_dir
+            if running.mirror_dir is not None
+            else running.workspace_path / "spec"
+        )
         loop = asyncio.get_running_loop()
         state = await loop.run_in_executor(
             None, read_executor_state, spec_dir, SPEC_PREFIX

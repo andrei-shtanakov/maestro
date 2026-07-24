@@ -81,7 +81,21 @@ class FakeOrchestratorBackend:
     # skips the _SPAWNING_SENTINEL pid write — see Orchestrator._generate_and_launch).
     id = "local"
 
-    def __init__(self, pid: int = 1, exit_code: int = 0) -> None:
+    def __init__(
+        self,
+        isolator: object | None = None,
+        *,
+        pid: int = 1,
+        exit_code: int = 0,
+        backend_id: str = "local",
+        docker: object | None = None,
+    ) -> None:
+        # Accepts (and ignores) the same construction kwargs the registry
+        # resolver passes to `LocalBackend` (see `_build_local` in
+        # `maestro/execution/resolver.py`), so monkeypatching this class in
+        # for `LocalBackend` tolerates the resolver's call signature even
+        # when a test never routes through `_set_fake_backend`.
+        del isolator, backend_id, docker
         self.pid = pid
         self.exit_code = exit_code
         self.created_handles: list[FakeTaskHandle] = []

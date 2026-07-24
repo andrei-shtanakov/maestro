@@ -67,8 +67,8 @@ async def test_collect_error_recorded_not_fatal_exit_code_untouched():
     fin = await finalize_handle(handle)
     assert fin.execution.exit_code == 0  # business result untouched
     assert fin.collect_error is not None and "collect boom" in fin.collect_error
-    assert handle.cleaned_called is True  # cleanup actually ran
-    assert fin.cleaned is True  # cleanup succeeded
+    assert handle.cleaned_called is False  # cleanup skipped: resources preserved
+    assert fin.cleaned is False  # cleanup never attempted
 
 
 @pytest.mark.anyio
