@@ -1069,6 +1069,20 @@ class Scheduler:
         # back to the configured/default backend — see BackendResolver).
         # Stamped onto the request before any capability check/spawn.
         backend = self._backends.resolve(task.backend)
+
+        # Local-only fail-fast (spec §8): non-local backends must prove the
+        # target daemon is reachable — and not a remote DOCKER_HOST — before
+        # any capability probe or spawn. The local path stays a true no-op
+        # (LocalBackend.healthcheck() with no docker client is trivially
+        # reachable=True anyway, but skipping the call entirely for
+        # backend.id == "local" keeps this from adding any local overhead).
+        if backend.id != "local":
+            health = await backend.healthcheck()
+            if not health.reachable:
+                raise SchedulerError(
+                    f"Backend '{backend.id}' not reachable: {health.detail}"
+                )
+
         request = request.model_copy(update={"backend_id": backend.id})
 
         # Executor-side tool probe (replaces is_available()): checks the

@@ -45,15 +45,25 @@ class FakeBackend:
     the unchanged local path, without a real docker/subprocess backend.
     """
 
-    def __init__(self, backend_id: str, *, exit_code: int = 0, pid: int = 1) -> None:
+    def __init__(
+        self,
+        backend_id: str,
+        *,
+        exit_code: int = 0,
+        pid: int = 1,
+        reachable: bool = True,
+    ) -> None:
         self.id = backend_id
         self.exit_code = exit_code
         self.pid = pid
+        self.reachable = reachable
         self.created_handles: list[FakeTaskHandle] = []
         self.requests: list[ExecutionRequest] = []
 
     async def healthcheck(self) -> BackendHealth:
-        return BackendHealth(reachable=True)
+        if self.reachable:
+            return BackendHealth(reachable=True)
+        return BackendHealth(reachable=False, detail="DOCKER_HOST is remote")
 
     async def can_run(self, req: ExecutionRequest) -> CapabilityResult:
         del req
@@ -179,6 +189,33 @@ async def test_docker_workstream_persists_and_cleans_execution_handle(
     assert workstream_id not in orch._running
     open_rows = await db.get_open_execution_handles()
     assert all(r["entity_id"] != workstream_id for r in open_rows)
+
+
+@pytest.mark.anyio
+async def test_docker_workstream_healthcheck_unreachable_routes_needs_review(
+    orch_env: tuple[Orchestrator, Database, str],
+) -> None:
+    """An unreachable non-local backend must fail fast before spawning.
+
+    `_spawn_workstream` routes READY -> NEEDS_REVIEW instead of RUNNING, and
+    never mints an execution_id or persists an execution_handles row, so a
+    docker workstream never dispatches against an unreachable/remote daemon.
+    """
+    orch, db, workstream_id = orch_env
+    fake_backend = FakeBackend("docker", exit_code=0, pid=4242, reachable=False)
+    orch._backends.resolve = lambda _name: fake_backend  # type: ignore[method-assign]
+
+    await orch._generate_and_launch(workstream_id)
+
+    workstream = await db.get_workstream(workstream_id)
+    assert workstream.status is WorkstreamStatus.NEEDS_REVIEW
+    assert workstream.error_message is not None
+    assert "not reachable" in workstream.error_message
+
+    assert workstream_id not in orch._running
+    rows = await db.get_open_execution_handles()
+    assert all(r["entity_id"] != workstream_id for r in rows)
+    assert fake_backend.created_handles == []
 
 
 @pytest.mark.anyio

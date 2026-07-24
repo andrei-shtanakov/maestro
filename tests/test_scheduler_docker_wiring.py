@@ -20,9 +20,9 @@ import pytest
 
 from maestro.dag import DAG
 from maestro.database import Database
-from maestro.execution.models import CollectPolicy, ExecutionRequest
+from maestro.execution.models import BackendHealth, CollectPolicy, ExecutionRequest
 from maestro.models import AgentType, Task, TaskStatus
-from maestro.scheduler import Scheduler, SchedulerConfig
+from maestro.scheduler import Scheduler, SchedulerConfig, SchedulerError
 from tests.fakes.fake_execution_backend import FakeExecutionBackend
 
 
@@ -38,6 +38,18 @@ class FakeDockerBackend(FakeExecutionBackend):
     """
 
     id = "docker"
+
+
+class FakeUnreachableDockerBackend(FakeDockerBackend):
+    """A docker-id backend whose healthcheck reports unreachable.
+
+    Exercises the local-only fail-fast (spec §8): a `DOCKER_HOST=ssh://...`
+    (or an unreachable daemon) must reject the task before `can_run`/`run`
+    are ever called.
+    """
+
+    async def healthcheck(self) -> BackendHealth:
+        return BackendHealth(reachable=False, detail="DOCKER_HOST is remote")
 
 
 def _docker_spawner(exit_code: int = 0) -> MagicMock:
@@ -180,6 +192,31 @@ async def test_docker_task_persists_and_cleans_execution_handle(
 
     done_task = await db.get_task(task_id)
     assert done_task.status is TaskStatus.DONE
+
+
+@pytest.mark.anyio
+async def test_docker_task_healthcheck_unreachable_blocks_spawn(
+    scheduler_docker_env: tuple[Scheduler, Database, str],
+) -> None:
+    """An unreachable non-local backend must fail fast before `can_run`/`run`.
+
+    `_spawn_task` raises `SchedulerError` and never mints an execution_id or
+    persists an execution_handles row.
+    """
+    sched, db, task_id = scheduler_docker_env
+    unreachable_backend = FakeUnreachableDockerBackend()
+    sched._backends.resolve = lambda _name: unreachable_backend  # type: ignore[method-assign]
+
+    with pytest.raises(SchedulerError, match="not reachable"):
+        await sched._spawn_task(task_id)
+
+    assert task_id not in sched._running_tasks
+    rows = await db.get_open_execution_handles()
+    assert all(r["entity_id"] != task_id for r in rows)
+    assert unreachable_backend.created_handles == []
+
+    task = await db.get_task(task_id)
+    assert task.status is TaskStatus.READY
 
 
 @pytest.mark.anyio

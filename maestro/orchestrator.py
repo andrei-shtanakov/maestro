@@ -831,6 +831,31 @@ class Orchestrator:
         # this is a durable (non-local) execution.
         backend = self._backends.resolve(workstream.backend)
 
+        # Local-only fail-fast (spec §8): non-local backends must prove the
+        # target daemon is reachable — and not a remote DOCKER_HOST — before
+        # the READY->RUNNING transition/spawn. A block routes READY ->
+        # NEEDS_REVIEW instead, mirroring _route_gate_block, so a docker
+        # workstream never CAS's to RUNNING against an unreachable/remote
+        # daemon. The local path stays a true no-op — the call is skipped
+        # entirely for backend.id == "local".
+        if backend.id != "local":
+            health = await backend.healthcheck()
+            if not health.reachable:
+                reason = f"backend {backend.id} not reachable: {health.detail}"
+                self._logger.warning(
+                    "Workstream '%s' backend healthcheck failed: %s",
+                    workstream_id,
+                    reason,
+                )
+                await self._transition(
+                    workstream_id,
+                    WorkstreamStatus.NEEDS_REVIEW,
+                    expected_status=WorkstreamStatus.READY,
+                    message=reason,
+                    error_message=reason,
+                )
+                return
+
         execution_id: str | None = None
         request_launch_fields: dict[str, object] = {}
 
