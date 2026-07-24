@@ -49,7 +49,7 @@
 
 ## Increment A — Config registry + legacy Docker shim
 
-### Task A1: Transport / isolation / backend config models
+### Task 1 (A1): Transport / isolation / backend config models
 
 **Files:**
 - Modify: `maestro/execution/exec_config.py`
@@ -189,7 +189,7 @@ git commit -m "feat(exec): transport/isolation/backend config models for registr
 
 ---
 
-### Task A2: Registry `ExecutionConfig` + legacy-docker normalization
+### Task 2 (A2): Registry `ExecutionConfig` + legacy-docker normalization
 
 **Files:**
 - Modify: `maestro/execution/exec_config.py`
@@ -333,7 +333,7 @@ git commit -m "feat(exec): registry ExecutionConfig with legacy-docker shim"
 
 ---
 
-### Task A3: `BackendResolver` builds from the registry + Mode-2-only SSH guard
+### Task 3 (A3): `BackendResolver` builds from the registry + Mode-2-only SSH guard
 
 **Files:**
 - Modify: `maestro/execution/resolver.py`
@@ -498,7 +498,7 @@ git commit -m "feat(exec): resolver builds from registry; Mode-2-only SSH guard"
 
 ## Increment B — Shared infrastructure (secret-file, finalize contract, DB migration)
 
-### Task B1: Extract the shared `secret_file` helper
+### Task 4 (B1): Extract the shared `secret_file` helper
 
 **Files:**
 - Create: `maestro/execution/secret_file.py`
@@ -607,7 +607,7 @@ git commit -m "refactor(exec): extract shared secret_file helper from DockerIsol
 
 ---
 
-### Task B2: Callback-driven `finalize_handle` (inter-phase persistence)
+### Task 5 (B2): Callback-driven `finalize_handle` (inter-phase persistence)
 
 **Files:**
 - Modify: `maestro/execution/finalize.py`
@@ -795,7 +795,7 @@ git commit -m "feat(exec): callback-driven finalize_handle with inter-phase pers
 
 ---
 
-### Task B3: DB migration #8 — `collected` state + remote handle columns
+### Task 6 (B3): DB migration #8 — `collected` state + remote handle columns
 
 **Files:**
 - Modify: `maestro/database.py` (SCHEMA_SQL `execution_handles` at `:145`; migration registry near `:431`; add `_migrate_ssh_handle_columns`; `start_execution` at `:1251`; `mark_execution_state` at `:1343`; `get_open_execution_handles` at `:1392`)
@@ -979,7 +979,7 @@ git commit -m "feat(db): migration #8 — collected state + remote handle column
 
 ## Increment C — SSH transport primitives (CLI, launch builders, supervisor)
 
-### Task C1: `SshCli` — guarded ssh/rsync argv with an injectable runner
+### Task 7 (C1): `SshCli` — guarded ssh/rsync argv with an injectable runner
 
 **Files:**
 - Create: `maestro/execution/ssh_cli.py`
@@ -1224,7 +1224,7 @@ git commit -m "feat(exec): SshCli guarded argv builder over injectable runner"
 
 ---
 
-### Task C2: Launch-descriptor + remote-layout builders (pure)
+### Task 8 (C2): Launch-descriptor + remote-layout builders (pure)
 
 **Files:**
 - Create: `maestro/execution/ssh_launch.py`
@@ -1382,7 +1382,7 @@ git commit -m "feat(exec): pure SSH launch builders (layout, descriptor, transpo
 
 ---
 
-### Task C3: The remote Python supervisor (daemonizing, atomic status)
+### Task 9 (C3): The remote Python supervisor (daemonizing, atomic status)
 
 **Files:**
 - Create: `maestro/execution/resources/__init__.py` (empty), `maestro/execution/resources/maestro_supervisor.py`
@@ -1604,7 +1604,7 @@ git commit -m "feat(exec): daemonizing remote supervisor with atomic status mark
 
 ## Increment D — Collect (transactional) + progress mirror
 
-### Task D1: Baseline + two-phase transactional collect
+### Task 10 (D1): Baseline + two-phase transactional collect
 
 **Files:**
 - Create: `maestro/execution/ssh_collect.py`
@@ -1873,7 +1873,7 @@ git commit -m "feat(exec): two-phase transactional collect with rollback journal
 
 ---
 
-### Task D2: WAL-safe progress mirror (`sqlite3.backup()` snapshot)
+### Task 11 (D2): WAL-safe progress mirror (`sqlite3.backup()` snapshot)
 
 **Files:**
 - Create: `maestro/execution/ssh_mirror.py`
@@ -2001,7 +2001,7 @@ git commit -m "feat(exec): WAL-safe progress mirror via remote sqlite3.backup sn
 
 ## Increment E — SshTaskHandle, SshBackend, recovery
 
-### Task E1: `SshTaskHandle` + monitor (cached poll, status marker, pgroup signals)
+### Task 12 (E1): `SshTaskHandle` + monitor (cached poll, status marker, pgroup signals)
 
 **Files:**
 - Create: `maestro/execution/ssh_handle.py`
@@ -2354,7 +2354,7 @@ git commit -m "feat(exec): SshTaskHandle + monitor (cached poll, byte-offset tai
 
 ---
 
-### Task E2: `SshBackend` + resolver wiring + run() launch sequence
+### Task 13 (E2): `SshBackend` + resolver wiring + run() launch sequence
 
 **Files:**
 - Create: `maestro/execution/ssh_backend.py`
@@ -2639,7 +2639,7 @@ git commit -m "feat(exec): SshBackend run() with handshake-gated supervisor laun
 
 ---
 
-### Task E3: `ssh_recovery` — fail-closed probe classification
+### Task 14 (E3): `ssh_recovery` — fail-closed probe classification
 
 **Files:**
 - Create: `maestro/execution/ssh_recovery.py`
@@ -2794,7 +2794,7 @@ git commit -m "feat(exec): fail-closed SSH recovery probe + guarded GC"
 
 ## Increment F — Mode integration (scheduler guard + orchestrator wiring)
 
-### Task F1: Scheduler passes `mode="scheduler"` (Mode-1 SSH fail-fast)
+### Task 15 (F1): Scheduler passes `mode="scheduler"` (Mode-1 SSH fail-fast)
 
 **Files:**
 - Modify: `maestro/scheduler.py:280` (`self._backends = BackendResolver(execution)`)
@@ -2862,7 +2862,7 @@ git commit -m "feat(sched): enforce Mode-2-only SSH backends at resolver constru
 
 ---
 
-### Task F2: Orchestrator SSH request wiring (collect + mirror + finalize callbacks + recovery)
+### Task 16 (F2): Orchestrator SSH request wiring (collect + mirror + finalize callbacks + recovery)
 
 **Files:**
 - Modify: `maestro/orchestrator.py` — request build (`:918-930`), `_monitor_running` (`:1044-1083`), `_update_progress` (`:1085-1108`), recovery pass (`:322-360`, `_probe_open_handle`).
@@ -3081,7 +3081,7 @@ git commit -m "feat(orch): wire SSH backend — collect+mirror request, phased f
 
 ## Increment G — Docs, example, gated e2e
 
-### Task G1: CLAUDE.md drift note + example `with-ssh.yaml`
+### Task 17 (G1): CLAUDE.md drift note + example `with-ssh.yaml`
 
 **Files:**
 - Modify: `maestro/CLAUDE.md` (the "state polling deprecated" line, ~`:155`)
@@ -3155,7 +3155,7 @@ git commit -m "docs(exec): with-ssh.yaml example + CLAUDE.md polling drift note"
 
 ---
 
-### Task G2: Gated localhost-SSH e2e (real cleanup exercised)
+### Task 18 (G2): Gated localhost-SSH e2e (real cleanup exercised)
 
 **Files:**
 - Create: `tests/e2e/test_ssh_localhost_e2e.py`
