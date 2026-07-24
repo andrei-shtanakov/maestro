@@ -20,6 +20,7 @@ from maestro.execution.models import (
     PreparedRun,
     PreparedRunPlan,
 )
+from maestro.execution.secret_file import write_env_file
 
 
 @runtime_checkable
@@ -182,21 +183,7 @@ class DockerIsolator:
             plan.tmp_dir.chmod(0o700)
             if plan.env_file_keys:
                 env_file = plan.tmp_dir / "env"
-                lines = []
-                for key in plan.env_file_keys:
-                    value = os.environ.get(key, "")
-                    if any(c in value for c in ("\n", "\r", "\x00")):
-                        raise ValueError(
-                            f"secret {key} value has a forbidden control char"
-                        )
-                    lines.append(f"{key}={value}")
-                # 0600 from creation: O_CREAT|O_WRONLY with mode 0o600.
-                fd = os.open(
-                    str(env_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-                )
-                with os.fdopen(fd, "w") as fh:
-                    fh.write("\n".join(lines) + "\n")
-                env_file.chmod(0o600)  # defensive: umask could have narrowed
+                write_env_file(env_file, plan.env_file_keys, os.environ)
         except Exception:
             shutil.rmtree(plan.tmp_dir, ignore_errors=True)
             if env_file is not None:
