@@ -3,12 +3,31 @@
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from maestro.database import Database, create_database
 from maestro.models import Task, TaskConfig, TaskStatus
 from maestro.recovery import RecoveryStatistics, StateRecovery
+
+
+class _FakeDocker:
+    """Fake DockerCli for wiring tests — no subprocess, no daemon."""
+
+    def __init__(self, ids: list[str], labels: dict[str, str] | None = None) -> None:
+        self._ids = ids
+        self._labels = labels
+        self.rm_calls: list[str] = []
+
+    async def ps_ids_by_label(self, key: str, value: str) -> list[str]:
+        return self._ids
+
+    async def inspect(self, name: str) -> dict[str, Any] | None:
+        return {"Config": {"Labels": self._labels or {}}}
+
+    async def rm(self, name: str) -> None:
+        self.rm_calls.append(name)
 
 
 # =============================================================================
@@ -549,3 +568,156 @@ class TestCrashRecoverySimulation:
         assert stats.tasks_pending == 0
 
         await db.close()
+
+
+# =============================================================================
+# Wiring Tests: Docker-backed recovery (Task 18)
+# =============================================================================
+
+
+class TestDockerBackedRecovery:
+    """Tests that a docker-backed RUNNING/VALIDATING task with a possibly-
+    live container is routed to NEEDS_REVIEW instead of silently re-READYed,
+    while a local-backed task (no open handle row) is unaffected.
+    """
+
+    @pytest.mark.anyio
+    async def test_running_docker_task_with_live_container_needs_review(
+        self, db_with_tasks: Database
+    ) -> None:
+        """A RUNNING task with a matching live container goes to NEEDS_REVIEW."""
+        await db_with_tasks.update_task_status("task-1", TaskStatus.READY)
+        await db_with_tasks.start_execution(
+            entity_kind="task",
+            entity_id="task-1",
+            expected_status=TaskStatus.READY.value,
+            running_status=TaskStatus.RUNNING.value,
+            execution_id="exec-1",
+            backend_id="docker",
+            transport_ref="docker:maestro-exec-1",
+            attempt=1,
+        )
+        task = await db_with_tasks.get_task("task-1")
+        assert task.status == TaskStatus.RUNNING
+
+        docker = _FakeDocker(ids=["c1"], labels={"maestro.execution_id": "exec-1"})
+        recovery = StateRecovery(db_with_tasks, docker=docker)
+        stats = await recovery.recover()
+
+        task = await db_with_tasks.get_task("task-1")
+        assert task.status == TaskStatus.NEEDS_REVIEW
+        assert "Docker recovery" in (task.error_message or "")
+        assert stats.running_recovered == 1
+
+    @pytest.mark.anyio
+    async def test_running_docker_task_no_container_proceeds_to_ready(
+        self, db_with_tasks: Database
+    ) -> None:
+        """A RUNNING docker-backed task with no matching container still
+        recovers to READY (probe returns needs_review=False)."""
+        await db_with_tasks.update_task_status("task-1", TaskStatus.READY)
+        await db_with_tasks.start_execution(
+            entity_kind="task",
+            entity_id="task-1",
+            expected_status=TaskStatus.READY.value,
+            running_status=TaskStatus.RUNNING.value,
+            execution_id="exec-1",
+            backend_id="docker",
+            transport_ref="docker:maestro-exec-1",
+            attempt=1,
+        )
+
+        docker = _FakeDocker(ids=[])
+        recovery = StateRecovery(db_with_tasks, docker=docker)
+        await recovery.recover()
+
+        task = await db_with_tasks.get_task("task-1")
+        assert task.status == TaskStatus.READY
+
+    @pytest.mark.anyio
+    async def test_local_task_unaffected_by_docker_probe(
+        self, db_with_tasks: Database
+    ) -> None:
+        """A task with no open execution_handles row (local-backed) is
+        recovered exactly as before, even if the injected docker fake
+        would otherwise report a live container — the probe is only
+        consulted when an open handle row exists for the task."""
+        await db_with_tasks.update_task_status("task-1", TaskStatus.READY)
+        await db_with_tasks.update_task_status("task-1", TaskStatus.RUNNING)
+
+        docker = _FakeDocker(ids=["c1"], labels={"maestro.execution_id": "exec-1"})
+        recovery = StateRecovery(db_with_tasks, docker=docker)
+        stats = await recovery.recover()
+
+        task = await db_with_tasks.get_task("task-1")
+        assert task.status == TaskStatus.READY
+        assert stats.running_recovered == 1
+        assert docker.rm_calls == []
+
+    @pytest.mark.anyio
+    async def test_validating_docker_task_with_live_container_needs_review(
+        self, db_with_tasks: Database
+    ) -> None:
+        """A VALIDATING task with a possibly-live container goes to
+        NEEDS_REVIEW via the FAILED intermediate (no direct VALIDATING ->
+        NEEDS_REVIEW edge)."""
+        await db_with_tasks.update_task_status("task-1", TaskStatus.READY)
+        await db_with_tasks.start_execution(
+            entity_kind="task",
+            entity_id="task-1",
+            expected_status=TaskStatus.READY.value,
+            running_status=TaskStatus.RUNNING.value,
+            execution_id="exec-1",
+            backend_id="docker",
+            transport_ref="docker:maestro-exec-1",
+            attempt=1,
+        )
+        await db_with_tasks.update_task_status(
+            "task-1", TaskStatus.VALIDATING, expected_status=TaskStatus.RUNNING
+        )
+
+        docker = _FakeDocker(ids=["c1", "c2"])  # ambiguous -> fail closed
+        recovery = StateRecovery(db_with_tasks, docker=docker)
+        stats = await recovery.recover()
+
+        task = await db_with_tasks.get_task("task-1")
+        assert task.status == TaskStatus.NEEDS_REVIEW
+        assert stats.validating_recovered == 1
+
+    @pytest.mark.anyio
+    async def test_gc_sweeps_terminal_handle_and_marks_cleaned(
+        self, db_with_tasks: Database
+    ) -> None:
+        """A `terminal` handle for an already-settled task is GC'd
+        (container removed) and marked `cleaned`; task status is untouched."""
+        await db_with_tasks.update_task_status("task-1", TaskStatus.READY)
+        await db_with_tasks.start_execution(
+            entity_kind="task",
+            entity_id="task-1",
+            expected_status=TaskStatus.READY.value,
+            running_status=TaskStatus.RUNNING.value,
+            execution_id="exec-1",
+            backend_id="docker",
+            transport_ref="docker:maestro-exec-1",
+            attempt=1,
+        )
+        await db_with_tasks.mark_execution_state(
+            "exec-1", "terminal", allowed_from=["prepared", "running"]
+        )
+        await db_with_tasks.update_task_status(
+            "task-1", TaskStatus.VALIDATING, expected_status=TaskStatus.RUNNING
+        )
+        await db_with_tasks.update_task_status(
+            "task-1", TaskStatus.DONE, expected_status=TaskStatus.VALIDATING
+        )
+
+        docker = _FakeDocker(ids=["c1"], labels={"maestro.execution_id": "exec-1"})
+        recovery = StateRecovery(db_with_tasks, docker=docker)
+        await recovery.recover()
+
+        assert docker.rm_calls == ["c1"]
+        remaining = await db_with_tasks.get_open_execution_handles()
+        assert remaining == []  # cleaned rows are no longer "open"
+
+        task = await db_with_tasks.get_task("task-1")
+        assert task.status == TaskStatus.DONE  # untouched by GC

@@ -9,6 +9,7 @@ re-execution.
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.coordination.routing import (
@@ -18,6 +19,13 @@ from maestro.coordination.routing import (
 )
 from maestro.database import Database
 from maestro.event_log import Event, EventType, get_event_logger
+from maestro.execution.docker_cli import DockerCli
+from maestro.execution.docker_recovery import (
+    GC_CLEAN_OUTCOMES,
+    DockerProbe,
+    gc_terminal_handle,
+    probe_execution,
+)
 from maestro.models import Task, TaskOutcome, TaskOutcomeStatus, TaskStatus
 
 
@@ -74,13 +82,17 @@ class StateRecovery:
         print(stats)
     """
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, docker: DockerProbe | None = None) -> None:
         """Initialize state recovery.
 
         Args:
             db: Database connection for task state access.
+            docker: Docker CLI wrapper used to probe execution_handles rows
+                for docker-backed tasks before re-READYing them. Injectable
+                for tests; defaults to a real `DockerCli()`.
         """
         self._db = db
+        self._docker = docker or DockerCli()
 
     async def recover(
         self, routing: RoutingStrategy | None = None
@@ -88,8 +100,15 @@ class StateRecovery:
         """Perform full state recovery.
 
         Finds all tasks in RUNNING or VALIDATING state and transitions
-        them back to READY for re-execution. Tasks in terminal states
-        (DONE, ABANDONED) are not affected.
+        them back to READY for re-execution — unless an open, non-local
+        `execution_handles` row exists for the task and `probe_execution`
+        finds (or cannot rule out) a live/leftover container, in which
+        case the task is routed to NEEDS_REVIEW instead (fail-closed: a
+        docker-backed task is never silently re-run over a container that
+        might still be alive). Tasks in terminal states (DONE, ABANDONED)
+        are not affected. `terminal`-state handles (any entity) are swept
+        for ownership-checked GC as a side effect — see
+        `_gc_terminal_handles`.
 
         Args:
             routing: Optional RoutingStrategy. When supplied, arbiter
@@ -99,11 +118,19 @@ class StateRecovery:
         Returns:
             RecoveryStatistics with details about recovered tasks.
         """
+        open_handles = await self._db.get_open_execution_handles()
+        task_handles = {
+            h["entity_id"]: h for h in open_handles if h["entity_kind"] == "task"
+        }
+
         # Recover RUNNING tasks
-        running_recovered = await self._recover_running_tasks()
+        running_recovered = await self._recover_running_tasks(task_handles)
 
         # Recover VALIDATING tasks
-        validating_recovered = await self._recover_validating_tasks()
+        validating_recovered = await self._recover_validating_tasks(task_handles)
+
+        # Best-effort GC of leftover containers for settled entities.
+        await self._gc_terminal_handles(open_handles)
 
         if routing is not None:
             await recover_arbiter_outcomes(self._db, routing)
@@ -124,41 +151,154 @@ class StateRecovery:
             recovery_time=datetime.now(UTC),
         )
 
-    async def _recover_running_tasks(self) -> int:
+    async def _recover_running_tasks(
+        self, task_handles: dict[str, dict[str, Any]]
+    ) -> int:
         """Recover tasks stuck in RUNNING state.
 
-        Transitions RUNNING → FAILED → READY to allow re-execution.
+        Transitions RUNNING → FAILED → READY to allow re-execution — unless
+        the task has an open docker-backed handle and `probe_execution`
+        says review is needed, in which case it goes RUNNING → NEEDS_REVIEW
+        instead (a direct edge, valid per the `TaskStatus` state diagram).
+
+        Args:
+            task_handles: Map of `entity_id` -> open `execution_handles`
+                row, filtered to `entity_kind == "task"`.
 
         Returns:
-            Number of tasks recovered.
+            Number of tasks recovered (READY or routed to NEEDS_REVIEW).
         """
         running_tasks = await self._db.get_tasks_by_status(TaskStatus.RUNNING)
         recovered = 0
 
         for task in running_tasks:
+            if await self._route_docker_task_to_review(task, task_handles):
+                recovered += 1
+                continue
             await self._transition_to_ready(task, "Recovered after scheduler restart")
             recovered += 1
 
         return recovered
 
-    async def _recover_validating_tasks(self) -> int:
+    async def _recover_validating_tasks(
+        self, task_handles: dict[str, dict[str, Any]]
+    ) -> int:
         """Recover tasks stuck in VALIDATING state.
 
-        Transitions VALIDATING → FAILED → READY to allow re-execution.
+        Transitions VALIDATING → FAILED → READY to allow re-execution —
+        unless the task has an open docker-backed handle and
+        `probe_execution` says review is needed, in which case it goes
+        VALIDATING → FAILED → NEEDS_REVIEW instead (VALIDATING has no
+        direct edge to NEEDS_REVIEW; see the `TaskStatus` state diagram).
+
+        Args:
+            task_handles: Map of `entity_id` -> open `execution_handles`
+                row, filtered to `entity_kind == "task"`.
 
         Returns:
-            Number of tasks recovered.
+            Number of tasks recovered (READY or routed to NEEDS_REVIEW).
         """
         validating_tasks = await self._db.get_tasks_by_status(TaskStatus.VALIDATING)
         recovered = 0
 
         for task in validating_tasks:
+            if await self._route_docker_task_to_review(task, task_handles):
+                recovered += 1
+                continue
             await self._transition_to_ready(
                 task, "Recovered from validation after scheduler restart"
             )
             recovered += 1
 
         return recovered
+
+    async def _route_docker_task_to_review(
+        self, task: Task, task_handles: dict[str, dict[str, Any]]
+    ) -> bool:
+        """Probe a docker-backed task and route it to NEEDS_REVIEW if needed.
+
+        No-op (returns False) for tasks with no open, non-cleaned handle
+        row — a local-backed task is always unaffected, preserving the
+        pre-Task-18 recovery behavior exactly.
+
+        Args:
+            task: The RUNNING or VALIDATING task being recovered.
+            task_handles: Map of `entity_id` -> open `execution_handles`
+                row, filtered to `entity_kind == "task"`.
+
+        Returns:
+            True if the task was routed to NEEDS_REVIEW (caller must not
+            also re-READY it); False if there is nothing to probe.
+        """
+        row = task_handles.get(task.id)
+        if row is None or row["state"] not in ("prepared", "running"):
+            return False
+
+        verdict = await probe_execution(row["execution_id"], self._docker)
+        if not verdict.needs_review:
+            return False
+
+        message = f"Docker recovery: {verdict.reason}"
+        logger.warning(
+            "recovery: task '%s' has a possibly-live container (%s) — "
+            "routing to NEEDS_REVIEW instead of READY",
+            task.id,
+            verdict.reason,
+        )
+        if task.status == TaskStatus.VALIDATING:
+            await self._db.update_task_status(
+                task.id, TaskStatus.FAILED, error_message=message
+            )
+            await self._db.update_task_status(
+                task.id,
+                TaskStatus.NEEDS_REVIEW,
+                expected_status=TaskStatus.FAILED,
+            )
+        else:
+            await self._db.update_task_status(
+                task.id, TaskStatus.NEEDS_REVIEW, error_message=message
+            )
+        return True
+
+    async def _gc_terminal_handles(self, handles: list[dict[str, Any]]) -> int:
+        """Best-effort, ownership-checked GC sweep for `terminal` handles.
+
+        A `terminal` handle means the entity behind it already reached a
+        settled status (finalize ran) but container cleanup was never
+        confirmed. This only removes the leftover container (if any) and
+        marks the handle `cleaned` — it never touches entity status. Swept
+        across all entity kinds (task and workstream), since the handle
+        table is shared and no other recovery path currently GCs it.
+        A row whose outcome is ambiguous (multiple matches / label
+        mismatch / probe error) is left as `terminal` for the next sweep
+        or a human to resolve.
+
+        Args:
+            handles: Open `execution_handles` rows (any state) from
+                `Database.get_open_execution_handles()`.
+
+        Returns:
+            Number of handles marked `cleaned`.
+        """
+        swept = 0
+        for row in handles:
+            if row["state"] != "terminal":
+                continue
+            outcome = await gc_terminal_handle(row, self._docker)
+            if outcome in GC_CLEAN_OUTCOMES:
+                await self._db.mark_execution_state(
+                    row["execution_id"], "cleaned", allowed_from=["terminal"]
+                )
+                swept += 1
+            else:
+                logger.warning(
+                    "recovery: GC left handle %s (%s %s) as terminal: %s",
+                    row["execution_id"],
+                    row["entity_kind"],
+                    row["entity_id"],
+                    outcome,
+                )
+        return swept
 
     async def _transition_to_ready(self, task: Task, reason: str) -> None:
         """Transition a task back to READY state for re-execution.

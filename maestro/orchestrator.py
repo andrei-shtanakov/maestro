@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.changed_paths import changed_paths_since
@@ -24,6 +25,13 @@ from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
 from maestro.event_log import get_event_logger
 from maestro.execution.backend import TaskHandle
+from maestro.execution.docker_cli import DockerCli
+from maestro.execution.docker_recovery import (
+    GC_CLEAN_OUTCOMES,
+    DockerProbe,
+    gc_terminal_handle,
+    probe_execution,
+)
 from maestro.execution.finalize import ensure_finalize_task
 from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.execution.resolver import BackendResolver
@@ -166,6 +174,7 @@ class Orchestrator:
         log_dir: Path | None = None,
         notifier: NotificationManager | None = None,
         on_status_change: StatusChangeCallback | None = None,
+        docker: DockerProbe | None = None,
     ) -> None:
         """Initialize orchestrator.
 
@@ -179,8 +188,13 @@ class Orchestrator:
             notifier: Optional notification manager for workstream
                 lifecycle notifications.
             on_status_change: Optional callback for workstream status changes.
+            docker: Docker CLI wrapper used by startup recovery to probe
+                execution_handles rows for docker-backed workstreams before
+                re-READYing them. Injectable for tests; defaults to a real
+                `DockerCli()`.
         """
         self._db = db
+        self._docker = docker or DockerCli()
         self._workspace_mgr = workspace_mgr
         self._decomposer = decomposer
         self._pr_manager = pr_manager
@@ -303,9 +317,20 @@ class Orchestrator:
         can advance them. In-flight strands reset to READY (no retry, no
         error_message); a RUNNING workstream whose recorded process is still
         alive goes to NEEDS_REVIEW instead (never re-run over a live orphan);
-        FAILED workstreams reconcile by the retry rule. Best-effort per
-        workstream; never raises."""
+        a RUNNING workstream whose process looks dead but whose docker-backed
+        execution_handles row can't rule out a live/leftover container (Task
+        18: `probe_execution`, fail-closed) also goes to NEEDS_REVIEW; FAILED
+        workstreams reconcile by the retry rule. Best-effort per workstream;
+        never raises. `terminal`-state handles (any entity) are swept for
+        ownership-checked GC as a side effect — see `_gc_terminal_handles`."""
         recovered = 0
+        open_handles = await self._db.get_open_execution_handles()
+        workstream_handles = {
+            h["entity_id"]: h
+            for h in open_handles
+            if h["entity_kind"] == "workstream"
+            and h["state"] in ("prepared", "running")
+        }
 
         for state in _STRANDED_INFLIGHT:
             for w in await self._db.get_workstreams_by_status(state):
@@ -318,7 +343,31 @@ class Orchestrator:
                         else None
                     )
                     live_orphan = _maybe_live_orphan(orphan_pid)
-                    if live_orphan:
+                    docker_needs_review = False
+                    if not live_orphan and state is WorkstreamStatus.RUNNING:
+                        docker_needs_review = await self._probe_docker_workstream(
+                            w.id, workstream_handles
+                        )
+                    if docker_needs_review:
+                        self._logger.warning(
+                            "Workstream '%s' stranded in RUNNING with a "
+                            "possibly-live container after restart — sending "
+                            "to NEEDS_REVIEW; verify and clean it up before "
+                            "resume",
+                            w.id,
+                        )
+                        await self._transition(
+                            w.id, WorkstreamStatus.FAILED, expected_status=state
+                        )
+                        await self._transition(
+                            w.id,
+                            WorkstreamStatus.NEEDS_REVIEW,
+                            expected_status=WorkstreamStatus.FAILED,
+                            process_pid=None,
+                            generation_pid=None,
+                        )
+                        self._stats.failed += 1
+                    elif live_orphan:
                         if orphan_pid == _SPAWNING_SENTINEL:
                             self._logger.warning(
                                 "Workstream '%s' stranded in %s with a spawn in "
@@ -444,7 +493,61 @@ class Orchestrator:
             self._logger.info(
                 "Recovered %d stranded workstream(s) on startup", recovered
             )
+
+        # Best-effort GC of leftover containers for settled entities (any
+        # entity kind — the handle table is shared with the scheduler).
+        await self._gc_terminal_handles(open_handles)
+
         return recovered
+
+    async def _probe_docker_workstream(
+        self, workstream_id: str, workstream_handles: dict[str, dict[str, Any]]
+    ) -> bool:
+        """Probe a docker-backed workstream's open handle for a possibly-
+        live container (Task 18: `probe_execution`, fail-closed).
+
+        No-op (returns False) when there is no open, non-cleaned handle row
+        for this workstream — a local-backed workstream (or one whose
+        handle already reached `terminal`/`cleaned`) is always unaffected,
+        preserving pre-Task-18 recovery behavior exactly.
+        """
+        row = workstream_handles.get(workstream_id)
+        if row is None:
+            return False
+        verdict = await probe_execution(row["execution_id"], self._docker)
+        return verdict.needs_review
+
+    async def _gc_terminal_handles(self, handles: list[dict[str, Any]]) -> int:
+        """Best-effort, ownership-checked GC sweep for `terminal` handles.
+
+        Mirrors `StateRecovery._gc_terminal_handles` (Mode 1): a `terminal`
+        handle means the entity behind it already reached a settled status
+        (finalize ran) but container cleanup was never confirmed. This only
+        removes the leftover container (if any) and marks the handle
+        `cleaned` — it never touches entity status. Swept across all entity
+        kinds since the handle table is shared. A row whose outcome is
+        ambiguous (multiple matches / label mismatch / probe error) is left
+        as `terminal` for the next sweep or a human to resolve.
+        """
+        swept = 0
+        for row in handles:
+            if row["state"] != "terminal":
+                continue
+            outcome = await gc_terminal_handle(row, self._docker)
+            if outcome in GC_CLEAN_OUTCOMES:
+                await self._db.mark_execution_state(
+                    row["execution_id"], "cleaned", allowed_from=["terminal"]
+                )
+                swept += 1
+            else:
+                self._logger.warning(
+                    "recovery: GC left handle %s (%s %s) as terminal: %s",
+                    row["execution_id"],
+                    row["entity_kind"],
+                    row["entity_id"],
+                    outcome,
+                )
+        return swept
 
     async def _ensure_workstreams(self) -> None:
         """Ensure workstreams are in the database.
