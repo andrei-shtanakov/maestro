@@ -72,7 +72,10 @@ async def probe_execution(execution_id: str, docker: DockerProbe) -> RecoveryVer
         return RecoveryVerdict(False, "no container found")
     if len(ids) > 1:
         return RecoveryVerdict(True, f"ambiguous: {len(ids)} containers")
-    info = await docker.inspect(ids[0])
+    try:
+        info = await docker.inspect(ids[0])
+    except Exception as e:
+        return RecoveryVerdict(True, f"inspect failed: {e}")
     labels = (info or {}).get("Config", {}).get("Labels") or {}
     if labels.get("maestro.execution_id") != execution_id:
         return RecoveryVerdict(True, "label mismatch on found container")

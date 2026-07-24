@@ -119,8 +119,15 @@ class StateRecovery:
             RecoveryStatistics with details about recovered tasks.
         """
         open_handles = await self._db.get_open_execution_handles()
+        # Filter to prepared/running: a task can have both a stale terminal
+        # row (prior attempt, cleanup unconfirmed) and a fresh running row
+        # (current attempt) open at once. Without this filter, dict
+        # construction has no defined winner between them — a terminal row
+        # could shadow the live one and silently bypass the probe below.
         task_handles = {
-            h["entity_id"]: h for h in open_handles if h["entity_kind"] == "task"
+            h["entity_id"]: h
+            for h in open_handles
+            if h["entity_kind"] == "task" and h["state"] in ("prepared", "running")
         }
 
         # Recover RUNNING tasks

@@ -88,6 +88,17 @@ async def test_label_mismatch_needs_review() -> None:
     assert "mismatch" in v.reason
 
 
+@pytest.mark.anyio
+async def test_inspect_error_fails_closed() -> None:
+    """A single-match inspect() failure (e.g. a subprocess TimeoutError
+    under daemon load right after a crash) must fail closed, not raise —
+    an unhandled exception here would abort recovery for every other
+    task/workstream in the same recovery pass."""
+    v = await probe_execution("e1", _FakeDocker(ids=["c1"], raise_inspect=True))
+    assert v.needs_review is True
+    assert "inspect failed" in v.reason
+
+
 # =============================================================================
 # gc_terminal_handle
 # =============================================================================

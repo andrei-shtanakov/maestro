@@ -19,8 +19,10 @@ class _FakeDocker:
         self._ids = ids
         self._labels = labels
         self.rm_calls: list[str] = []
+        self.probed_execution_ids: list[str] = []
 
     async def ps_ids_by_label(self, key: str, value: str) -> list[str]:
+        self.probed_execution_ids.append(value)
         return self._ids
 
     async def inspect(self, name: str) -> dict[str, Any] | None:
@@ -721,3 +723,73 @@ class TestDockerBackedRecovery:
 
         task = await db_with_tasks.get_task("task-1")
         assert task.status == TaskStatus.DONE  # untouched by GC
+
+    @pytest.mark.anyio
+    async def test_stale_terminal_row_does_not_shadow_live_running_row(
+        self, db_with_tasks: Database
+    ) -> None:
+        """A task can have TWO open execution_handles rows at once: a stale
+        `terminal` row from a prior attempt (cleanup unconfirmed) plus a
+        fresh `running` row from the current retry. `task_handles` must be
+        filtered to prepared/running at construction time so the terminal
+        row can never win a dict last-write-wins race — get_open_execution_
+        handles has no ORDER BY, so row order is not a contract. This test
+        forces the terminal row to be last in the returned list (the exact
+        ordering that would make an unfiltered dict comprehension pick it)
+        to make the regression deterministic regardless of SQLite's actual
+        row-return order."""
+        await db_with_tasks.update_task_status("task-1", TaskStatus.READY)
+        await db_with_tasks.start_execution(
+            entity_kind="task",
+            entity_id="task-1",
+            expected_status=TaskStatus.READY.value,
+            running_status=TaskStatus.RUNNING.value,
+            execution_id="exec-old",
+            backend_id="docker",
+            transport_ref="docker:maestro-exec-old",
+            attempt=1,
+        )
+        await db_with_tasks.mark_execution_state(
+            "exec-old", "terminal", allowed_from=["prepared", "running"]
+        )
+        # Prior attempt settled (its terminal handle's cleanup is simply
+        # unconfirmed); reset the task for a fresh retry attempt.
+        await db_with_tasks.update_task_status(
+            "task-1", TaskStatus.READY, expected_status=TaskStatus.RUNNING
+        )
+        await db_with_tasks.start_execution(
+            entity_kind="task",
+            entity_id="task-1",
+            expected_status=TaskStatus.READY.value,
+            running_status=TaskStatus.RUNNING.value,
+            execution_id="exec-new",
+            backend_id="docker",
+            transport_ref="docker:maestro-exec-new",
+            attempt=2,
+        )
+
+        real_handles = await db_with_tasks.get_open_execution_handles()
+        assert {h["execution_id"] for h in real_handles} == {"exec-old", "exec-new"}
+        running_row = next(h for h in real_handles if h["execution_id"] == "exec-new")
+        terminal_row = next(h for h in real_handles if h["execution_id"] == "exec-old")
+        # running first, terminal last: a naive `{h["entity_id"]: h for h in
+        # handles}` (no state filter) would overwrite task-1's entry with
+        # the terminal row here.
+        ordered_handles = [running_row, terminal_row]
+
+        async def _fake_open_handles() -> list[dict[str, Any]]:
+            return ordered_handles
+
+        db_with_tasks.get_open_execution_handles = _fake_open_handles  # type: ignore[method-assign]
+
+        docker = _FakeDocker(ids=["c1"], labels={"maestro.execution_id": "exec-new"})
+        recovery = StateRecovery(db_with_tasks, docker=docker)
+        stats = await recovery.recover()
+
+        # The probe must have queried the live attempt's execution_id, not
+        # been bypassed by the stale terminal one.
+        assert "exec-new" in docker.probed_execution_ids
+
+        task = await db_with_tasks.get_task("task-1")
+        assert task.status == TaskStatus.NEEDS_REVIEW
+        assert stats.running_recovered == 1
