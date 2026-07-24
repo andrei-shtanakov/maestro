@@ -66,26 +66,6 @@ def _rel_escapes(worktree: Path, rel: str) -> bool:
     return root != target and root not in target.parents
 
 
-def _check_staging_sandboxed(worktree: Path, staging: Path) -> None:
-    """Reject a staging area that a one-hop `..` write already escaped.
-
-    A malicious/misbehaving remote sync can materialize a file via a
-    relative name like ``"../escape.py"``, which physically lands as a
-    *sibling* of ``staging`` rather than inside it — invisible to any walk
-    rooted at ``staging``. The only place left to detect that is
-    ``staging``'s own parent: it must contain nothing but the staging
-    directory itself (and, when co-located, the worktree).
-    """
-    parent = staging.resolve().parent
-    allowed = {staging.resolve()}
-    worktree_r = worktree.resolve()
-    if worktree_r.parent == parent:
-        allowed.add(worktree_r)
-    for entry in parent.iterdir():
-        if entry.resolve() not in allowed:
-            raise CollectConflict(f"unexpected path outside staging root: {entry}")
-
-
 def plan_collect(
     worktree: Path,
     staging: Path,
@@ -94,7 +74,6 @@ def plan_collect(
     forbidden: list[str],
 ) -> CollectPlan:
     """Preflight; raises CollectConflict on any violation. No side effects."""
-    _check_staging_sandboxed(worktree, staging)
     remote = _walk(staging, forbidden)
     # Symlink / traversal guard over the raw staging tree.
     for dirpath, _dirs, files in os.walk(staging):

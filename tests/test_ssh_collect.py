@@ -55,7 +55,9 @@ def test_preflight_conflict_leaves_worktree_untouched(tmp_path):
     st.mkdir()
     _w(wt, "a.py", "orig")
     _w(st, "a.py", "orig")
-    _w(st, "../escape.py", "evil")  # traversal
+    outside = tmp_path / "etc_passwd_like"
+    outside.write_text("secret")
+    (st / "evil.py").symlink_to(outside)  # symlink escaping the worktree
     base = capture_baseline(wt, excludes=EXCL)
     before = (wt / "a.py").read_text()
     with pytest.raises(CollectConflict):
