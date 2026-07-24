@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import time
@@ -51,6 +52,28 @@ def test_supervisor_handshake_and_atomic_status(tmp_path):
     status = _wait_status(tmp_path / "maestro-exec-e1" / "e1.status")
     assert status["exit_code"] == 0
     assert (tmp_path / "maestro-exec-e1" / ".maestro-owner").read_text().strip() == "e1"
+
+
+def test_supervisor_rejects_path_escape(tmp_path):
+    dp = _descriptor(tmp_path, [sys.executable, "-c", "print('hi')"])
+    desc = json.loads(dp.read_text())
+    root = tmp_path / "maestro-exec-e1"
+    evil = tmp_path / "maestro-exec-e1" / ".." / ".." / ".." / "etc" / "evil"
+    desc["status_file"] = str(evil)
+    dp.write_text(json.dumps(desc))
+
+    out = subprocess.run(
+        [sys.executable, str(SUP), str(dp)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert out.returncode == 2
+    assert "MAESTRO-SUPERVISOR-READY" not in out.stdout
+    assert not (root / "e1.status").exists()
+    resolved_evil = Path(os.path.normpath(str(evil)))
+    assert not resolved_evil.exists()
 
 
 def test_supervisor_preserves_argv_boundaries(tmp_path):

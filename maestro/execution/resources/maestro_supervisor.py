@@ -26,8 +26,14 @@ def _fail(msg: str) -> None:
 
 def _validate(desc: dict) -> None:
     root = f"{desc['workdir_root'].rstrip('/')}/maestro-exec-{desc['execution_id']}"
-    for key in ("cwd", "owner_marker", "pid_file", "status_file", "log_file"):
-        if not str(desc[key]).startswith(root + "/") and desc[key] != root:
+    root_real = str(Path(root).resolve(strict=False))
+    keys = ("cwd", "env_file", "owner_marker", "pid_file", "status_file", "log_file")
+    for key in keys:
+        candidate_real = str(Path(str(desc[key])).resolve(strict=False))
+        if candidate_real == root_real:
+            continue
+        common = os.path.commonpath([root_real, candidate_real])
+        if common != root_real:
             _fail(f"path {key} escapes {root}")
 
 
