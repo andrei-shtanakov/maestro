@@ -1484,6 +1484,54 @@ class Database:
         )
         await self._connection.commit()
 
+    async def update_execution_handle_launch(
+        self,
+        execution_id: str,
+        *,
+        transport_ref: str,
+        remote_host: str | None,
+        remote_dir: str | None,
+        status_marker: str | None,
+    ) -> None:
+        """Persist the coordinates minted by the backend's `run()` call.
+
+        `start_execution` inserts the `execution_handles` row before the
+        backend actually launches (so an all-or-nothing CAS+insert can gate
+        the READY->RUNNING transition), seeding a placeholder
+        `transport_ref` and NULL `remote_host`/`remote_dir`/`status_marker`.
+        For remote backends (e.g. ssh) the real values — the JSON
+        `transport_ref` from `encode_transport_ref` and the remote
+        directory/status marker — are only known once `backend.run()`
+        returns. This call overwrites the seeded placeholders with those
+        real values so crash recovery (`ssh_recovery.probe_ssh`,
+        `gc_ssh_terminal`) can decode `transport_ref` and locate the remote
+        workspace.
+
+        Args:
+            execution_id: The execution handle to update.
+            transport_ref: The backend-minted opaque transport reference.
+            remote_host: Remote host for a remote backend, else `None`.
+            remote_dir: Remote working directory, else `None`.
+            status_marker: Remote path polled to detect completion.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        await self._connection.execute(
+            """
+            UPDATE execution_handles
+            SET transport_ref = ?, remote_host = ?, remote_dir = ?,
+                status_marker = ?
+            WHERE execution_id = ?
+            """,
+            (transport_ref, remote_host, remote_dir, status_marker, execution_id),
+        )
+        await self._connection.commit()
+
     async def get_open_execution_handles(self) -> list[dict[str, Any]]:
         """Return execution handles a recovery pass must reconcile.
 

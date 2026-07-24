@@ -9,8 +9,10 @@ callbacks + collect-failure routing, and the `_probe_open_handle` /
 `TestStartupRecovery`.
 """
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -178,7 +180,20 @@ class TestSpawnWorkstreamSshBranch:
 
             async def fake_run(req: ExecutionRequest) -> FakeTaskHandle:
                 recorded["req"] = req
-                return FakeTaskHandle(exit_code=0, pid=777)
+                handle = FakeTaskHandle(exit_code=0, pid=777)
+                # Realistic SshBackend.run() ref shape (JSON transport_ref
+                # via encode_transport_ref) — Task 16b's write-back decodes
+                # it, so the fake must match the real contract.
+                layout = remote_layout("/var/tmp/m", cast("str", req.execution_id))
+                handle.ref = handle.ref.model_copy(
+                    update={
+                        "transport_ref": encode_transport_ref(
+                            "gpu", None, layout.root, layout.status
+                        ),
+                        "status_marker": layout.status,
+                    }
+                )
+                return handle
 
             async def fake_healthcheck() -> BackendHealth:
                 return BackendHealth(reachable=True)
@@ -209,6 +224,70 @@ class TestSpawnWorkstreamSshBranch:
             running = orch._running["w"]
             assert running.mirror_dir == tmp_path / "logs" / "w.mirror"
             assert str(req.progress_mirror.local_dir) == str(running.mirror_dir)
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_ssh_backend_persists_minted_handle_coordinates(
+        self, tmp_path
+    ) -> None:
+        """Task 16b: after `backend.run()` mints the real (JSON)
+        transport_ref/remote_dir/status_marker, `_spawn_workstream` writes
+        them back onto the `execution_handles` row seeded by
+        `start_execution` — closing the gap where crash recovery could
+        never locate the remote workspace."""
+        from maestro.execution.ssh_launch import decode_transport_ref, remote_layout
+
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            backend = _ssh_backend()
+            layout = remote_layout("/var/tmp/m", "e-minted")
+            minted_transport_ref = encode_transport_ref(
+                "gpu", None, layout.root, layout.status
+            )
+
+            async def fake_run(req: ExecutionRequest) -> FakeTaskHandle:
+                handle = FakeTaskHandle(exit_code=0, pid=777)
+                handle.ref = handle.ref.model_copy(
+                    update={
+                        "transport_ref": minted_transport_ref,
+                        "status_marker": layout.status,
+                    }
+                )
+                return handle
+
+            async def fake_healthcheck() -> BackendHealth:
+                return BackendHealth(reachable=True)
+
+            backend.run = fake_run  # type: ignore[method-assign]
+            backend.healthcheck = fake_healthcheck  # type: ignore[method-assign]
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(
+                _seed("w", WorkstreamStatus.READY, backend="gpu")
+            )
+            workspace = tmp_path / "ws-w"
+            workspace.mkdir()
+            cast_mgr = orch._workspace_mgr
+            cast_mgr.workspace_exists = MagicMock(return_value=True)
+            cast_mgr.get_workspace_path = MagicMock(return_value=workspace)
+            orch._decomposer.generate_spec = AsyncMock()
+
+            await orch._spawn_workstream("w")
+
+            handles = await db.get_open_execution_handles()
+            row = next(h for h in handles if h["backend_id"] == "gpu")
+
+            # transport_ref round-trips as real JSON (not the plain-string
+            # placeholder `start_execution` seeds before the launch).
+            decoded = decode_transport_ref(row["transport_ref"])
+            assert decoded == json.loads(minted_transport_ref)
+            assert row["remote_dir"] == layout.root
+            assert row["status_marker"] == layout.status
+            assert row["remote_host"] == "gpu"
+
+            # A subsequent recovery probe can decode it without error.
+            json.loads(row["transport_ref"])
         finally:
             await db.close()
 

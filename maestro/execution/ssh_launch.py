@@ -88,3 +88,13 @@ def encode_transport_ref(
             "status_marker": status_marker,
         }
     )
+
+
+def decode_transport_ref(s: str) -> dict:
+    """Decode an opaque `transport_ref` string produced by `encode_transport_ref`.
+
+    Pure inverse of `encode_transport_ref` — keeps callers (e.g. the
+    orchestrator, persisting the minted handle coordinates after
+    `SshBackend.run()`) decoupled from the JSON shape.
+    """
+    return json.loads(s)

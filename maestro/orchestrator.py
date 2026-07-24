@@ -42,6 +42,7 @@ from maestro.execution.models import (
 )
 from maestro.execution.resolver import BackendResolver
 from maestro.execution.ssh_backend import SshBackend
+from maestro.execution.ssh_launch import decode_transport_ref
 from maestro.execution.ssh_recovery import gc_ssh_terminal, probe_ssh
 from maestro.gates import (
     BLOCK_REASON_PREFIX,
@@ -1099,6 +1100,21 @@ class Orchestrator:
             backend_id=backend.id,
             mirror_dir=mirror_dir,
         )
+
+        if isinstance(backend, SshBackend):
+            # Persist the coordinates SshBackend.run() actually minted (the
+            # JSON transport_ref, remote_dir, status_marker) — start_execution
+            # only seeded a plain-string placeholder before the launch, so
+            # without this write ssh_recovery can never locate the remote
+            # workspace (Task 16b).
+            info = decode_transport_ref(handle.ref.transport_ref)
+            await self._db.update_execution_handle_launch(
+                cast("str", execution_id),
+                transport_ref=handle.ref.transport_ref,
+                remote_host=info.get("host"),
+                remote_dir=info.get("remote_dir"),
+                status_marker=handle.ref.status_marker,
+            )
 
         # Update PID in DB (same-state field patch, no dispatch). Docker
         # recovery uses execution_handles, not pid (Task 18) — leaving the
