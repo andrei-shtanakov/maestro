@@ -56,7 +56,11 @@ class FakeOrchestratorBackend:
     `.poll()` / `.os_pid` behave identically to the scheduler fakes.
     """
 
-    id = "fake"
+    # Cached under the resolver's "local" key by the autouse fixture /
+    # _set_fake_backend, so it must report id="local" to exercise the local
+    # spawn branch (the non-local branch mints a durable execution handle and
+    # skips the _SPAWNING_SENTINEL pid write — see Orchestrator._generate_and_launch).
+    id = "local"
 
     def __init__(self, pid: int = 1, exit_code: int = 0) -> None:
         self.pid = pid
