@@ -34,7 +34,6 @@ from maestro.execution.ssh_launch import (
 
 
 _HANDSHAKE = "MAESTRO-SUPERVISOR-READY"
-_COLLECT_EXCLUDES = [".git", ".maestro", "*.log"]
 
 
 def _supervisor_src() -> str:
@@ -100,7 +99,7 @@ class SshBackend:
         if req.execution_id is None:
             raise ValueError("SshBackend requires req.execution_id")
         layout = remote_layout(self._t.workdir_root, req.execution_id)
-        baseline = capture_baseline(req.workdir, excludes=_COLLECT_EXCLUDES)
+        baseline = capture_baseline(req.workdir, excludes=RSYNC_EXCLUDES_OUT)
 
         await self._materialize_remote(req, layout)
 
@@ -192,7 +191,7 @@ class SshBackend:
         Imported lazily so this module has no hard import-time dependency on
         a sibling that lands in a later task.
         """
-        from maestro.execution.ssh_recovery import probe_ssh  # pyrefly: ignore
+        from maestro.execution.ssh_recovery import probe_ssh
 
         verdict = await probe_ssh(self._ssh, ref)
         return ProbeResult(alive=verdict.needs_review, detail=verdict.reason)
