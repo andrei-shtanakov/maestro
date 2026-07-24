@@ -159,7 +159,7 @@ def build_ssh_execution_request(
         ),
         progress_mirror=ProgressMirrorPolicy(
             kind="spec_runner_sqlite",
-            remote_globs=[],
+            remote_globs=[f".executor-{SPEC_PREFIX}state.db"],
             local_dir=Path(mirror_dir),
             interval_seconds=2.0,
         ),

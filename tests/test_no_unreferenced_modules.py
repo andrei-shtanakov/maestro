@@ -34,6 +34,10 @@ _ALLOWLIST: frozenset[str] = frozenset(
         # `uv run python -m maestro.schemas.generate` — JSON-schema codegen
         # script, run manually / in docs, imported by nothing.
         "maestro.schemas.generate",
+        # Remote-executed supervisor script, read as text via
+        # `importlib.resources` in ssh_backend.py and run with `python3` on
+        # the executor host; never imported as a Python module.
+        "maestro.execution.resources.maestro_supervisor",
     }
 )
 

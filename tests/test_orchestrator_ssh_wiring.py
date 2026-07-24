@@ -95,7 +95,7 @@ def test_ssh_request_fields_match_contract():
     mirror = req.progress_mirror
     assert mirror is not None
     assert mirror.kind == "spec_runner_sqlite"
-    assert mirror.remote_globs == []
+    assert mirror.remote_globs == [".executor-maestro-state.db"]
     assert mirror.interval_seconds == 2.0
 
 

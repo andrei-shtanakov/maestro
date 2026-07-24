@@ -7,6 +7,7 @@ process GROUP (negative pgid), never a broad pkill.
 import asyncio
 import contextlib
 import json
+import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,10 @@ from maestro.execution.models import (
 from maestro.execution.ssh_cli import SshCli
 from maestro.execution.ssh_collect import apply_collect, plan_collect
 from maestro.execution.ssh_launch import RSYNC_EXCLUDES_COLLECT, RemoteLayout
+from maestro.execution.ssh_mirror import mirror_once
 
+
+logger = logging.getLogger(__name__)
 
 _MAX_BACKOFF_S = 30.0
 
@@ -32,6 +36,15 @@ class CollectSpec:
     staging_dir: Path
     journal_dir: Path
     baseline: dict[str, str]
+
+
+@dataclass
+class MirrorSpec:
+    """Remote/local paths needed to drive the WAL progress mirror each tick."""
+
+    remote_db: str
+    remote_snapshot: str
+    local_target: Path
 
 
 class SshTaskHandle:
@@ -60,6 +73,7 @@ class SshTaskHandle:
         collect_spec: CollectSpec,
         poll_interval: float = 1.0,
         expected_owner: str | None = None,
+        mirror_spec: MirrorSpec | None = None,
     ) -> None:
         """Initialize the handle; call `start()` to spawn the monitor."""
         self._ssh = ssh
@@ -70,6 +84,7 @@ class SshTaskHandle:
         self._collect = collect_spec
         self._interval = poll_interval
         self._expected_owner = expected_owner
+        self._mirror = mirror_spec
         self._exit_code: int | None = None
         self._terminal = asyncio.Event()
         self._timed_out = False
@@ -102,6 +117,7 @@ class SshTaskHandle:
         while not self._terminal.is_set():
             try:
                 await self._tail_log()
+                await self._mirror_progress()
                 status = await self._read_status()
                 if status is not None:
                     self._exit_code = int(status["exit_code"])
@@ -127,6 +143,23 @@ class SshTaskHandle:
             with self._log_path.open("a", encoding="utf-8") as fh:
                 fh.write(res.stdout)
             self._log_offset += len(res.stdout.encode("utf-8"))
+
+    async def _mirror_progress(self) -> None:
+        """Best-effort WAL progress-mirror tick; never breaks the monitor loop.
+
+        `mirror_once` already reports transient failures via its return
+        value rather than raising, but this is still wrapped so a defect
+        there can never take down log-tailing / status-polling.
+        """
+        if self._mirror is None:
+            return
+        with contextlib.suppress(Exception):
+            await mirror_once(
+                self._ssh,
+                self._mirror.remote_db,
+                self._mirror.remote_snapshot,
+                self._mirror.local_target,
+            )
 
     async def _read_status(self) -> dict | None:
         """Read the atomic status marker; None while the run is still live."""

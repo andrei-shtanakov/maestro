@@ -23,7 +23,7 @@ from maestro.execution.models import (
 from maestro.execution.secret_file import write_env_file
 from maestro.execution.ssh_cli import Runner, RunResult, SshCli
 from maestro.execution.ssh_collect import capture_baseline
-from maestro.execution.ssh_handle import CollectSpec, SshTaskHandle
+from maestro.execution.ssh_handle import CollectSpec, MirrorSpec, SshTaskHandle
 from maestro.execution.ssh_launch import (
     RSYNC_EXCLUDES_OUT,
     RemoteLayout,
@@ -131,9 +131,30 @@ class SshBackend:
             timeout_seconds=req.timeout_seconds,
             collect_spec=CollectSpec(req.workdir, staging, journal, baseline),
             expected_owner=req.execution_id,
+            mirror_spec=self._build_mirror_spec(req, layout),
         )
         handle.start()
         return handle
+
+    def _build_mirror_spec(
+        self, req: ExecutionRequest, layout: RemoteLayout
+    ) -> MirrorSpec | None:
+        """Build the WAL progress-mirror wiring from `req.progress_mirror`.
+
+        None when the request has no mirror policy or the policy names no
+        remote state file — local/docker backends never set this, so this
+        stays a no-op for them.
+        """
+        policy = req.progress_mirror
+        if policy is None or not policy.remote_globs:
+            return None
+        state_file = policy.remote_globs[0]
+        policy.local_dir.mkdir(parents=True, exist_ok=True)
+        return MirrorSpec(
+            remote_db=f"{layout.repo}/spec/{state_file}",
+            remote_snapshot=f"{layout.root}/state-snapshot.db",
+            local_target=policy.local_dir / state_file,
+        )
 
     async def _launch_supervisor(
         self, layout: RemoteLayout, descriptor: dict

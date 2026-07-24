@@ -11,7 +11,7 @@ import pytest
 from maestro.execution.exec_config import SshTransport
 from maestro.execution.models import ExecutionHandleRef
 from maestro.execution.ssh_cli import RunResult, SshCli
-from maestro.execution.ssh_handle import CollectSpec, SshTaskHandle
+from maestro.execution.ssh_handle import CollectSpec, MirrorSpec, SshTaskHandle
 from maestro.execution.ssh_launch import remote_layout
 
 
@@ -100,6 +100,50 @@ async def test_cleanup_refuses_when_owner_marker_mismatch(tmp_path):
     with pytest.raises(RuntimeError, match="owner"):
         await h.cleanup()
     assert not any("rm -rf" in " ".join(c) for c in fake.calls)
+
+
+@pytest.mark.anyio
+async def test_monitor_drives_mirror_once_each_tick(tmp_path):
+    """Task 16c: with a `mirror_spec` set, the monitor loop calls
+    `mirror_once` (remote snapshot + rsync pull) on ticks while running,
+    and still reaches terminal without hanging or duplicating the log."""
+    status = json.dumps({"pid": 5, "pgid": 5, "exit_code": 0, "completed_at": 1.0})
+    fake = FakeSsh(
+        [
+            ("python3 - ", RunResult(0, "", "")),  # remote SNAPSHOT_SCRIPT run
+            ("rsync", RunResult(0, "", "")),  # snapshot pull
+            ("cat", RunResult(0, status, "")),  # status marker
+        ]
+    )
+    ssh = SshCli(SshTransport(type="ssh", host="gpu", workdir_root="/w"), runner=fake)
+    layout = remote_layout("/w", "e1")
+    mirror = MirrorSpec(
+        remote_db=f"{layout.repo}/spec/.executor-maestro-state.db",
+        remote_snapshot=f"{layout.root}/state-snapshot.db",
+        local_target=tmp_path / "mirror" / ".executor-maestro-state.db",
+    )
+    (tmp_path / "mirror").mkdir()
+    h = SshTaskHandle(
+        ssh,
+        layout,
+        _ref(),
+        log_path=tmp_path / "log",
+        timeout_seconds=None,
+        collect_spec=CollectSpec(tmp_path / "wt", tmp_path / "st", tmp_path / "j", {}),
+        poll_interval=0.01,
+        mirror_spec=mirror,
+    )
+    h.start()
+    res = await h.wait()
+    assert res.exit_code == 0  # reached terminal, no hang
+
+    snapshot_calls = [c for c in fake.calls if "python3 -" in " ".join(c)]
+    assert snapshot_calls, "mirror_once never ran its remote snapshot step"
+    assert mirror.remote_db in " ".join(snapshot_calls[0])
+    assert mirror.remote_snapshot in " ".join(snapshot_calls[0])
+
+    rsync_calls = [c for c in fake.calls if "rsync" in " ".join(c)]
+    assert any(mirror.remote_snapshot in " ".join(c) for c in rsync_calls)
 
 
 @pytest.mark.anyio
