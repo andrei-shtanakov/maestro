@@ -12,8 +12,9 @@ scheduler test suite (see `tests/fakes/fake_execution_backend.py`).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -192,6 +193,40 @@ async def test_docker_task_persists_and_cleans_execution_handle(
 
     done_task = await db.get_task(task_id)
     assert done_task.status is TaskStatus.DONE
+
+
+@pytest.mark.anyio
+async def test_docker_task_timeout_marks_cleaned_when_cleanup_confirmed(
+    scheduler_docker_env: tuple[Scheduler, Database, str],
+) -> None:
+    """A timed-out docker task whose finalize confirms cleanup must not
+    leave a stale open `terminal` execution_handles row — it should be
+    driven all the way to `cleaned`, mirroring the completion branch."""
+    sched, db, task_id = scheduler_docker_env
+
+    # A long fake delay keeps FakeTaskHandle.poll() returning None (still
+    # "running") on the first tick, so the elapsed-time timeout branch is
+    # the one that fires below rather than the completion branch.
+    spawner = cast("MagicMock", sched._spawners["claude_code"])
+    req = spawner.build_request.return_value
+    spawner.build_request.return_value = req.model_copy(
+        update={"labels": {**req.labels, "fake_delay_seconds": "10000"}}
+    )
+
+    started = await sched._spawn_task(task_id)
+    assert started is True
+
+    running_task = sched._running_tasks[task_id]
+    assert running_task.execution_id is not None
+    running_task.started_at = datetime.now(UTC) - timedelta(
+        minutes=running_task.task.timeout_minutes + 1
+    )
+
+    await sched._monitor_running_tasks()
+
+    assert task_id not in sched._running_tasks
+    open_rows = await db.get_open_execution_handles()
+    assert all(r["entity_id"] != task_id for r in open_rows)
 
 
 @pytest.mark.anyio

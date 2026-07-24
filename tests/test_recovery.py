@@ -637,6 +637,35 @@ class TestDockerBackedRecovery:
         assert task.status == TaskStatus.READY
 
     @pytest.mark.anyio
+    async def test_running_docker_task_no_container_closes_handle_row(
+        self, db_with_tasks: Database
+    ) -> None:
+        """A RUNNING docker-backed task whose probe finds no container is
+        re-READYed AND its open execution_handles row is reconciled
+        (terminal -> cleaned) so it no longer shadows the next attempt."""
+        await db_with_tasks.update_task_status("task-1", TaskStatus.READY)
+        await db_with_tasks.start_execution(
+            entity_kind="task",
+            entity_id="task-1",
+            expected_status=TaskStatus.READY.value,
+            running_status=TaskStatus.RUNNING.value,
+            execution_id="exec-1",
+            backend_id="docker",
+            transport_ref="docker:maestro-exec-1",
+            attempt=1,
+        )
+
+        docker = _FakeDocker(ids=[])
+        recovery = StateRecovery(db_with_tasks, docker=docker)
+        await recovery.recover()
+
+        task = await db_with_tasks.get_task("task-1")
+        assert task.status == TaskStatus.READY
+
+        remaining = await db_with_tasks.get_open_execution_handles()
+        assert remaining == []
+
+    @pytest.mark.anyio
     async def test_local_task_unaffected_by_docker_probe(
         self, db_with_tasks: Database
     ) -> None:

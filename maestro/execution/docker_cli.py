@@ -68,15 +68,25 @@ class DockerCli:
         return rc == 0
 
     async def inspect(self, name: str) -> dict[str, Any] | None:
-        """Inspect a container by name. Returns None if absent or
-        json decode error.
+        """Inspect a container by name.
+
+        Returns None only when docker itself reports the object as absent
+        (stderr contains "no such", case-insensitively — covers "No such
+        object/container/image"). Any other non-zero return code (daemon
+        unreachable, permission error, etc.) is a genuine failure, not
+        "absent" — it raises RuntimeError so callers never conflate a
+        connectivity/daemon fault with "container doesn't exist". A JSON
+        decode error on an rc=0 response is treated as absent/unknown
+        (None) rather than raised, since docker itself reported success.
         """
-        rc, out, _ = await self._run(
+        rc, out, err = await self._run(
             [self._binary, "inspect", "--format", "{{json .}}", name],
             self._op_timeout,
         )
         if rc != 0:
-            return None
+            if "no such" in err.lower():
+                return None
+            raise RuntimeError(f"docker inspect {name} failed: {err or out}")
         try:
             return json.loads(out)
         except json.JSONDecodeError:

@@ -512,11 +512,22 @@ class Orchestrator:
         for this workstream — a local-backed workstream (or one whose
         handle already reached `terminal`/`cleaned`) is always unaffected,
         preserving pre-Task-18 recovery behavior exactly.
+
+        When the verdict confirms no container is left, the open handle row
+        is closed (terminal -> cleaned) here so it doesn't linger open and
+        shadow the workstream's next attempt after it's recovered to READY.
         """
         row = workstream_handles.get(workstream_id)
         if row is None:
             return False
         verdict = await probe_execution(row["execution_id"], self._docker)
+        if not verdict.needs_review:
+            await self._db.mark_execution_state(
+                row["execution_id"], "terminal", allowed_from=["prepared", "running"]
+            )
+            await self._db.mark_execution_state(
+                row["execution_id"], "cleaned", allowed_from=["terminal"]
+            )
         return verdict.needs_review
 
     async def _gc_terminal_handles(self, handles: list[dict[str, Any]]) -> int:

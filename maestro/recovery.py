@@ -243,6 +243,15 @@ class StateRecovery:
 
         verdict = await probe_execution(row["execution_id"], self._docker)
         if not verdict.needs_review:
+            # Confirmed no container: the execution is done. Close the open
+            # handle row now so it doesn't linger open/shadow the fresh
+            # attempt's own handle after the task is re-READYed.
+            await self._db.mark_execution_state(
+                row["execution_id"], "terminal", allowed_from=["prepared", "running"]
+            )
+            await self._db.mark_execution_state(
+                row["execution_id"], "cleaned", allowed_from=["terminal"]
+            )
             return False
 
         message = f"Docker recovery: {verdict.reason}"

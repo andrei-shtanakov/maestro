@@ -2,10 +2,20 @@
 
 These exercise the FULL stack (`BackendResolver` -> `LocalBackend(DockerIsolator)`
 -> `DockerTaskHandle`) against a real docker daemon. They auto-skip (never
-fail/error) when docker is unavailable, so a CI runner without docker sees
-clean SKIPs. Every setup call that shells out to docker (image pull, network
-create) lives inside a `@skip_no_docker`-gated test body, so a skipped
-collection run never touches docker at all.
+fail/error) when docker is unavailable.
+
+Two independent gates keep collection cheap and daemon-free:
+  - `skip_no_docker` (collection-time, via `@pytest.mark.skipif`) only checks
+    `shutil.which("docker")` — a plain PATH lookup, no subprocess. A machine
+    without the docker CLI skips here with zero shelling out at collection.
+  - `_require_daemon()` (test-execution-time, called as the first line of
+    each test body) runs `docker version` and calls `pytest.skip(...)` if it
+    fails. A machine with the CLI but no running daemon skips here instead,
+    after collection has already completed.
+
+Every OTHER setup call that shells out to docker (image pull, network
+create) lives inside a test body gated by both of the above, so a skipped
+run never touches docker beyond the single `docker version` daemon probe.
 
 Network test note: the only network reachability asserted here is between
 two containers on a locally created docker network — never the public
@@ -31,16 +41,23 @@ pytestmark = pytest.mark.anyio
 IMAGE = "python:3.12-slim"  # a small public image with python; no agent CLIs needed
 
 
-def _docker_available() -> bool:
-    """Return True only if the docker CLI exists and the daemon answers."""
-    if shutil.which("docker") is None:
-        return False
-    return subprocess.run(["docker", "version"], capture_output=True).returncode == 0
-
-
 skip_no_docker = pytest.mark.skipif(
-    not _docker_available(), reason="docker not available"
+    shutil.which("docker") is None, reason="docker CLI not installed"
 )
+
+
+def _require_daemon() -> None:
+    """Skip the current test if the docker CLI can't reach a daemon.
+
+    Cheap collection-time gating (`skip_no_docker`) only confirms the CLI
+    binary exists; this confirms the daemon actually answers, and must be
+    called at test-execution time (never at import/collection time) so a
+    CLI-present-but-daemon-down machine skips per-test instead of hanging
+    or failing collection.
+    """
+    result = subprocess.run(["docker", "version"], capture_output=True)
+    if result.returncode != 0:
+        pytest.skip("docker daemon unavailable")
 
 
 def _pull_image() -> None:
@@ -123,6 +140,7 @@ async def test_bind_mount_collect_is_noop_file_visible_on_host(
     is a no-op, because the workdir is bind-mounted (not copied) into the
     container.
     """
+    _require_daemon()
     _pull_image()
     wd = tmp_path / "wd"
     wd.mkdir()
@@ -149,6 +167,7 @@ async def test_bind_mount_collect_is_noop_file_visible_on_host(
 @skip_no_docker
 async def test_success_leaves_no_container(tmp_path: Path) -> None:
     """A successful run's container is fully removed by finalize's cleanup."""
+    _require_daemon()
     _pull_image()
     wd = tmp_path / "wd"
     wd.mkdir()
@@ -176,6 +195,7 @@ async def test_timeout_kills_and_removes_container(tmp_path: Path) -> None:
     """A run that exceeds timeout_seconds is reported as timed out, and its
     container is stopped/removed with no leftover after finalize.
     """
+    _require_daemon()
     _pull_image()
     wd = tmp_path / "wd"
     wd.mkdir()
@@ -206,6 +226,7 @@ async def test_opt_in_network_via_local_docker_network(tmp_path: Path) -> None:
     network can reach ANOTHER container attached to that same local
     network — this test never asserts reachability to the public internet.
     """
+    _require_daemon()
     _pull_image()
     suffix = uuid.uuid4().hex[:8]
     network_name = f"maestro-itest-net-{suffix}"

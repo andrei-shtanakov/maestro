@@ -19,11 +19,20 @@ class FakeDockerCli(DockerCli):
     `LocalBackend`'s docker-aware `healthcheck`/`can_run` call.
     """
 
-    def __init__(self, *, version_ok: bool = True, image_exists: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        version_ok: bool = True,
+        image_exists: bool = True,
+        version_ok_raises: Exception | None = None,
+    ) -> None:
         self._version_ok = version_ok
         self._image_exists = image_exists
+        self._version_ok_raises = version_ok_raises
 
     async def version_ok(self) -> bool:
+        if self._version_ok_raises is not None:
+            raise self._version_ok_raises
         return self._version_ok
 
     async def image_exists(self, image: str) -> bool:
@@ -107,6 +116,23 @@ async def test_docker_healthcheck_daemon_unreachable(monkeypatch):
     health = await backend.healthcheck()
     assert health.reachable is False
     assert "daemon" in health.detail
+
+
+@pytest.mark.anyio
+async def test_docker_healthcheck_subprocess_error_returns_unreachable(monkeypatch):
+    """A `version_ok()` that raises (e.g. `FileNotFoundError` when the
+    `docker` binary is missing) must not escape `healthcheck()` — it should
+    be reported as unreachable, not propagate into the scheduler/orchestrator
+    spawn flow."""
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    docker = FakeDockerCli(version_ok_raises=FileNotFoundError("docker not found"))
+    cfg = DockerConfig(image="maestro-runner:x")
+    backend = LocalBackend(
+        DockerIsolator(cfg, docker=docker), backend_id="docker", docker=docker
+    )
+    health = await backend.healthcheck()
+    assert health.reachable is False
+    assert "docker unreachable" in (health.detail or "")
 
 
 @pytest.mark.anyio

@@ -176,7 +176,11 @@ class LocalBackend:
                 reachable=False,
                 detail=f"DOCKER_HOST={host!r} is remote; Phase 1 is local only",
             )
-        if not await self._docker.version_ok():
+        try:
+            reachable = await self._docker.version_ok()
+        except Exception as e:
+            return BackendHealth(reachable=False, detail=f"docker unreachable: {e}")
+        if not reachable:
             return BackendHealth(reachable=False, detail="docker daemon unreachable")
         return BackendHealth(reachable=True)
 

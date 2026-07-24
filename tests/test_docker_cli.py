@@ -61,6 +61,16 @@ async def test_ps_ids_by_label_splits_lines():
 
 
 @pytest.mark.anyio
+async def test_inspect_raises_on_daemon_error():
+    fake = _FakeDocker(
+        [(1, "", "Cannot connect to the Docker daemon at unix:///var/run/docker.sock")]
+    )
+    cli = DockerCli(run_cmd=fake)
+    with pytest.raises(RuntimeError, match="docker inspect"):
+        await cli.inspect("maestro-x")
+
+
+@pytest.mark.anyio
 async def test_inspect_json_decode_error():
     fake = _FakeDocker([(0, "not json{", "")])
     cli = DockerCli(run_cmd=fake)

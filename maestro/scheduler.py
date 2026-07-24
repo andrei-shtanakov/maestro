@@ -1303,17 +1303,20 @@ class Scheduler:
 
                 if elapsed.total_seconds() > timeout_seconds:
                     await running_task.handle.terminate(grace_seconds=10.0)
-                    await asyncio.shield(ensure_finalize_task(running_task))
+                    timeout_fin = await asyncio.shield(
+                        ensure_finalize_task(running_task)
+                    )
                     timeout_exec_id = running_task.execution_id
                     if timeout_exec_id is not None:
-                        # Container was force-stopped: mark terminal only —
-                        # cleanup may not have been confirmed, so `cleaned`
-                        # would overclaim.
                         await self._db.mark_execution_state(
                             timeout_exec_id,
                             "terminal",
                             allowed_from=["prepared", "running"],
                         )
+                        if timeout_fin.cleaned:
+                            await self._db.mark_execution_state(
+                                timeout_exec_id, "cleaned", allowed_from=["terminal"]
+                            )
                     await self._handle_task_timeout(task_id, running_task)
                     completed.append(task_id)
 

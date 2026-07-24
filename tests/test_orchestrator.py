@@ -1762,6 +1762,9 @@ class TestStartupRecovery:
             await orch._recover_stranded_workstreams()
             w = await db.get_workstream("w")
             assert w.status == WorkstreamStatus.READY
+
+            remaining = await db.get_open_execution_handles()
+            assert all(h["entity_id"] != "w" for h in remaining)
         finally:
             await db.close()
 
