@@ -1,3 +1,5 @@
+import shlex
+
 import pytest
 
 from maestro.execution.exec_config import SshTransport
@@ -36,6 +38,16 @@ def test_ssh_opts_cannot_override_guarded_key():
         SshCli(_t(ssh_opts=["-o", "StrictHostKeyChecking=no"])).validate_ssh_opts()
 
 
+def test_ssh_opts_cannot_override_guarded_key_compact_form():
+    with pytest.raises(ValueError, match="guarded"):
+        SshCli(_t(ssh_opts=["-oStrictHostKeyChecking=no"])).validate_ssh_opts()
+
+
+def test_ssh_opts_cannot_override_guarded_key_case_insensitive():
+    with pytest.raises(ValueError, match="guarded"):
+        SshCli(_t(ssh_opts=["-o", "stricthostkeychecking=no"])).validate_ssh_opts()
+
+
 def test_probe_tool_rejects_bad_name():
     with pytest.raises(ValueError, match="tool name"):
         import anyio
@@ -56,3 +68,17 @@ async def test_run_uses_injected_runner():
     res = await cli.run(["true"], stdin="x")
     assert res.returncode == 0 and seen["stdin"] == "x"
     assert seen["argv"][0] == "ssh" and seen["argv"][-2:] == ["gpu", "true"]
+
+
+@pytest.mark.anyio
+async def test_run_shell_quotes_argv_with_embedded_space():
+    seen = {}
+
+    async def fake(argv, stdin):
+        seen["argv"] = argv
+        return RunResult(0, "", "")
+
+    cli = SshCli(_t(), runner=fake)
+    await cli.run(["echo", "a b"])
+    remote_command = seen["argv"][-1]
+    assert shlex.split(remote_command) == ["echo", "a b"]

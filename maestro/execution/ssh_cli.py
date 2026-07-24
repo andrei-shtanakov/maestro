@@ -8,6 +8,7 @@ verification / connect timeout / password-auth-off.
 
 import asyncio
 import re
+import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -22,6 +23,7 @@ _GUARDED_KEYS = {
     "PasswordAuthentication",
     "KbdInteractiveAuthentication",
 }
+_GUARDED_KEYS_LOWER = {key.lower() for key in _GUARDED_KEYS}
 
 
 @dataclass
@@ -72,13 +74,21 @@ class SshCli:
         return self._t.workdir_root
 
     def validate_ssh_opts(self) -> None:
-        """Reject any user ssh_opt that sets a guarded key."""
+        """Reject any user ssh_opt that sets a guarded key.
+
+        Detects both the two-token form (``-o KEY=VALUE``) and the compact
+        single-token form (``-oKEY=VALUE``), and compares keys
+        case-insensitively since OpenSSH option names are case-insensitive.
+        """
         opts = self._t.ssh_opts
         for i, tok in enumerate(opts):
+            key: str | None = None
             if tok == "-o" and i + 1 < len(opts):
                 key = opts[i + 1].split("=", 1)[0].strip()
-                if key in _GUARDED_KEYS:
-                    raise ValueError(f"ssh_opt sets guarded key {key!r}")
+            elif tok.startswith("-o") and tok != "-o":
+                key = tok[2:].split("=", 1)[0].strip()
+            if key is not None and key.lower() in _GUARDED_KEYS_LOWER:
+                raise ValueError(f"ssh_opt sets guarded key {key!r}")
 
     def _guarded_opts(self) -> list[str]:
         return [
@@ -133,8 +143,14 @@ class SshCli:
         return argv
 
     async def run(self, argv: list[str], *, stdin: str | None = None) -> RunResult:
-        """Run `argv` on the remote host via `ssh_base() + argv`."""
-        return await self._runner(self.ssh_base() + argv, stdin)
+        """Run `argv` on the remote host via `ssh_base() + [shlex.join(argv)]`.
+
+        OpenSSH joins all trailing command arguments with spaces into a
+        single string handed to the remote login shell, which re-parses it.
+        Shell-quoting `argv` into one token here preserves argument
+        boundaries (e.g. embedded spaces) across that re-parse.
+        """
+        return await self._runner([*self.ssh_base(), shlex.join(argv)], stdin)
 
     async def rsync(
         self, src: str, dst: str, *, delete: bool, excludes: list[str]
