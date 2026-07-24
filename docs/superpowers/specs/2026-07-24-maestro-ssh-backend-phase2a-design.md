@@ -73,7 +73,9 @@ execution:
     gpu-box:
       transport:
         type: ssh
-        host: gpu-box             # ssh alias or [user@]host[:port]; NOT ssh://
+        host: gpu-box             # ssh config alias or a bare hostname; NOT ssh://, NOT user@host:port
+        user: null                # optional; passed safely, never folded into `host`
+        port: null                # optional; passed via `-p`, never `host:port`
         workdir_root: /var/tmp/maestro
         connect_timeout_s: 10
         ssh_opts: ["-o", "ServerAliveInterval=15"]   # whitelisted; see B
@@ -114,10 +116,17 @@ Rules (all enforced at config load, fail-fast):
   "SSH backends are Mode-2 only until Phase 2b."
 
 Config models: introduce `BackendSpec { transport: TransportSpec, isolation:
-IsolationSpec, secret_env, max_concurrent? }`, `TransportSpec` =
-`LocalTransport | SshTransport`, `IsolationSpec` = `BareIsolation |
-DockerIsolation`. The GH denylist validator (`exec_config._is_denylisted`) moves
-to `BackendSpec.secret_env`.
+IsolationSpec, secret_env, inherit_secret_defaults, max_concurrent? }`,
+`TransportSpec` = `LocalTransport | SshTransport`, `IsolationSpec` =
+`BareIsolation | DockerIsolation`. The GH denylist validator
+(`exec_config._is_denylisted`) moves to `BackendSpec.secret_env`.
+
+- **Structured host, not a single token.** OpenSSH does not treat an arbitrary
+  `[user@]host[:port]` as one safe host token. `SshTransport` uses **separate
+  fields**: `host` (an ssh-config alias or a bare hostname), optional `user`,
+  optional `port`. `user` is passed as `-l <user>` (or a validated `user@host`),
+  `port` via `-p <port>` — never string-concatenated into `host`. A `host`
+  containing `@` or `:` is rejected at config load.
 
 ### B. `SshBackend` + `SshCli`
 
@@ -148,15 +157,24 @@ New files `maestro/execution/ssh_backend.py` and `maestro/execution/ssh_cli.py`.
 
 1. `ssh host mktemp -d <workdir_root>/maestro-exec-<execution_id>.XXXX`
    (uses **`execution_id`**, the uuid, not the entity `run_id`).
-2. `rsync -a --delete <workdir>/ host:<tmp>/` excluding `.maestro`, logs, and
-   backend temp (parent §8). **Remote git materialization:** a Mode-2 worktree
-   is a *linked* worktree — its `.git` is a file pointing into the center's main
-   `.git/worktrees/<name>`, which won't exist remotely. The remote needs a
-   self-contained git repo for spec-runner to operate; the exact strategy
-   (materialize a standalone repo on the remote vs. rsync a detached copy) is a
-   plan-time detail. It does **not** affect collect: collect is **file-level**
-   (E) and the remote's git history is **never** authoritative — the center owns
-   branch/commit/PR/merge, and only file changes are brought back.
+2. **Remote git materialization via a bundle (fixed strategy, not plan-time).**
+   A Mode-2 worktree is a *linked* worktree — its `.git` is a file pointing into
+   the center's main `.git/worktrees/<name>`, absent remotely. spec-runner needs
+   a self-contained git repo, so the sequence is:
+   1. the center creates a **git bundle** from the authoritative repo at the
+      worktree's HEAD (`git bundle create <bundle> HEAD` / the feature branch);
+   2. the bundle is transferred to the remote tmp dir — it carries **no GitHub
+      credentials** and no remote URLs;
+   3. remote `git clone <bundle> <tmp>/repo` produces a self-contained repo;
+   4. the local worktree contents — **including initially dirty/untracked
+      files** — are rsync'd over the clone (`rsync -a`, excluding `.git`,
+      `.maestro`, logs, backend temp), reproducing the exact working state;
+   5. the remote `.git` is **never** collected back;
+   6. final file changes are computed against the **pre-run content baseline**
+      (E), not remote git history.
+
+   This keeps the center the sole owner of branch/commit/PR/merge and needs no
+   GitHub auth on the executor.
 3. **Secrets via protected temp file, never in argv.** Build the `0600`
    env-file **locally** in a `0700` temp dir from this backend's `secret_env`
    allowlist (reuse the control-char validation currently in
@@ -166,8 +184,12 @@ New files `maestro/execution/ssh_backend.py` and `maestro/execution/ssh_cli.py`.
    never logged. Referenced remotely via `set -a; . <envfile>; set +a`.
 4. **Verified launcher over stdin, detached, process-group identified.** The
    remote command is a fixed launcher **script piped over stdin** to
-   `ssh host bash -s`, **not** assembled by shell interpolation of argv. The
-   script:
+   `ssh host bash -s`, **not** assembled by shell interpolation of argv. Remote
+   paths and the `execution_id` are passed as **positional arguments**
+   (`bash -s <execution_id> <tmp> -- "$@"`), never interpolated into the script
+   text/heredoc. The script:
+   - writes an **ownership marker** `<tmp>/.maestro-owner` containing the
+     `execution_id` (gates the guarded recursive delete in D);
    - `setsid` the job into its own **session/process group** so the whole tree
      can be signalled and descendants can't be orphaned;
    - writes both `pid` and `pgid` to `<tmp>/<execution_id>.pid`;
@@ -181,13 +203,14 @@ New files `maestro/execution/ssh_backend.py` and `maestro/execution/ssh_cli.py`.
 5. A local asyncio **monitor** task (D) tails the job's output over SSH into the
    center's `log_path` and polls the status marker to update the cached
    `poll()`.
-6. **Durable identity.** `transport_ref` must be unambiguous —
-   `"ssh:<host>:<run_id>"` is rejected (host may be `user@host:port`; `run_id`
-   is the entity id; the string is ambiguous to parse). Persist a **structured**
-   ref plus dedicated columns (see G): `remote_host`, `remote_dir`,
-   `status_marker` (`<tmp>/<execution_id>.status`), keyed by `execution_id`.
-   `probe(ref)` after a transport drop reads the marker (or `ssh host kill -0`)
-   without a live channel.
+6. **Durable identity.** A delimited `"ssh:<host>:<run_id>"` string is rejected
+   (ambiguous to parse). `transport_ref` is stored as an **opaque, versioned
+   JSON encoding** (`{"v":1,"transport":"ssh","host":…,"port":…,"remote_dir":…,
+   "status_marker":…}`) — treated as an opaque blob, never string-split. The
+   **source of truth for recovery lookup** is the **dedicated columns** added in
+   G: `remote_host`, `remote_dir`, `status_marker` (`<tmp>/<execution_id>.status`),
+   keyed by `execution_id`. `probe(ref)` after a transport drop reads the marker
+   (or `ssh host kill -0 -<pgid>`) without a live channel.
 
 ### D. `SshTaskHandle` and the monitor
 
@@ -209,9 +232,16 @@ The monitor task must:
 from the marker; `timed_out` if `req.timeout_seconds` elapsed first).
 `terminate(grace)` / `kill()` signal the **process group** (`ssh host kill
 -TERM -<pgid>` then `kill -KILL -<pgid>`), not just the wrapper pid. **No broad
-`pkill` by run_id** — it could match a foreign process. `cleanup()` removes the
-remote tmp dir and best-effort `shred`s the env-file *when available* (never
-depends on it), only after collect is confirmed (G).
+`pkill` by run_id** — it could match a foreign process.
+
+`cleanup()` removes the remote tmp dir and best-effort `shred`s the env-file
+*when available* (never depends on it), only after collect is confirmed (G).
+**Guarded recursive delete:** before any remote `rm -rf`, verify (a) the target
+`remote_dir` is **under** the configured `workdir_root`, and (b) it contains an
+**ownership marker** (`<tmp>/.maestro-owner`, written in C.4) whose content
+matches the expected `execution_id`. A persisted path alone is **not**
+sufficient authorization for a recursive delete — both checks must pass or the
+delete is refused and the row left for review.
 
 ### E. Collect — baseline diff, atomic apply, inside finalization
 
@@ -223,20 +253,36 @@ on_failure="collect")` (Phase-1 orchestrator currently sends `mode="none"`).
   it, a divergence check can't tell whether the local worktree was mutated in
   parallel.
 - **Collect** = rsync `host:<tmp>/ → local staging` (exclude `.git`,
-  `.maestro`, logs, secret files, backend temp), then compute a **manifest/diff**
-  vs the baseline and apply **file-level** into the *existing* worktree (never a
-  directory swap — the worktree holds a `.git` file/metadata, parent §8):
-  - supports **modified**, **new**, and **deleted** files;
-  - tolerates an initially **dirty** worktree;
-  - `conflict_policy="fail"` triggers **only** when a path the *remote* changed
-    also diverged locally from the baseline (parallel local mutation);
-  - **symlink / path-traversal protection**: reject any staged path that
-    escapes the worktree root or is a symlink pointing outside it;
-  - **forbid applying** `.git/**`, `.maestro/**`, backend temp, and secret
-    files regardless of manifest;
-  - apply is **atomic per file** (write to temp in the target dir, `rename`).
-- On conflict or any apply failure → the workstream goes **NEEDS_REVIEW** and
-  **staging + remote tmp are preserved** for diagnosis (not cleaned).
+  `.maestro`, logs, secret files, backend temp), then apply **file-level** into
+  the *existing* worktree (never a directory swap — the worktree holds a `.git`
+  file/metadata, parent §8) in **two strictly separated phases**. "No partial
+  apply" is stronger than atomic-per-file and requires this split:
+
+  1. **Preflight (zero worktree mutation).** Compute the remote diff vs the
+     baseline; check **all** conflicts; validate **all** forbidden-path /
+     symlink / path-traversal rules; stage every replacement file and the
+     deletion list. Any failure here → **no local change whatsoever**,
+     workstream → NEEDS_REVIEW.
+     - supports **modified**, **new**, and **deleted** files;
+     - tolerates an initially **dirty** worktree;
+     - `conflict_policy="fail"` triggers **only** when a path the *remote*
+       changed also diverged locally from the baseline (parallel local
+       mutation);
+     - **symlink / path-traversal protection**: reject any staged path that
+       escapes the worktree root or is a symlink pointing outside it;
+     - **forbid applying** `.git/**`, `.maestro/**`, backend temp, and secret
+       files regardless of manifest.
+  2. **Apply with a rollback journal.** Back up every affected local path
+     (originals into a journal dir), then apply all replacements/deletions
+     (atomic per file: write-temp-in-target-dir + `rename`). On **any** runtime
+     error mid-apply, **restore all backups** from the journal (best-effort
+     full rollback), then route to NEEDS_REVIEW. The journal is deleted only
+     after a fully successful apply.
+- On conflict / preflight failure → **zero** local changes; workstream →
+  NEEDS_REVIEW; staging + remote tmp preserved. On an I/O error during apply →
+  rollback restores the worktree; if rollback itself cannot fully complete, the
+  workstream is NEEDS_REVIEW and the journal + staging + remote tmp are all
+  preserved for manual recovery.
 - **Single-owner.** Collect stays *inside* `finalize_handle` (it already calls
   `handle.collect()`); we do **not** add a second collect call in the success
   continuation. The orchestrator continuation is gated on finalization having
@@ -257,9 +303,11 @@ snapshot protocol.
 **Mechanism** (per mirror tick):
 
 1. On the remote, produce a **consistent snapshot** of the live DB into a temp
-   file via Python `sqlite3.Connection.backup()` (a small remote helper
-   invocation — `ssh host python3 - <<'PY' …`). This is safe under an active
-   writer and adds **no new runtime dependency** (Python is already required for
+   file via Python `sqlite3.Connection.backup()`. The helper **script is piped
+   over stdin** (`ssh host python3 - <src_db> <dst_snapshot>`) and receives the
+   source/destination paths as **positional `sys.argv` arguments** — remote
+   paths are **never** interpolated into the script text/heredoc. Safe under an
+   active writer; **no new runtime dependency** (Python is already required for
    spec-runner).
 2. Atomically `rename` the snapshot to a stable name on the remote.
 3. `rsync` the **single** snapshot file to the center.
@@ -285,6 +333,41 @@ recovery would lose them. So the execution state machine gains a durable
 ```
 prepared → running → terminal → collected → cleaned
 ```
+
+**Conditional cleanup — a change to the shared `finalize_handle` contract.**
+The shipped `finalize_handle` (`execution/finalize.py`) calls `cleanup()`
+**unconditionally** after `collect()`, even when collect raised. For SSH that
+would `rm -rf` the remote tmp exactly when its unapplied changes must be kept.
+The contract changes so cleanup is **gated on collect success**:
+
+```python
+@dataclass
+class FinalizationResult:
+    execution: ExecutionResult
+    collect_error: str | None = None
+    cleanup_error: str | None = None
+    collect_succeeded: bool = False
+    cleanup_attempted: bool = False
+
+    @property
+    def cleaned(self) -> bool:
+        return self.cleanup_attempted and self.cleanup_error is None
+```
+
+Rule in `finalize_handle`:
+
+- `collect()` succeeds → mark `collected`, then call `cleanup()`
+  (`cleanup_attempted=True`); on success mark `cleaned`.
+- `collect()` fails / conflicts → `cleanup()` is **not** called; remote tmp +
+  staging are preserved; the monitor routes the workstream to **NEEDS_REVIEW**.
+- **Docker / local** `collect()` is a no-op that always succeeds →
+  `collect_succeeded=True`, cleanup runs as before — **zero behavior change**.
+
+This makes the `terminal → collected → cleaned` transitions *observable* (driven
+by real collect/cleanup outcomes), not merely declarative. Both modes'
+`_monitor_running` call sites (which today read `fin.cleaned`) branch on
+`fin.collect_succeeded` before marking `collected`/`cleaned` and before entering
+any gate/PR flow.
 
 - **Schema migration #8** (`_migrate_*`): extend the `execution_handles.state`
   CHECK to include `'collected'`, and `ALTER TABLE ADD COLUMN` for
@@ -323,10 +406,11 @@ prepared → running → terminal → collected → cleaned
   live remote spec dir).
 - **Finalization gates the continuation.** In `_monitor_running`, after
   `ensure_finalize_task`, the workstream may proceed to ex-post gate / PR /
-  merge **only if** `FinalizationResult` collected successfully. On
-  collect error/conflict: `NEEDS_REVIEW`, preserve remote tmp + staging, do
-  **not** enter the PR/gate flow. Execution state is marked `terminal` →
-  `collected` (on success) → `cleaned`.
+  merge **only if** `fin.collect_succeeded`. On collect error/conflict:
+  `NEEDS_REVIEW`, preserve remote tmp + staging, do **not** enter the PR/gate
+  flow. Execution state is marked `terminal` → `collected` (only on
+  `collect_succeeded`) → `cleaned` (only on `fin.cleaned`), per the conditional
+  cleanup contract (G).
 - **Observability.** Propagate `TRACEPARENT` via `trace_env` into the remote
   env; add spans `execution.dispatch`, `execution.transfer` (bytes in/out), and
   record host/backend on the workstream (parent §14).
@@ -340,23 +424,32 @@ Unit (injected fake-SSH runner, **no real sshd**):
 - run / poll(cached) / wait / terminate(**process-group**) / kill / cleanup /
   probe;
 - **shell quoting**: argv with spaces, quotes, `$()`, newlines survives to the
-  remote intact (verified launcher over stdin);
+  remote intact (verified launcher over stdin, positional args);
 - **`ssh_opts` cannot disable** `BatchMode` / host verification / connect
   timeout / password-auth-off (guarded precedence);
+- **host fields**: a `host` containing `@` or `:` is rejected; `user`/`port`
+  render as `-l`/`-p`, never concatenated into `host`;
 - secret env-file: `0600`/`0700`, control-char rejection, GH denylist, value
   never in argv;
 - **reconnect tail** resumes at byte offset — no duplicated log bytes;
 - **process-group terminate** kills descendants (fake tree);
-- **collect**: local divergence on a remote-changed path → conflict with **no
-  partial apply**; remote **deletion** applied; **symlink escape rejected**;
+- **collect (two-phase)**: preflight conflict on a remote-changed path →
+  **zero** local changes; I/O error mid-apply → **rollback journal restores**
+  the worktree; remote **deletion** applied; **symlink escape rejected**;
   dirty-worktree tolerated; atomic per-file apply;
+- **conditional cleanup**: collect failure ⇒ `cleanup()` **not** called, remote
+  tmp preserved; collect success ⇒ `collected` then `cleaned`; docker/local
+  no-op collect ⇒ unchanged;
+- **guarded rm -rf**: refused when `remote_dir` is outside `workdir_root` or the
+  `.maestro-owner` marker's `execution_id` mismatches;
 - **recovery**: crash after terminal marker but before collect → remote tmp
   **preserved**, workstream → `NEEDS_REVIEW`; marker-absent + alive →
   `NEEDS_REVIEW`;
-- **progress mirror**: `sqlite3.backup()` snapshot is readable under an active
-  remote writer; mirror atomic-replace;
+- **progress mirror**: `sqlite3.backup()` snapshot (positional-arg helper over
+  stdin) is readable under an active remote writer; mirror atomic-replace;
 - config: registry parse, legacy-docker shim + collision error, Mode-1 SSH
-  fail-fast, unknown-backend fail-fast.
+  fail-fast, unknown-backend fail-fast, per-backend `secret_env` +
+  `inherit_secret_defaults`.
 
 Gated opt-in e2e (real localhost sshd, skipped by default like the docker
 integration gate): a Mode-2 workstream over `ssh localhost`, mirrored progress
