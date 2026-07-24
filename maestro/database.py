@@ -149,9 +149,13 @@ CREATE TABLE IF NOT EXISTS execution_handles (
     attempt        INTEGER NOT NULL,
     backend_id     TEXT NOT NULL,
     transport_ref  TEXT NOT NULL,
-    state          TEXT NOT NULL CHECK (state IN ('prepared','running','terminal','cleaned')),
+    state          TEXT NOT NULL CHECK (state IN ('prepared','running','terminal','collected','cleaned')),
     created_at     TEXT NOT NULL,
-    finished_at    TEXT
+    finished_at    TEXT,
+    remote_host    TEXT,
+    remote_dir     TEXT,
+    status_marker  TEXT,
+    collected_at   TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_exec_state_backend ON execution_handles (state, backend_id);
 CREATE INDEX IF NOT EXISTS ix_exec_entity ON execution_handles (entity_kind, entity_id, attempt);
@@ -430,6 +434,7 @@ class Database:
             (6, "gates_v13_gate_approvals", self._migrate_gate_approvals),
             (7, "execution_handles", self._migrate_execution_handles),
             (8, "entity_backend_columns", self._migrate_entity_backend_columns),
+            (9, "ssh_handle_columns", self._migrate_ssh_handle_columns),
         ]
 
         for version, name, fn in ordered:
@@ -682,6 +687,78 @@ class Database:
                 await self._connection.execute(
                     f"ALTER TABLE {table} ADD COLUMN backend TEXT"
                 )
+
+    async def _migrate_ssh_handle_columns(self) -> None:
+        """Migration 9: add `collected` state + remote columns to
+        `execution_handles`.
+
+        SSH runs need a durable `collected` state (SSH-collected but not
+        yet cleaned) and persisted remote coordinates (`remote_host`,
+        `remote_dir`, `status_marker`, `collected_at`). SQLite cannot alter
+        a CHECK constraint or add columns to an existing CHECK in place, so
+        this rebuilds the table (rename -> create-new -> copy -> drop) and
+        re-creates its indexes, same shape as `_migrate_execution_handles`
+        (migration 7).
+
+        Idempotent via `PRAGMA table_info` (guarding on `collected_at`):
+        a fresh database already gets the new schema from SCHEMA_SQL, so
+        this no-ops rather than needlessly rebuilding an already-correct
+        table — mirrors `_migrate_entity_backend_columns` (migration 8).
+
+        Uses sequential `execute()` calls rather than `executescript()`:
+        `executescript()` implicitly commits any pending transaction before
+        running, which would force-commit the batch of migrations 1-8
+        mid-loop and break the single-final-commit atomicity
+        `initialize_schema()` relies on. `execute()` leaves the transaction
+        open, matching every other migration in this list.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(execution_handles)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "collected_at" in columns:
+            return
+
+        await self._connection.execute(
+            "ALTER TABLE execution_handles RENAME TO execution_handles_old"
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE execution_handles (
+                execution_id   TEXT PRIMARY KEY,
+                entity_kind    TEXT NOT NULL CHECK (entity_kind IN ('task','workstream')),
+                entity_id      TEXT NOT NULL,
+                attempt        INTEGER NOT NULL,
+                backend_id     TEXT NOT NULL,
+                transport_ref  TEXT NOT NULL,
+                state          TEXT NOT NULL CHECK (state IN ('prepared','running','terminal','collected','cleaned')),
+                created_at     TEXT NOT NULL,
+                finished_at    TEXT,
+                remote_host    TEXT,
+                remote_dir     TEXT,
+                status_marker  TEXT,
+                collected_at   TEXT
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            INSERT INTO execution_handles
+                (execution_id, entity_kind, entity_id, attempt, backend_id,
+                 transport_ref, state, created_at, finished_at)
+            SELECT execution_id, entity_kind, entity_id, attempt, backend_id,
+                   transport_ref, state, created_at, finished_at
+            FROM execution_handles_old
+            """
+        )
+        await self._connection.execute("DROP TABLE execution_handles_old")
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_exec_state_backend "
+            "ON execution_handles (state, backend_id)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_exec_entity "
+            "ON execution_handles (entity_kind, entity_id, attempt)"
+        )
 
     @asynccontextmanager
     async def transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:
@@ -1259,6 +1336,9 @@ class Database:
         backend_id: str,
         transport_ref: str,
         attempt: int,
+        remote_host: str | None = None,
+        remote_dir: str | None = None,
+        status_marker: str | None = None,
     ) -> None:
         """Atomically CAS the entity to `running_status` and record a handle.
 
@@ -1285,6 +1365,10 @@ class Database:
             backend_id: Backend that will run the execution (e.g. `"docker"`).
             transport_ref: Backend-specific handle (e.g. container name).
             attempt: Attempt number for this entity.
+            remote_host: SSH remote host, when `backend_id` is remote
+                (e.g. `"ssh"`); `None` for local/docker backends.
+            remote_dir: Remote working directory for the execution.
+            status_marker: Remote path polled to detect completion.
 
         Raises:
             DatabaseError: If database not connected.
@@ -1322,8 +1406,9 @@ class Database:
                 """
                 INSERT INTO execution_handles
                   (execution_id, entity_kind, entity_id, attempt, backend_id,
-                   transport_ref, state, created_at, finished_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, NULL)
+                   transport_ref, state, created_at, finished_at,
+                   remote_host, remote_dir, status_marker)
+                VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, NULL, ?, ?, ?)
                 """,
                 (
                     execution_id,
@@ -1333,6 +1418,9 @@ class Database:
                     backend_id,
                     transport_ref,
                     _format_datetime(datetime.now(UTC)),
+                    remote_host,
+                    remote_dir,
+                    status_marker,
                 ),
             )
             await self._connection.commit()
@@ -1353,7 +1441,8 @@ class Database:
         `allowed_from` — a handle can never regress (e.g. `cleaned` ->
         `running` is a no-op, not an error). `finished_at` is stamped only
         when transitioning into a terminal state (`"terminal"` or
-        `"cleaned"`); otherwise it is left unchanged.
+        `"cleaned"`); `collected_at` is stamped only when transitioning
+        into `"collected"`. Both are left unchanged otherwise.
 
         Caveat: this is a silent no-op — it does not raise or report which
         rows changed — both when `execution_id` matches no row at all and
@@ -1363,7 +1452,8 @@ class Database:
 
         Args:
             execution_id: The execution handle to update.
-            new_state: Target state (`prepared`/`running`/`terminal`/`cleaned`).
+            new_state: Target state (`prepared`/`running`/`terminal`/
+                `collected`/`cleaned`).
             allowed_from: States from which this transition is permitted.
 
         Raises:
@@ -1379,22 +1469,28 @@ class Database:
             if new_state in ("terminal", "cleaned")
             else None
         )
+        collected_at = (
+            _format_datetime(datetime.now(UTC)) if new_state == "collected" else None
+        )
         await self._connection.execute(
             f"""
             UPDATE execution_handles
-            SET state = ?, finished_at = COALESCE(?, finished_at)
+            SET state = ?,
+                finished_at = COALESCE(?, finished_at),
+                collected_at = COALESCE(?, collected_at)
             WHERE execution_id = ? AND state IN ({placeholders})
             """,
-            (new_state, finished_at, execution_id, *allowed_from),
+            (new_state, finished_at, collected_at, execution_id, *allowed_from),
         )
         await self._connection.commit()
 
     async def get_open_execution_handles(self) -> list[dict[str, Any]]:
         """Return execution handles a recovery pass must reconcile.
 
-        Rows with `state IN ('prepared', 'running', 'terminal')` and
-        `backend_id != 'local'` — non-cleaned, non-local handles that may
-        correspond to a live backend process/container.
+        Rows with `state IN ('prepared', 'running', 'terminal', 'collected')`
+        and `backend_id != 'local'` — non-cleaned, non-local handles that may
+        correspond to a live backend process/container, or (for `collected`)
+        an SSH run whose remote artifacts have not yet been cleaned up.
 
         Raises:
             DatabaseError: If database not connected.
@@ -1406,9 +1502,10 @@ class Database:
         cursor = await self._connection.execute(
             """
             SELECT execution_id, entity_kind, entity_id, attempt, backend_id,
-                   transport_ref, state, created_at, finished_at
+                   transport_ref, state, created_at, finished_at,
+                   remote_host, remote_dir, status_marker, collected_at
             FROM execution_handles
-            WHERE state IN ('prepared', 'running', 'terminal')
+            WHERE state IN ('prepared', 'running', 'terminal', 'collected')
               AND backend_id != 'local'
             """
         )
