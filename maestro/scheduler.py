@@ -277,7 +277,7 @@ class Scheduler:
         self._arbiter_mode: ArbiterMode = arbiter_mode
         self._hold_throttle: HoldThrottle = HoldThrottle()
         self._abandon_outcome_after_s: int = 300
-        self._backends = BackendResolver(execution)
+        self._backends = BackendResolver(execution, mode="scheduler")
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._last_tick: tuple[int, int, int] | None = None
