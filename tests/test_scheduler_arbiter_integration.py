@@ -27,10 +27,12 @@ from tests.fakes.fake_execution_backend import FakeExecutionBackend
 @pytest.fixture(autouse=True)
 def _fake_execution_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch Scheduler's LocalBackend so MagicMock spawners here never spawn
-    a real subprocess. See tests/fakes/fake_execution_backend.py and the
-    identical fixture in tests/test_scheduler.py.
+    a real subprocess. `BackendResolver` (in `maestro.execution.resolver`) is
+    what constructs `LocalBackend` now, so that's where the patch lands. See
+    tests/fakes/fake_execution_backend.py and the identical fixture in
+    tests/test_scheduler.py.
     """
-    monkeypatch.setattr("maestro.scheduler.LocalBackend", FakeExecutionBackend)
+    monkeypatch.setattr("maestro.execution.resolver.LocalBackend", FakeExecutionBackend)
 
 
 def _cfg() -> ArbiterConfig:

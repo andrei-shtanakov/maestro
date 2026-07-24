@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.request import pathname2url
 
 import aiosqlite
@@ -138,6 +138,23 @@ CREATE TABLE IF NOT EXISTS gate_approvals (
     approved_at TEXT NOT NULL,
     UNIQUE (workstream_id, phase, sha)
 );
+
+-- Docker Isolation Phase 1: durable execution identity. One row per spawned
+-- backend execution attempt (task or workstream); survives orchestrator
+-- restarts so a live/orphaned execution can be recognized on recovery.
+CREATE TABLE IF NOT EXISTS execution_handles (
+    execution_id   TEXT PRIMARY KEY,
+    entity_kind    TEXT NOT NULL CHECK (entity_kind IN ('task','workstream')),
+    entity_id      TEXT NOT NULL,
+    attempt        INTEGER NOT NULL,
+    backend_id     TEXT NOT NULL,
+    transport_ref  TEXT NOT NULL,
+    state          TEXT NOT NULL CHECK (state IN ('prepared','running','terminal','cleaned')),
+    created_at     TEXT NOT NULL,
+    finished_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_exec_state_backend ON execution_handles (state, backend_id);
+CREATE INDEX IF NOT EXISTS ix_exec_entity ON execution_handles (entity_kind, entity_id, attempt);
 
 -- Mini-R: Linear migration journal. Every applied schema migration inserts
 -- exactly one row here so future connects can skip already-applied work
@@ -411,6 +428,8 @@ class Database:
                 self._migrate_workstreams_generation_pid,
             ),
             (6, "gates_v13_gate_approvals", self._migrate_gate_approvals),
+            (7, "execution_handles", self._migrate_execution_handles),
+            (8, "entity_backend_columns", self._migrate_entity_backend_columns),
         ]
 
         for version, name, fn in ordered:
@@ -609,6 +628,60 @@ class Database:
             )
             """
         )
+
+    async def _migrate_execution_handles(self) -> None:
+        """Migration 7: Docker Isolation Phase 1 durable execution identity.
+
+        `CREATE TABLE IF NOT EXISTS` (+ its indexes) — a no-op on databases
+        whose SCHEMA_SQL already created the table; creates it for
+        pre-v7 databases. Mirrors `_migrate_gate_approvals` (migration 6).
+
+        Uses three sequential `execute()` calls rather than `executescript()`:
+        `executescript()` implicitly commits any pending transaction before
+        running (then runs in autocommit), which would force-commit the
+        batch of migrations 1-6 mid-loop and break the single-final-commit
+        atomicity `initialize_schema()` relies on. `execute()` leaves the
+        transaction open, matching every other migration in this list.
+        """
+        assert self._connection is not None
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS execution_handles (
+                execution_id   TEXT PRIMARY KEY,
+                entity_kind    TEXT NOT NULL CHECK (entity_kind IN ('task','workstream')),
+                entity_id      TEXT NOT NULL,
+                attempt        INTEGER NOT NULL,
+                backend_id     TEXT NOT NULL,
+                transport_ref  TEXT NOT NULL,
+                state          TEXT NOT NULL CHECK (state IN ('prepared','running','terminal','cleaned')),
+                created_at     TEXT NOT NULL,
+                finished_at    TEXT
+            )
+            """
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_exec_state_backend "
+            "ON execution_handles (state, backend_id)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_exec_entity "
+            "ON execution_handles (entity_kind, entity_id, attempt)"
+        )
+
+    async def _migrate_entity_backend_columns(self) -> None:
+        """Migration 8: add nullable `backend` to `tasks` and `workstreams`.
+
+        NULL for all pre-existing rows (backend unknown/legacy). Idempotent
+        via PRAGMA table_info, same shape as `_migrate_tasks_arbiter_columns`.
+        """
+        assert self._connection is not None
+        for table in ("tasks", "workstreams"):
+            cursor = await self._connection.execute(f"PRAGMA table_info({table})")
+            columns = {row["name"] for row in await cursor.fetchall()}
+            if "backend" not in columns:
+                await self._connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN backend TEXT"
+                )
 
     @asynccontextmanager
     async def transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:
@@ -1170,6 +1243,177 @@ class Database:
                 raise ConcurrentModificationError(msg)
 
         return await self.get_task(task_id)
+
+    # =========================================================================
+    # Execution Handles (Docker Isolation Phase 1)
+    # =========================================================================
+
+    async def start_execution(
+        self,
+        *,
+        entity_kind: Literal["task", "workstream"],
+        entity_id: str,
+        expected_status: str,
+        running_status: str,
+        execution_id: str,
+        backend_id: str,
+        transport_ref: str,
+        attempt: int,
+    ) -> None:
+        """Atomically CAS the entity to `running_status` and record a handle.
+
+        Single transaction: CAS-UPDATE the entity's status row (also
+        stamping `started_at` via `COALESCE`, mirroring `update_task_status`'s
+        RUNNING-transition behavior so a later terminal-status write can set
+        `completed_at` without failing the model's "completed_at requires
+        started_at" invariant), then insert the `execution_handles` row in
+        state `'prepared'`. If the CAS matches no row (entity already left
+        `expected_status`), the transaction is rolled back and
+        `ConcurrentModificationError` is raised. If the subsequent INSERT
+        fails for any reason, the transaction is also rolled back before
+        re-raising — the whole operation is all-or-nothing: either the CAS
+        and the insert both apply, or neither does. No `execution_handles`
+        row (and no CAS'd status) is ever left behind on failure.
+
+        Args:
+            entity_kind: `"task"` or `"workstream"` — selects the table the
+                CAS applies to.
+            entity_id: ID of the task/workstream being started.
+            expected_status: Status the entity must currently have.
+            running_status: Status to CAS the entity into.
+            execution_id: Unique ID for this execution attempt.
+            backend_id: Backend that will run the execution (e.g. `"docker"`).
+            transport_ref: Backend-specific handle (e.g. container name).
+            attempt: Attempt number for this entity.
+
+        Raises:
+            DatabaseError: If database not connected.
+            ConcurrentModificationError: If the entity's status is not
+                `expected_status`.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        table = "tasks" if entity_kind == "task" else "workstreams"
+        cursor = await self._connection.execute(
+            f"""
+            UPDATE {table}
+            SET status = ?, started_at = COALESCE(started_at, ?)
+            WHERE id = ? AND status = ?
+            """,
+            (
+                running_status,
+                _format_datetime(datetime.now(UTC)),
+                entity_id,
+                expected_status,
+            ),
+        )
+        if cursor.rowcount == 0:
+            await self._connection.rollback()
+            msg = (
+                f"{entity_kind} '{entity_id}': status is not "
+                f"'{expected_status}' (expected for start_execution)"
+            )
+            raise ConcurrentModificationError(msg)
+
+        try:
+            await self._connection.execute(
+                """
+                INSERT INTO execution_handles
+                  (execution_id, entity_kind, entity_id, attempt, backend_id,
+                   transport_ref, state, created_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, NULL)
+                """,
+                (
+                    execution_id,
+                    entity_kind,
+                    entity_id,
+                    attempt,
+                    backend_id,
+                    transport_ref,
+                    _format_datetime(datetime.now(UTC)),
+                ),
+            )
+            await self._connection.commit()
+        except Exception:
+            await self._connection.rollback()
+            raise
+
+    async def mark_execution_state(
+        self,
+        execution_id: str,
+        new_state: str,
+        *,
+        allowed_from: list[str],
+    ) -> None:
+        """Monotonically update an execution handle's state.
+
+        The update only applies when the handle's current state is one of
+        `allowed_from` — a handle can never regress (e.g. `cleaned` ->
+        `running` is a no-op, not an error). `finished_at` is stamped only
+        when transitioning into a terminal state (`"terminal"` or
+        `"cleaned"`); otherwise it is left unchanged.
+
+        Caveat: this is a silent no-op — it does not raise or report which
+        rows changed — both when `execution_id` matches no row at all and
+        when it matches a row whose current state is not in `allowed_from`.
+        Callers that need to distinguish "already in the target state" from
+        "not found" from "blocked transition" must query separately.
+
+        Args:
+            execution_id: The execution handle to update.
+            new_state: Target state (`prepared`/`running`/`terminal`/`cleaned`).
+            allowed_from: States from which this transition is permitted.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        placeholders = ",".join("?" for _ in allowed_from)
+        finished_at = (
+            _format_datetime(datetime.now(UTC))
+            if new_state in ("terminal", "cleaned")
+            else None
+        )
+        await self._connection.execute(
+            f"""
+            UPDATE execution_handles
+            SET state = ?, finished_at = COALESCE(?, finished_at)
+            WHERE execution_id = ? AND state IN ({placeholders})
+            """,
+            (new_state, finished_at, execution_id, *allowed_from),
+        )
+        await self._connection.commit()
+
+    async def get_open_execution_handles(self) -> list[dict[str, Any]]:
+        """Return execution handles a recovery pass must reconcile.
+
+        Rows with `state IN ('prepared', 'running', 'terminal')` and
+        `backend_id != 'local'` — non-cleaned, non-local handles that may
+        correspond to a live backend process/container.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            SELECT execution_id, entity_kind, entity_id, attempt, backend_id,
+                   transport_ref, state, created_at, finished_at
+            FROM execution_handles
+            WHERE state IN ('prepared', 'running', 'terminal')
+              AND backend_id != 'local'
+            """
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
 
     # =========================================================================
     # Query by Status

@@ -63,7 +63,10 @@ class TaskHandle(Protocol):
 class ExecutionBackend(Protocol):
     """Runs an ExecutionRequest and yields a TaskHandle."""
 
-    id: str
+    @property
+    def id(self) -> str:
+        """Backend identifier (e.g. "local", "docker")."""
+        ...
 
     async def healthcheck(self) -> BackendHealth:
         """Is the transport reachable (fail-fast before dispatch)?"""

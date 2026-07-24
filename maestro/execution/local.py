@@ -5,8 +5,10 @@ import contextlib
 import os
 import shutil
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING, cast
 
-from maestro.execution.env import build_local_env
+from maestro._vendor.obs import child_env
+from maestro.execution.env import build_local_env  # noqa: F401 (re-exported)
 from maestro.execution.models import (
     BackendHealth,
     CapabilityResult,
@@ -14,8 +16,17 @@ from maestro.execution.models import (
     ExecutionHandleRef,
     ExecutionRequest,
     ExecutionResult,
+    PreparedRun,
     ProbeResult,
 )
+
+
+if TYPE_CHECKING:
+    # Imported only for type hints: isolators.py imports this module, so a
+    # runtime import here would create a circular import.
+    from maestro.execution.backend import TaskHandle
+    from maestro.execution.docker_cli import DockerCli
+    from maestro.execution.isolators import DockerIsolator, Isolator
 
 
 _TAIL_LIMIT = 4000
@@ -115,20 +126,88 @@ def _decode_tail(data: bytes | None) -> str:
     return text[-_TAIL_LIMIT:]
 
 
-class LocalBackend:
-    """Runs an ExecutionRequest as a local asyncio subprocess."""
+def _cleanup_prepared(prepared: PreparedRun) -> None:
+    """Best-effort removal of files an isolator materialized (spawn-failure path)."""
+    for path in prepared.cleanup_paths:
+        with contextlib.suppress(OSError):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
 
-    id = "local"
+
+class LocalBackend:
+    """Runs an ExecutionRequest as a local asyncio subprocess.
+
+    Isolation-aware: with no `docker` client, `healthcheck`/`can_run` behave
+    exactly as the plain local backend always has. Passing a `DockerCli`
+    (paired with a `DockerIsolator`, see `resolver.py`) switches `healthcheck`
+    to a daemon/DOCKER_HOST reachability check and `can_run` to an image
+    presence gate — the composition the docker backend is built from.
+    """
+
+    def __init__(
+        self,
+        isolator: "Isolator | None" = None,
+        *,
+        backend_id: str = "local",
+        docker: "DockerCli | None" = None,
+    ) -> None:
+        # Default BareIsolator; imported lazily to break the import cycle
+        # (isolators.py imports LocalTaskHandle from this module).
+        if isolator is None:
+            from maestro.execution.isolators import BareIsolator
+
+            isolator = BareIsolator()
+        self._isolator = isolator
+        self._backend_id = backend_id
+        self._docker = docker
+
+    @property
+    def id(self) -> str:
+        return self._backend_id
 
     async def healthcheck(self) -> BackendHealth:
+        if self._docker is None:
+            return BackendHealth(reachable=True)
+        host = os.environ.get("DOCKER_HOST", "")
+        if host.startswith("ssh://") or host.startswith("tcp://"):
+            return BackendHealth(
+                reachable=False,
+                detail=f"DOCKER_HOST={host!r} is remote; Phase 1 is local only",
+            )
+        try:
+            reachable = await self._docker.version_ok()
+        except Exception as e:
+            return BackendHealth(reachable=False, detail=f"docker unreachable: {e}")
+        if not reachable:
+            return BackendHealth(reachable=False, detail="docker daemon unreachable")
         return BackendHealth(reachable=True)
 
     async def can_run(self, req: ExecutionRequest) -> CapabilityResult:
-        missing = [t for t in req.required_tools if shutil.which(t) is None]
-        return CapabilityResult(ok=not missing, missing_tools=missing)
+        if self._docker is None:
+            missing = [t for t in req.required_tools if shutil.which(t) is None]
+            return CapabilityResult(ok=not missing, missing_tools=missing)
+        # Docker: image presence is the Phase-1 capability gate; a full
+        # in-image tool probe (a --rm helper container) is exercised by
+        # integration tests. `self._docker is not None` here implies the
+        # resolver paired this backend with a DockerIsolator (resolver.py).
+        # `cast` only affects static typing: if that invariant is ever
+        # violated (e.g. a BareIsolator passed alongside a non-None
+        # `docker`), this raises AttributeError at call time — not a silent
+        # type lie — since `_cfg` genuinely doesn't exist on other isolators.
+        image = cast("DockerIsolator", self._isolator)._cfg.image
+        if not await self._docker.image_exists(image):
+            return CapabilityResult(ok=False, missing_tools=[f"image:{image}"])
+        return CapabilityResult(ok=True)
 
-    async def run(self, req: ExecutionRequest) -> LocalTaskHandle:
-        env = build_local_env(req)
+    async def run(self, req: ExecutionRequest) -> "TaskHandle":
+        plan = self._isolator.prepare(
+            req, trace_env=child_env(), host_env=dict(os.environ)
+        )
+        prepared = self._isolator.materialize(plan)
+        argv = prepared.plan.argv
+        env = prepared.plan.env
         log_fd: int | None = None
         if req.capture_output:
             stdout = asyncio.subprocess.PIPE
@@ -139,7 +218,7 @@ class LocalBackend:
             stderr = asyncio.subprocess.STDOUT
         try:
             proc = await asyncio.create_subprocess_exec(
-                *req.argv,
+                *argv,
                 cwd=req.workdir,
                 env=env,
                 stdin=asyncio.subprocess.PIPE if req.stdin is not None else None,
@@ -149,6 +228,8 @@ class LocalBackend:
         except BaseException:
             if log_fd is not None:
                 os.close(log_fd)
+            # Clean any files the isolator created before the spawn failed.
+            _cleanup_prepared(prepared)
             raise
         if log_fd is not None:
             # The child inherited its own dup of the fd when spawned above;
@@ -162,12 +243,13 @@ class LocalBackend:
             proc.stdin.write(req.stdin.encode("utf-8"))
             proc.stdin.close()
         ref = ExecutionHandleRef(
-            backend_id=self.id,
+            backend_id=req.backend_id,
             run_id=req.run_id,
-            transport_ref=f"local_pid:{proc.pid}",
+            transport_ref=self._isolator.transport_ref(prepared, proc.pid),
             started_at=datetime.now(UTC),
         )
-        return LocalTaskHandle(proc, req, log_fd, ref)
+        local_handle = LocalTaskHandle(proc, req, log_fd, ref)
+        return self._isolator.wrap(local_handle, prepared, ref)
 
     async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
         if not ref.transport_ref.startswith("local_pid:"):

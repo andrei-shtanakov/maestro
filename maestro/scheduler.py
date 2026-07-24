@@ -13,6 +13,7 @@ import contextlib
 import logging
 import signal
 import subprocess
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -37,8 +38,10 @@ from maestro.dag import DAG
 from maestro.database import Database
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
 from maestro.execution.backend import TaskHandle
-from maestro.execution.local import LocalBackend
+from maestro.execution.exec_config import ExecutionConfig
+from maestro.execution.finalize import ensure_finalize_task
 from maestro.execution.models import ExecutionRequest
+from maestro.execution.resolver import BackendResolver
 from maestro.models import (
     AgentType,
     ArbiterMode,
@@ -164,12 +167,20 @@ class RunningTask:
         handle: Execution handle (poll/wait/terminate/kill/collect/cleanup).
         started_at: When the task started.
         log_file: Path to the log file.
+        finalize_task: The single finalization task for this run, if started.
+        execution_id: The minted execution-handle id for non-local backends,
+            or ``None`` for the local path (no `execution_handles` row).
+        backend_id: The resolved execution backend id (e.g. "local",
+            "docker") this task was spawned on.
     """
 
     task: Task
     handle: TaskHandle
     started_at: datetime
     log_file: Path
+    finalize_task: "asyncio.Task | None" = None
+    execution_id: str | None = None
+    backend_id: str = "local"
 
 
 @dataclass
@@ -228,6 +239,7 @@ class Scheduler:
         on_status_change: StatusChangeCallback | None = None,
         routing: RoutingStrategy | None = None,
         arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
+        execution: ExecutionConfig | None = None,
     ) -> None:
         """Initialize scheduler.
 
@@ -242,6 +254,10 @@ class Scheduler:
             routing: Routing strategy (defaults to StaticRouting).
             arbiter_mode: ADVISORY (default) or AUTHORITATIVE; drives retry
                 gating when arbiter becomes unavailable.
+            execution: Optional execution-backends config (the `execution:`
+                block of the project config). None keeps the zero-config
+                local/bare path — `BackendResolver` resolves every task to
+                `LocalBackend`, identical to the pre-Task-8 behavior.
         """
         self._db = db
         self._dag = dag
@@ -261,7 +277,7 @@ class Scheduler:
         self._arbiter_mode: ArbiterMode = arbiter_mode
         self._hold_throttle: HoldThrottle = HoldThrottle()
         self._abandon_outcome_after_s: int = 300
-        self._backend = LocalBackend()
+        self._backends = BackendResolver(execution)
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._last_tick: tuple[int, int, int] | None = None
@@ -1049,6 +1065,26 @@ class Scheduler:
             model=routed_model,
         )
 
+        # Resolve the execution backend for this task (per-entity, falling
+        # back to the configured/default backend — see BackendResolver).
+        # Stamped onto the request before any capability check/spawn.
+        backend = self._backends.resolve(task.backend)
+
+        # Local-only fail-fast (spec §8): non-local backends must prove the
+        # target daemon is reachable — and not a remote DOCKER_HOST — before
+        # any capability probe or spawn. The local path stays a true no-op
+        # (LocalBackend.healthcheck() with no docker client is trivially
+        # reachable=True anyway, but skipping the call entirely for
+        # backend.id == "local" keeps this from adding any local overhead).
+        if backend.id != "local":
+            health = await backend.healthcheck()
+            if not health.reachable:
+                raise SchedulerError(
+                    f"Backend '{backend.id}' not reachable: {health.detail}"
+                )
+
+        request = request.model_copy(update={"backend_id": backend.id})
+
         # Executor-side tool probe (replaces is_available()): checks the
         # request's required_tools against the target executor. Fails
         # fast with the same "not available" wording the old
@@ -1056,7 +1092,7 @@ class Scheduler:
         # hold even though the check now runs backend-side. Runs before any
         # RUNNING transition/span so a missing tool never leaves the task
         # observed as briefly RUNNING.
-        cap = await self._backend.can_run(request)
+        cap = await backend.can_run(request)
         if not cap.ok:
             msg = (
                 f"Agent '{spawner_key}' is not available on this system "
@@ -1080,14 +1116,47 @@ class Scheduler:
             # notification here (§0: the notification now means "status is
             # running", not "process launched"; it fires even if the
             # launch below fails).
-            task = await self._transition(
-                task_id,
-                TaskStatus.RUNNING,
-                expected_status=TaskStatus.READY,
-            )
+            #
+            # Non-local backends mint a durable execution identity first: the
+            # READY->RUNNING CAS and the execution_handles insert are one
+            # atomic DB transaction (start_execution), so the committed
+            # transition is dispatched afterward via
+            # _dispatch_committed_transition rather than the plain
+            # _transition helper (mirrors the reset_for_retry_atomic idiom
+            # used elsewhere for atomically-committed writes). The local path
+            # is unchanged — still the plain _transition call.
+            if backend.id != "local":
+                execution_id = str(uuid.uuid4())
+                attempt = task.retry_count + 1
+                request = request.model_copy(
+                    update={
+                        "execution_id": execution_id,
+                        "entity_kind": "task",
+                        "attempt": attempt,
+                    }
+                )
+                await self._db.start_execution(
+                    entity_kind="task",
+                    entity_id=task_id,
+                    expected_status=TaskStatus.READY.value,
+                    running_status=TaskStatus.RUNNING.value,
+                    execution_id=execution_id,
+                    backend_id=backend.id,
+                    transport_ref=f"{backend.id}:maestro-{execution_id}",
+                    attempt=attempt,
+                )
+                task = await self._db.get_task(task_id)
+                await self._dispatch_committed_transition(task, frm=TaskStatus.READY)
+            else:
+                execution_id = None
+                task = await self._transition(
+                    task_id,
+                    TaskStatus.RUNNING,
+                    expected_status=TaskStatus.READY,
+                )
             self._retry_ready_times.pop(task_id, None)
 
-            handle = await self._backend.run(request)
+            handle = await backend.run(request)
 
             # Track running task
             self._running_tasks[task_id] = RunningTask(
@@ -1095,6 +1164,8 @@ class Scheduler:
                 handle=handle,
                 started_at=datetime.now(UTC),
                 log_file=log_file,
+                execution_id=execution_id,
+                backend_id=backend.id,
             )
 
             return True
@@ -1202,8 +1273,28 @@ class Scheduler:
             return_code = running_task.handle.poll()
 
             if return_code is not None:
-                # Process finished
-                await self._handle_task_completion(task_id, running_task, return_code)
+                # Process finished — finalize (reap/collect/cleanup) exactly
+                # once before dispatching on the outcome.
+                fin = await asyncio.shield(ensure_finalize_task(running_task))
+                exec_id = running_task.execution_id
+                if exec_id is not None:
+                    await self._db.mark_execution_state(
+                        exec_id, "terminal", allowed_from=["prepared", "running"]
+                    )
+                    if fin.cleaned:
+                        await self._db.mark_execution_state(
+                            exec_id, "cleaned", allowed_from=["terminal"]
+                        )
+                if fin.collect_error or fin.cleanup_error:
+                    _obs_log.warning(
+                        "execution.finalize.resource_fault",
+                        task_id=task_id,
+                        collect_error=fin.collect_error,
+                        cleanup_error=fin.cleanup_error,
+                    )
+                await self._handle_task_completion(
+                    task_id, running_task, fin.execution.exit_code
+                )
                 completed.append(task_id)
             else:
                 # Check for timeout
@@ -1211,6 +1302,21 @@ class Scheduler:
                 timeout_seconds = running_task.task.timeout_minutes * 60
 
                 if elapsed.total_seconds() > timeout_seconds:
+                    await running_task.handle.terminate(grace_seconds=10.0)
+                    timeout_fin = await asyncio.shield(
+                        ensure_finalize_task(running_task)
+                    )
+                    timeout_exec_id = running_task.execution_id
+                    if timeout_exec_id is not None:
+                        await self._db.mark_execution_state(
+                            timeout_exec_id,
+                            "terminal",
+                            allowed_from=["prepared", "running"],
+                        )
+                        if timeout_fin.cleaned:
+                            await self._db.mark_execution_state(
+                                timeout_exec_id, "cleaned", allowed_from=["terminal"]
+                            )
                     await self._handle_task_timeout(task_id, running_task)
                     completed.append(task_id)
 
@@ -1222,14 +1328,15 @@ class Scheduler:
         self,
         task_id: str,
         running_task: RunningTask,
-        return_code: int,
+        return_code: int | None,
     ) -> None:
         """Handle task completion.
 
         Args:
             task_id: ID of the completed task.
             running_task: The running task info.
-            return_code: Process exit code.
+            return_code: Process exit code (``None`` is treated as failure —
+                it never compares equal to 0).
         """
         task = running_task.task
 
@@ -1263,6 +1370,7 @@ class Scheduler:
                         task_id=task_id,
                         agent=task.routed_agent_type or task.agent_type.value,
                         validation_passed=True,
+                        backend_id=running_task.backend_id,
                     )
                 else:
                     # Include validation output in error for retry context
@@ -1286,6 +1394,7 @@ class Scheduler:
                     task_id=task_id,
                     agent=task.routed_agent_type or task.agent_type.value,
                     validation_passed=None,
+                    backend_id=running_task.backend_id,
                 )
         else:
             # Process failed
@@ -1678,6 +1787,7 @@ async def create_scheduler_from_config(
     routing: RoutingStrategy | None = None,
     arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
     arbiter_enabled: bool = False,
+    execution: ExecutionConfig | None = None,
 ) -> Scheduler:
     """Create a scheduler from task configurations.
 
@@ -1698,6 +1808,10 @@ async def create_scheduler_from_config(
         auto_commit: Whether to auto-commit after task completion.
         routing: Routing strategy (defaults to StaticRouting).
         arbiter_mode: Arbiter authority mode (ADVISORY by default).
+        arbiter_enabled: Whether arbiter integration is enabled.
+        execution: Optional execution-backends config (the project's
+            `execution:` block); forwarded to `Scheduler` for per-task
+            backend resolution. None keeps the zero-config local path.
 
     Returns:
         Configured Scheduler instance.
@@ -1738,4 +1852,5 @@ async def create_scheduler_from_config(
         on_status_change=on_status_change,
         routing=routing,
         arbiter_mode=arbiter_mode,
+        execution=execution,
     )

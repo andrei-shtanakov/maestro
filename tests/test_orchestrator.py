@@ -44,6 +44,25 @@ if TYPE_CHECKING:
     from maestro.execution.local import LocalBackend
 
 
+class _FakeDocker:
+    """Fake DockerCli for startup-recovery wiring tests — no subprocess,
+    no daemon."""
+
+    def __init__(self, ids: list[str], labels: dict[str, str] | None = None) -> None:
+        self._ids = ids
+        self._labels = labels
+        self.rm_calls: list[str] = []
+
+    async def ps_ids_by_label(self, key: str, value: str) -> list[str]:
+        return self._ids
+
+    async def inspect(self, name: str) -> dict[str, object] | None:
+        return {"Config": {"Labels": self._labels or {}}}
+
+    async def rm(self, name: str) -> None:
+        self.rm_calls.append(name)
+
+
 class FakeOrchestratorBackend:
     """ExecutionBackend double for orchestrator tests.
 
@@ -56,7 +75,11 @@ class FakeOrchestratorBackend:
     `.poll()` / `.os_pid` behave identically to the scheduler fakes.
     """
 
-    id = "fake"
+    # Cached under the resolver's "local" key by the autouse fixture /
+    # _set_fake_backend, so it must report id="local" to exercise the local
+    # spawn branch (the non-local branch mints a durable execution handle and
+    # skips the _SPAWNING_SENTINEL pid write — see Orchestrator._generate_and_launch).
+    id = "local"
 
     def __init__(self, pid: int = 1, exit_code: int = 0) -> None:
         self.pid = pid
@@ -86,23 +109,28 @@ def _fake_execution_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch every Orchestrator's `LocalBackend` with a fake for this module.
 
     Mirrors the scheduler test pattern (Task 5, see test_scheduler.py):
-    `Orchestrator.__init__` does `self._backend = LocalBackend()`; patching
-    the name in `maestro.orchestrator` makes every orchestrator built in
-    this file use `FakeOrchestratorBackend` instead, so `_spawn_workstream`
-    never spawns a real `spec-runner` subprocess.
+    `Orchestrator.__init__` builds `self._backends = BackendResolver(...)`,
+    and `BackendResolver._build()` (in `maestro.execution.resolver`) is what
+    constructs `LocalBackend()` for the "local" name. Patching the name
+    there makes every orchestrator built in this file resolve to
+    `FakeOrchestratorBackend` instead, so `_spawn_workstream` never spawns a
+    real `spec-runner` subprocess.
     """
-    monkeypatch.setattr("maestro.orchestrator.LocalBackend", FakeOrchestratorBackend)
+    monkeypatch.setattr(
+        "maestro.execution.resolver.LocalBackend", FakeOrchestratorBackend
+    )
 
 
 def _set_fake_backend(orch: Orchestrator, backend: FakeOrchestratorBackend) -> None:
-    """Type-narrowing assignment of `orch._backend` in tests.
+    """Type-narrowing assignment of the orchestrator's resolved backend.
 
-    Statically typed as `LocalBackend` on `Orchestrator`; the autouse fixture
-    above already swaps in a `FakeOrchestratorBackend` at construction time,
-    but a handful of tests need a *specific* pid/exit_code, so they build
-    their own instance and assign it here instead of relying on the default.
+    The autouse fixture above already swaps in a `FakeOrchestratorBackend` at
+    construction time (cached under the "local" key), but a handful of tests
+    need a *specific* pid/exit_code, so they build their own instance and
+    overwrite the resolver's cache entry here instead of relying on the
+    default.
     """
-    orch._backend = cast("LocalBackend", backend)
+    orch._backends._cache["local"] = cast("LocalBackend", backend)
 
 
 # =============================================================================
@@ -227,7 +255,7 @@ def orchestrator(
 def orchestrator_with_fake_backend(orchestrator: Orchestrator) -> Orchestrator:
     """Alias for readability in tests that spawn a workstream and inspect
     `.handle`. The autouse `_fake_execution_backend` fixture above already
-    wires `orchestrator._backend` to a `FakeOrchestratorBackend`.
+    wires `orchestrator._backends` to resolve to a `FakeOrchestratorBackend`.
     """
     return orchestrator
 
@@ -1518,6 +1546,7 @@ class TestStartupRecovery:
         mock_decomposer,
         mock_pr_manager,
         orch_config,
+        docker=None,
     ):
         from maestro.database import Database
 
@@ -1529,6 +1558,7 @@ class TestStartupRecovery:
             decomposer=mock_decomposer,
             config=orch_config,
             pr_manager=mock_pr_manager,
+            docker=docker,
         )
         return orch, db
 
@@ -1644,6 +1674,132 @@ class TestStartupRecovery:
             await db.create_workstream(ws)
             await orch._recover_stranded_workstreams()
             assert (await db.get_workstream("d")).status == WorkstreamStatus.READY
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_running_docker_backed_live_container_needs_review(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        """A RUNNING workstream whose recorded process looks dead but whose
+        docker-backed execution_handles row can't rule out a live/leftover
+        container (Task 18: `probe_execution`) is routed to NEEDS_REVIEW,
+        not READY."""
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+        docker = _FakeDocker(ids=["c1"], labels={"maestro.execution_id": "exec-1"})
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+            docker=docker,
+        )
+        try:
+            await db.create_workstream(self._seed("w", WorkstreamStatus.READY))
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="exec-1",
+                backend_id="docker",
+                transport_ref="docker:maestro-exec-1",
+                attempt=1,
+            )
+            count = await orch._recover_stranded_workstreams()
+            assert count == 1
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert orch._stats.failed == 1
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_running_docker_backed_no_container_recovers_ready(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        """A RUNNING docker-backed workstream with no matching container
+        still recovers to READY (probe returns needs_review=False)."""
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+        docker = _FakeDocker(ids=[])
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+            docker=docker,
+        )
+        try:
+            await db.create_workstream(self._seed("w", WorkstreamStatus.READY))
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="exec-1",
+                backend_id="docker",
+                transport_ref="docker:maestro-exec-1",
+                attempt=1,
+            )
+            await orch._recover_stranded_workstreams()
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.READY
+
+            remaining = await db.get_open_execution_handles()
+            assert all(h["entity_id"] != "w" for h in remaining)
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_running_local_workstream_unaffected_by_docker_probe(
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        orch_config,
+        monkeypatch,
+    ) -> None:
+        """A workstream with no open execution_handles row (local-backed) is
+        recovered exactly as before, even if the injected docker fake would
+        otherwise report a live container."""
+        from maestro import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+        docker = _FakeDocker(ids=["c1"], labels={"maestro.execution_id": "exec-1"})
+        orch, db = await self._orch_with_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            orch_config,
+            docker=docker,
+        )
+        try:
+            await db.create_workstream(self._seed("w", WorkstreamStatus.RUNNING))
+            count = await orch._recover_stranded_workstreams()
+            assert count == 1
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.READY
+            assert docker.rm_calls == []
         finally:
             await db.close()
 

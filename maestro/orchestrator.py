@@ -12,10 +12,12 @@ import logging
 import os
 import signal
 import subprocess
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.changed_paths import changed_paths_since
@@ -23,8 +25,16 @@ from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
 from maestro.event_log import get_event_logger
 from maestro.execution.backend import TaskHandle
-from maestro.execution.local import LocalBackend
+from maestro.execution.docker_cli import DockerCli
+from maestro.execution.docker_recovery import (
+    GC_CLEAN_OUTCOMES,
+    DockerProbe,
+    gc_terminal_handle,
+    probe_execution,
+)
+from maestro.execution.finalize import ensure_finalize_task
 from maestro.execution.models import CollectPolicy, ExecutionRequest
+from maestro.execution.resolver import BackendResolver
 from maestro.gates import (
     BLOCK_REASON_PREFIX,
     ApprovalMarker,
@@ -114,13 +124,24 @@ _STRANDED_INFLIGHT = (
 
 @dataclass
 class RunningWorkstream:
-    """Represents a currently running workstream execution."""
+    """Represents a currently running workstream execution.
+
+    ``finalize_task`` holds the single-owner finalization task (reap + collect
+    + cleanup) so a second monitor/shutdown caller awaits it rather than
+    starting a duplicate. ``execution_id`` is the durable execution-handle id
+    for a non-local backend (``None`` for the local path, which persists no
+    handle). ``backend_id`` is the resolved execution backend id (e.g.
+    "local", "docker") this workstream was spawned on.
+    """
 
     workstream: Workstream
     handle: TaskHandle
     started_at: datetime
     workspace_path: Path
     log_file: Path
+    finalize_task: "asyncio.Task | None" = None
+    execution_id: str | None = None
+    backend_id: str = "local"
 
 
 @dataclass
@@ -155,6 +176,7 @@ class Orchestrator:
         log_dir: Path | None = None,
         notifier: NotificationManager | None = None,
         on_status_change: StatusChangeCallback | None = None,
+        docker: DockerProbe | None = None,
     ) -> None:
         """Initialize orchestrator.
 
@@ -168,8 +190,13 @@ class Orchestrator:
             notifier: Optional notification manager for workstream
                 lifecycle notifications.
             on_status_change: Optional callback for workstream status changes.
+            docker: Docker CLI wrapper used by startup recovery to probe
+                execution_handles rows for docker-backed workstreams before
+                re-READYing them. Injectable for tests; defaults to a real
+                `DockerCli()`.
         """
         self._db = db
+        self._docker = docker or DockerCli()
         self._workspace_mgr = workspace_mgr
         self._decomposer = decomposer
         self._pr_manager = pr_manager
@@ -191,7 +218,7 @@ class Orchestrator:
                 log_dir=pipeline_log_dir(),
             )
 
-        self._backend = LocalBackend()
+        self._backends = BackendResolver(self._config.execution)
         self._running: dict[str, RunningWorkstream] = {}
         self._generating: dict[str, asyncio.Task[None]] = {}
         self._shutdown_grace_seconds: float = 5.0
@@ -292,9 +319,20 @@ class Orchestrator:
         can advance them. In-flight strands reset to READY (no retry, no
         error_message); a RUNNING workstream whose recorded process is still
         alive goes to NEEDS_REVIEW instead (never re-run over a live orphan);
-        FAILED workstreams reconcile by the retry rule. Best-effort per
-        workstream; never raises."""
+        a RUNNING workstream whose process looks dead but whose docker-backed
+        execution_handles row can't rule out a live/leftover container (Task
+        18: `probe_execution`, fail-closed) also goes to NEEDS_REVIEW; FAILED
+        workstreams reconcile by the retry rule. Best-effort per workstream;
+        never raises. `terminal`-state handles (any entity) are swept for
+        ownership-checked GC as a side effect — see `_gc_terminal_handles`."""
         recovered = 0
+        open_handles = await self._db.get_open_execution_handles()
+        workstream_handles = {
+            h["entity_id"]: h
+            for h in open_handles
+            if h["entity_kind"] == "workstream"
+            and h["state"] in ("prepared", "running")
+        }
 
         for state in _STRANDED_INFLIGHT:
             for w in await self._db.get_workstreams_by_status(state):
@@ -307,7 +345,31 @@ class Orchestrator:
                         else None
                     )
                     live_orphan = _maybe_live_orphan(orphan_pid)
-                    if live_orphan:
+                    docker_needs_review = False
+                    if not live_orphan and state is WorkstreamStatus.RUNNING:
+                        docker_needs_review = await self._probe_docker_workstream(
+                            w.id, workstream_handles
+                        )
+                    if docker_needs_review:
+                        self._logger.warning(
+                            "Workstream '%s' stranded in RUNNING with a "
+                            "possibly-live container after restart — sending "
+                            "to NEEDS_REVIEW; verify and clean it up before "
+                            "resume",
+                            w.id,
+                        )
+                        await self._transition(
+                            w.id, WorkstreamStatus.FAILED, expected_status=state
+                        )
+                        await self._transition(
+                            w.id,
+                            WorkstreamStatus.NEEDS_REVIEW,
+                            expected_status=WorkstreamStatus.FAILED,
+                            process_pid=None,
+                            generation_pid=None,
+                        )
+                        self._stats.failed += 1
+                    elif live_orphan:
                         if orphan_pid == _SPAWNING_SENTINEL:
                             self._logger.warning(
                                 "Workstream '%s' stranded in %s with a spawn in "
@@ -433,7 +495,72 @@ class Orchestrator:
             self._logger.info(
                 "Recovered %d stranded workstream(s) on startup", recovered
             )
+
+        # Best-effort GC of leftover containers for settled entities (any
+        # entity kind — the handle table is shared with the scheduler).
+        await self._gc_terminal_handles(open_handles)
+
         return recovered
+
+    async def _probe_docker_workstream(
+        self, workstream_id: str, workstream_handles: dict[str, dict[str, Any]]
+    ) -> bool:
+        """Probe a docker-backed workstream's open handle for a possibly-
+        live container (Task 18: `probe_execution`, fail-closed).
+
+        No-op (returns False) when there is no open, non-cleaned handle row
+        for this workstream — a local-backed workstream (or one whose
+        handle already reached `terminal`/`cleaned`) is always unaffected,
+        preserving pre-Task-18 recovery behavior exactly.
+
+        When the verdict confirms no container is left, the open handle row
+        is closed (terminal -> cleaned) here so it doesn't linger open and
+        shadow the workstream's next attempt after it's recovered to READY.
+        """
+        row = workstream_handles.get(workstream_id)
+        if row is None:
+            return False
+        verdict = await probe_execution(row["execution_id"], self._docker)
+        if not verdict.needs_review:
+            await self._db.mark_execution_state(
+                row["execution_id"], "terminal", allowed_from=["prepared", "running"]
+            )
+            await self._db.mark_execution_state(
+                row["execution_id"], "cleaned", allowed_from=["terminal"]
+            )
+        return verdict.needs_review
+
+    async def _gc_terminal_handles(self, handles: list[dict[str, Any]]) -> int:
+        """Best-effort, ownership-checked GC sweep for `terminal` handles.
+
+        Mirrors `StateRecovery._gc_terminal_handles` (Mode 1): a `terminal`
+        handle means the entity behind it already reached a settled status
+        (finalize ran) but container cleanup was never confirmed. This only
+        removes the leftover container (if any) and marks the handle
+        `cleaned` — it never touches entity status. Swept across all entity
+        kinds since the handle table is shared. A row whose outcome is
+        ambiguous (multiple matches / label mismatch / probe error) is left
+        as `terminal` for the next sweep or a human to resolve.
+        """
+        swept = 0
+        for row in handles:
+            if row["state"] != "terminal":
+                continue
+            outcome = await gc_terminal_handle(row, self._docker)
+            if outcome in GC_CLEAN_OUTCOMES:
+                await self._db.mark_execution_state(
+                    row["execution_id"], "cleaned", allowed_from=["terminal"]
+                )
+                swept += 1
+            else:
+                self._logger.warning(
+                    "recovery: GC left handle %s (%s %s) as terminal: %s",
+                    row["execution_id"],
+                    row["entity_kind"],
+                    row["entity_id"],
+                    outcome,
+                )
+        return swept
 
     async def _ensure_workstreams(self) -> None:
         """Ensure workstreams are in the database.
@@ -709,12 +836,74 @@ class Orchestrator:
         if not await self._gate_ex_ante(workstream_id, workstream):
             return
 
-        await self._transition(
-            workstream_id,
-            WorkstreamStatus.RUNNING,
-            expected_status=WorkstreamStatus.READY,
-            process_pid=_SPAWNING_SENTINEL,
-        )
+        # Resolve the execution backend for this workstream (per-entity,
+        # falling back to the configured/default backend) BEFORE the
+        # READY->RUNNING transition, so the transition can branch on whether
+        # this is a durable (non-local) execution.
+        backend = self._backends.resolve(workstream.backend)
+
+        # Local-only fail-fast (spec §8): non-local backends must prove the
+        # target daemon is reachable — and not a remote DOCKER_HOST — before
+        # the READY->RUNNING transition/spawn. A block routes READY ->
+        # NEEDS_REVIEW instead, mirroring _route_gate_block, so a docker
+        # workstream never CAS's to RUNNING against an unreachable/remote
+        # daemon. The local path stays a true no-op — the call is skipped
+        # entirely for backend.id == "local".
+        if backend.id != "local":
+            health = await backend.healthcheck()
+            if not health.reachable:
+                reason = f"backend {backend.id} not reachable: {health.detail}"
+                self._logger.warning(
+                    "Workstream '%s' backend healthcheck failed: %s",
+                    workstream_id,
+                    reason,
+                )
+                await self._transition(
+                    workstream_id,
+                    WorkstreamStatus.NEEDS_REVIEW,
+                    expected_status=WorkstreamStatus.READY,
+                    message=reason,
+                    error_message=reason,
+                )
+                return
+
+        execution_id: str | None = None
+        request_launch_fields: dict[str, object] = {}
+
+        if backend.id != "local":
+            # Non-local backends mint a durable execution identity: the
+            # READY->RUNNING CAS and the execution_handles insert are one
+            # atomic DB transaction (start_execution), so the already-
+            # committed transition is dispatched directly afterward rather
+            # than through the plain _transition helper (mirrors
+            # Scheduler._spawn_task's docker branch, Task 16). The local
+            # path below is unchanged.
+            execution_id = str(uuid.uuid4())
+            attempt = workstream.retry_count + 1
+            await self._db.start_execution(
+                entity_kind="workstream",
+                entity_id=workstream_id,
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id=execution_id,
+                backend_id=backend.id,
+                transport_ref=f"{backend.id}:maestro-{execution_id}",
+                attempt=attempt,
+            )
+            request_launch_fields = {
+                "execution_id": execution_id,
+                "entity_kind": "workstream",
+                "attempt": attempt,
+            }
+            refreshed = await self._db.get_workstream(workstream_id)
+            await self._dispatcher.fire(_subject(refreshed), frm=WorkstreamStatus.READY)
+        else:
+            await self._transition(
+                workstream_id,
+                WorkstreamStatus.RUNNING,
+                expected_status=WorkstreamStatus.READY,
+                process_pid=_SPAWNING_SENTINEL,
+            )
 
         # Spawn spec-runner
         log_file = self._log_dir / f"{workstream_id}.log"
@@ -735,8 +924,13 @@ class Orchestrator:
             collect=CollectPolicy(mode="none"),
             required_tools=["spec-runner"],
         )
+
+        request = request.model_copy(
+            update={"backend_id": backend.id, **request_launch_fields}
+        )
+
         with span("task.execute", task_id=workstream_id):
-            handle = await self._backend.run(request)
+            handle = await backend.run(request)
 
         # Register in _running BEFORE any further await, so a shutdown
         # cancellation can never orphan the spawned process: once it's
@@ -753,9 +947,13 @@ class Orchestrator:
             started_at=datetime.now(UTC),
             workspace_path=workspace,
             log_file=log_file,
+            execution_id=execution_id,
+            backend_id=backend.id,
         )
 
-        # Update PID in DB (same-state field patch, no dispatch).
+        # Update PID in DB (same-state field patch, no dispatch). Docker
+        # recovery uses execution_handles, not pid (Task 18) — leaving the
+        # real pid here for non-local backends too is harmless.
         await self._update_fields(workstream_id, process_pid=handle.os_pid)
 
         self._logger.info(
@@ -855,7 +1053,30 @@ class Orchestrator:
             return_code = running.handle.poll()
 
             if return_code is not None:
-                await self._handle_completion(zid, running, return_code)
+                # Process finished — finalize (reap/collect/cleanup) exactly
+                # once before dispatching on the outcome.
+                fin = await asyncio.shield(ensure_finalize_task(running))
+                if running.execution_id is not None:
+                    await self._db.mark_execution_state(
+                        running.execution_id,
+                        "terminal",
+                        allowed_from=["prepared", "running"],
+                    )
+                    if fin.cleaned:
+                        await self._db.mark_execution_state(
+                            running.execution_id,
+                            "cleaned",
+                            allowed_from=["terminal"],
+                        )
+                if fin.collect_error or fin.cleanup_error:
+                    self._logger.warning(
+                        "execution.finalize.resource_fault workstream=%s "
+                        "collect_error=%s cleanup_error=%s",
+                        zid,
+                        fin.collect_error,
+                        fin.cleanup_error,
+                    )
+                await self._handle_completion(zid, running, fin.execution.exit_code)
                 completed.append(zid)
 
         for zid in completed:
@@ -1090,18 +1311,26 @@ class Orchestrator:
         self,
         workstream_id: str,
         running: RunningWorkstream,
-        return_code: int,
+        return_code: int | None,
     ) -> None:
-        """Handle spec-runner process completion."""
+        """Handle spec-runner process completion.
+
+        Args:
+            workstream_id: ID of the completed workstream.
+            running: The running workstream info.
+            return_code: Process exit code (``None`` is treated as failure —
+                it never compares equal to 0).
+        """
         if return_code == 0:
             self._logger.info(
-                "Workstream '%s' completed successfully",
+                "Workstream '%s' completed successfully (backend=%s)",
                 workstream_id,
+                running.backend_id,
             )
             await self._handle_success(workstream_id, running.workspace_path)
         else:
             self._logger.warning(
-                "Workstream '%s' failed (code %d)",
+                "Workstream '%s' failed (code %s)",
                 workstream_id,
                 return_code,
             )

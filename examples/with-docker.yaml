@@ -1,0 +1,56 @@
+# =============================================================================
+# Maestro Task Scheduler — Local Docker Isolation Example (Phase 1)
+# =============================================================================
+#
+# Demonstrates the `execution:` block plus a per-task `backend: docker`
+# override. No `execution:` block at all → local+bare, as before (see
+# examples/tasks.yaml for the zero-config case).
+#
+# Usage:
+#   uv run maestro run with-docker.yaml
+#
+# =============================================================================
+
+project: my-app
+repo: ~/projects/my-app
+max_concurrent: 2
+
+# Default values applied to all tasks (can be overridden per-task)
+defaults:
+  timeout_minutes: 30
+  max_retries: 2
+  agent_type: claude_code
+
+# Git settings
+git:
+  base_branch: main
+  auto_push: true
+  branch_prefix: "agent/"
+
+# Execution backends (Phase 1: local isolator process + optional local Docker
+# isolation). Absent entirely -> every task runs local+bare (see tasks.yaml).
+execution:
+  default_backend: local
+  docker:
+    image: maestro-runner:2026-07-23   # must have the agent CLIs pre-installed
+    network: none                      # secure default; widen explicitly if needed
+    memory: 8g
+    cpus: "2"
+    user: "1000:1000"
+    secret_env: [ANTHROPIC_API_KEY]    # NAMES only; values read from the host env
+
+tasks:
+  - id: sandbox-refactor
+    title: "Refactor the parser"
+    prompt: |
+      Refactor the parser; keep the public API stable.
+    scope: ["src/parser/**"]
+    backend: docker                    # this task runs in an isolated container
+
+  - id: local-notes
+    title: "Summarize the changes"
+    prompt: |
+      Summarize the changes made by sandbox-refactor.
+    scope: ["NOTES.md"]
+    depends_on: [sandbox-refactor]
+    # no backend: -> falls back to execution.default_backend (local)
