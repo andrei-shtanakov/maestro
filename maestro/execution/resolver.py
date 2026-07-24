@@ -78,9 +78,10 @@ class BackendResolver:
         return LocalBackend(backend_id=name)
 
     def _build_ssh(
-        self, name: str, _spec: BackendSpec, _transport: SshTransport
+        self, name: str, _spec: BackendSpec, transport: SshTransport
     ) -> ExecutionBackend:
-        """Stub — the real SSH backend arrives in Task D2 (Task 13 / E2)."""
-        raise ExecutionConfigError(
-            f"backend {name!r}: ssh backend not yet wired (Task D2)"
+        from maestro.execution.ssh_backend import SshBackend
+
+        return SshBackend(
+            name, transport, secret_env=self._execution.effective_secret_env(name)
         )
