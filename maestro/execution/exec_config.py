@@ -31,13 +31,6 @@ class DockerConfig(BaseModel):
         return value
 
 
-class ExecutionConfig(BaseModel):
-    """The `execution:` block; absent → local + bare, old behavior."""
-
-    default_backend: str = "local"
-    docker: DockerConfig | None = None
-
-
 class LocalTransport(BaseModel):
     """Run the harness in-process on the local machine."""
 
@@ -102,3 +95,52 @@ class BackendSpec(BaseModel):
             msg = f"secret_env may not carry GitHub credentials: {bad}"
             raise ValueError(msg)
         return value
+
+
+class ExecutionConfig(BaseModel):
+    """The `execution:` block. Absent → `local + bare`, old behavior.
+
+    `backends` is the canonical named registry (transport x isolation). The
+    Phase-1 `docker` field is a legacy shorthand normalized into
+    `backends["docker"]`. `local` is always implicit.
+    """
+
+    default_backend: str = "local"
+    secret_env_defaults: list[str] = Field(default_factory=list)
+    backends: dict[str, BackendSpec] = Field(default_factory=dict)
+    docker: DockerConfig | None = None
+
+    def normalized(self) -> dict[str, "BackendSpec"]:
+        """Effective registry: implicit `local`, legacy-docker shim, no collision."""
+        registry: dict[str, BackendSpec] = dict(self.backends)
+        if "local" not in registry:
+            registry["local"] = BackendSpec(
+                transport=LocalTransport(), isolation=BareIsolation()
+            )
+        if self.docker is not None:
+            if "docker" in self.backends:
+                raise ValueError(
+                    "execution.docker (legacy) and backends.docker (canonical) "
+                    "are both set; remove one — no implicit precedence"
+                )
+            registry["docker"] = BackendSpec(
+                transport=LocalTransport(),
+                isolation=DockerIsolation(
+                    type="docker",
+                    image=self.docker.image,
+                    network=self.docker.network,
+                    memory=self.docker.memory,
+                    cpus=self.docker.cpus,
+                    user=self.docker.user,
+                ),
+                secret_env=list(self.docker.secret_env),
+            )
+        return registry
+
+    def effective_secret_env(self, name: str) -> list[str]:
+        """Per-backend secret allowlist, unioning defaults iff opted in."""
+        spec = self.normalized()[name]
+        if spec.inherit_secret_defaults:
+            merged = list(dict.fromkeys([*self.secret_env_defaults, *spec.secret_env]))
+            return merged
+        return list(spec.secret_env)
