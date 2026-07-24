@@ -206,21 +206,38 @@ New files `maestro/execution/ssh_backend.py` and `maestro/execution/ssh_cli.py`.
    - Deliver a **fixed, versioned Python supervisor** script into the remote tmp
      (its source contains **no** interpolated dynamic argv), and launch it with
      a fixed argv: `ssh <host> python3 <tmp>/maestro_supervisor.py <descriptor>`.
-   - The supervisor:
-     - validates the descriptor and **ownership** (writes/confirms
-       `<tmp>/.maestro-owner` == `execution_id`; refuses if `cwd`/paths escape
-       `workdir_root`);
-     - loads `env_file` into the child environment (parsed in Python, no shell);
-     - runs `subprocess.Popen(argv, cwd=…, env=…, start_new_session=True)` —
-       **no shell**, argv boundaries preserved, own session/process group;
-     - records `pid`/`pgid` to `<tmp>/<execution_id>.pid`;
-     - waits, then writes `<tmp>/<execution_id>.status` JSON **atomically**
-       (`tmp` file → `flush` → `os.fsync` → `os.replace`) as `{pid, pgid,
-       exit_code, completed_at}`. Real `fsync` is a Python primitive; Bash has
-       no portable equivalent.
-5. A local asyncio **monitor** task (D) tails the job's output over SSH into the
-   center's `log_path` and polls the status marker to update the cached
-   `poll()`.
+   - **The supervisor daemonizes — it must outlive the launch SSH channel.**
+     Running foreground under the `ssh` command, a dropped channel would
+     `SIGHUP` the supervisor: the workload child (started with
+     `start_new_session=True`) would survive, but nobody would `wait()` it,
+     write the atomic `.status`, or own the remote log — which silently breaks
+     the recovery contract (the monitor only accepts *terminal* via `.status`).
+     So the supervisor detaches:
+     - **`fork()`** → the **parent** confirms the child started, prints a
+       one-line **startup handshake** to the launch SSH's stdout, and exits,
+       ending the launch SSH command; the **child** `setsid()`s (new
+       session/process group, no controlling terminal);
+     - the detached child redirects **stdin ← `/dev/null`** and the workload's
+       **stdout/stderr → a named `<tmp>/<execution_id>.log`** (not the SSH
+       channel);
+     - only this daemonized supervisor then validates descriptor + **ownership**
+       (writes/confirms `<tmp>/.maestro-owner` == `execution_id`; refuses if
+       `cwd`/paths escape `workdir_root`), loads `env_file` into the child env
+       (parsed in Python, no shell), runs
+       `subprocess.Popen(argv, cwd=…, env=…, start_new_session=True)` (**no
+       shell**, argv boundaries preserved), records `pid`/`pgid` to
+       `<tmp>/<execution_id>.pid`, `wait()`s, and writes
+       `<tmp>/<execution_id>.status` JSON **atomically** (`tmp` → `flush` →
+       `os.fsync` → `os.replace`) as `{pid, pgid, exit_code, completed_at}`.
+       Real `fsync` is a Python primitive; Bash has none portable.
+   - **Startup handshake gates `run()`.** `run()` returns only after the
+     handshake confirms the owner marker, descriptor, named log, and `pid`/`pgid`
+     are all in place — so a channel drop **after** the handshake can never leave
+     the run in an unobservable state.
+5. A local asyncio **monitor** task (D) reconnects and tails the **named remote
+   log** (`<tmp>/<execution_id>.log`) over SSH into the center's `log_path`, and
+   polls the status marker to update the cached `poll()`. The monitor never
+   depends on the launch SSH channel staying open.
 6. **Durable identity.** A delimited `"ssh:<host>:<run_id>"` string is rejected
    (ambiguous to parse). `transport_ref` is stored as an **opaque, versioned
    JSON encoding** (`{"v":1,"transport":"ssh","host":…,"port":…,"remote_dir":…,
@@ -460,7 +477,8 @@ semantics.)
   the task resolves, `_monitor_running` proceeds to ex-post gate / PR / merge
   **only if** `fin.collect_succeeded`. On collect error/conflict: `NEEDS_REVIEW`,
   preserve remote tmp + staging, do **not** enter the PR/gate flow. `cleaned` is
-  marked from the callback path only on `fin.cleaned`.
+  marked only after `cleanup()` returns successfully (`fin.cleaned`), before any
+  further orchestration continuation.
 - **Observability.** Propagate `TRACEPARENT` via `trace_env` into the remote
   env; add spans `execution.dispatch`, `execution.transfer` (bytes in/out), and
   record host/backend on the workstream (parent §14).
@@ -482,7 +500,12 @@ Unit (injected fake-SSH runner, **no real sshd**):
   render as `-l`/`-p`, never concatenated into `host`;
 - secret env-file: `0600`/`0700`, control-char rejection, GH denylist, value
   never in argv;
-- **reconnect tail** resumes at byte offset — no duplicated log bytes;
+- **detached supervisor**: dropping the launch SSH channel immediately after
+  the startup handshake does **not** prevent the workload from completing and
+  writing the atomic `.status` marker; the reconnecting monitor still observes
+  terminal (proves the supervisor outlives the launch channel);
+- **reconnect tail** of the named remote log resumes at byte offset — no
+  duplicated log bytes;
 - **process-group terminate** kills descendants (fake tree);
 - **collect (two-phase)**: preflight conflict on a remote-changed path →
   **zero** local changes; I/O error mid-apply → **rollback journal restores**
