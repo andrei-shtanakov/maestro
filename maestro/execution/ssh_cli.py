@@ -125,6 +125,8 @@ class SshCli:
 
     def _rsync_ssh_string(self) -> str:
         parts = ["ssh", *self._t.ssh_opts, *self._guarded_opts()]
+        if self._t.user:
+            parts += ["-l", self._t.user]
         if self._t.port:
             parts += ["-p", str(self._t.port)]
         return " ".join(parts)

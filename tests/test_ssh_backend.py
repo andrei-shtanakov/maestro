@@ -1,9 +1,12 @@
+import subprocess
+
 import pytest
 
 from maestro.execution.exec_config import SshTransport
 from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.execution.ssh_backend import SshBackend
 from maestro.execution.ssh_cli import RunResult
+from maestro.execution.ssh_launch import remote_layout
 
 
 class Recorder:
@@ -52,3 +55,44 @@ async def test_run_awaits_handshake_before_returning(tmp_path, monkeypatch):
 
 async def _fake_async(*a, **k):
     return None
+
+
+def _git(*args: str) -> None:
+    subprocess.run(["git", *args], check=True, capture_output=True)
+
+
+@pytest.mark.anyio
+async def test_materialize_remote_removes_local_bundle_after_transfer(tmp_path):
+    wt = tmp_path / "gitwt"
+    wt.mkdir()
+    _git("init", "-q", str(wt))
+    _git("-C", str(wt), "config", "user.email", "t@example.com")
+    _git("-C", str(wt), "config", "user.name", "t")
+    (wt / "f.txt").write_text("x")
+    _git("-C", str(wt), "add", ".")
+    _git("-C", str(wt), "commit", "-q", "-m", "init")
+
+    rec = Recorder()
+    t = SshTransport(type="ssh", host="gpu", workdir_root="/var/tmp/m")
+    staging_root = tmp_path / "staging"
+    staging_root.mkdir()
+    backend = SshBackend(
+        "gpu", t, secret_env=[], runner=rec, local_staging_root=staging_root
+    )
+    layout = remote_layout(t.workdir_root, "e")
+    req = ExecutionRequest(
+        run_id="api",
+        argv=["spec-runner", "run", "--all"],
+        workdir=wt,
+        log_path=tmp_path / "api.log",
+        collect=CollectPolicy(mode="whole_worktree"),
+        required_tools=["spec-runner"],
+        execution_id="e",
+        entity_kind="workstream",
+        backend_id="gpu",
+    )
+
+    await backend._materialize_remote(req, layout)
+
+    bundle = staging_root / "maestro-bundle-e.bundle"
+    assert not bundle.exists()

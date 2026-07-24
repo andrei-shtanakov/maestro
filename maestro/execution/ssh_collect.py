@@ -97,7 +97,35 @@ def plan_collect(
             raise CollectConflict(
                 f"local worktree diverged from baseline on remote-touched path: {rel}"
             )
+
+    for rel in modified:
+        _check_structural_conflict(worktree, rel)
+
     return CollectPlan(modified=modified, deleted=deleted)
+
+
+def _check_structural_conflict(worktree: Path, rel: str) -> None:
+    """Raise if applying `rel` would clash with the worktree's file/dir shape.
+
+    Read-only: only stats existing paths, never mutates. Two cases:
+    an ancestor of `rel` is currently a regular file (can't create a nested
+    path under a file), or `rel` itself currently exists as a directory
+    (can't replace a directory with a file).
+    """
+    parts = rel.split("/")
+    ancestor = worktree
+    for part in parts[:-1]:
+        ancestor = ancestor / part
+        if ancestor.is_file():
+            raise CollectConflict(
+                f"structural conflict: {ancestor.relative_to(worktree).as_posix()} "
+                f"is a file, cannot create nested path {rel}"
+            )
+    target = worktree / rel
+    if target.is_dir():
+        raise CollectConflict(
+            f"structural conflict: {rel} is a directory, cannot replace with a file"
+        )
 
 
 def _atomic_copy(src: Path, dst: Path) -> None:

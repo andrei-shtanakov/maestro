@@ -65,6 +65,35 @@ def test_preflight_conflict_leaves_worktree_untouched(tmp_path):
     assert (wt / "a.py").read_text() == before
 
 
+def test_file_dir_structural_conflict_detected_in_preflight(tmp_path):
+    """Baseline has a file `a`; remote wants to nest `a/b` under it."""
+    wt, st = tmp_path / "wt", tmp_path / "st"
+    wt.mkdir()
+    st.mkdir()
+    _w(wt, "a", "a is a file")
+    base = capture_baseline(wt, excludes=EXCL)
+    _w(st, "a/b", "nested")
+    before = (wt / "a").read_text()
+    with pytest.raises(CollectConflict):
+        plan_collect(wt, st, base, forbidden=FORBIDDEN)
+    assert (wt / "a").read_text() == before
+    assert (wt / "a").is_file()  # zero mutation: still a file, not a dir
+
+
+def test_dir_file_structural_conflict_detected_in_preflight(tmp_path):
+    """Baseline has a dir `a/` (with `a/b`); remote replaces it with file `a`."""
+    wt, st = tmp_path / "wt", tmp_path / "st"
+    wt.mkdir()
+    st.mkdir()
+    _w(wt, "a/b", "nested orig")
+    base = capture_baseline(wt, excludes=EXCL)
+    _w(st, "a", "a is now a file")
+    with pytest.raises(CollectConflict):
+        plan_collect(wt, st, base, forbidden=FORBIDDEN)
+    assert (wt / "a").is_dir()  # zero mutation: still a directory
+    assert (wt / "a" / "b").read_text() == "nested orig"
+
+
 def test_rollback_restores_on_apply_error(tmp_path, monkeypatch):
     wt, st = tmp_path / "wt", tmp_path / "st"
     wt.mkdir()

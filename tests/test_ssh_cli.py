@@ -55,6 +55,18 @@ def test_probe_tool_rejects_bad_name():
         anyio.run(SshCli(_t()).probe_tool, "spec runner; rm -rf /")
 
 
+def test_rsync_transport_string_includes_user_when_set():
+    argv = SshCli(_t(user="alice")).rsync_argv("src", "dst", delete=False, excludes=[])
+    ssh_string = argv[argv.index("-e") + 1]
+    assert "-l alice" in ssh_string
+
+
+def test_rsync_transport_string_omits_user_when_unset():
+    argv = SshCli(_t()).rsync_argv("src", "dst", delete=False, excludes=[])
+    ssh_string = argv[argv.index("-e") + 1]
+    assert "-l" not in ssh_string.split()
+
+
 @pytest.mark.anyio
 async def test_run_uses_injected_runner():
     seen = {}

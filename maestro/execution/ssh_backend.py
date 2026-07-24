@@ -175,17 +175,23 @@ class SshBackend:
         """git bundle → transfer → clone; rsync worktree overlay; env-file."""
         # 1. Remote root, private.
         await self._ssh.run(["mkdir", "-p", "-m", "700", layout.root])
-        # 2. git bundle of the worktree HEAD, transferred and cloned.
+        # 2. git bundle of the worktree HEAD, transferred and cloned. The
+        # local bundle is a scratch file staged only to reach the remote; it
+        # is unlinked once the transfer completes so repeated runs don't
+        # leak large bundle files under the local staging root.
         bundle = self._staging_root / f"maestro-bundle-{req.execution_id}.bundle"
-        await _run_local(
-            ["git", "-C", str(req.workdir), "bundle", "create", str(bundle), "HEAD"]
-        )
-        await self._ssh.rsync(
-            str(bundle),
-            f"{self._t.host}:{layout.root}/repo.bundle",
-            delete=False,
-            excludes=[],
-        )
+        try:
+            await _run_local(
+                ["git", "-C", str(req.workdir), "bundle", "create", str(bundle), "HEAD"]
+            )
+            await self._ssh.rsync(
+                str(bundle),
+                f"{self._t.host}:{layout.root}/repo.bundle",
+                delete=False,
+                excludes=[],
+            )
+        finally:
+            bundle.unlink(missing_ok=True)
         await self._ssh.run(["git", "clone", f"{layout.root}/repo.bundle", layout.repo])
         # 3. Overlay the working tree (incl. dirty/untracked), excluding .git etc.
         await self._ssh.rsync(
