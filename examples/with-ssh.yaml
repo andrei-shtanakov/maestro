@@ -1,0 +1,52 @@
+# =============================================================================
+# Maestro Multi-Process Orchestrator — Remote SSH Executor Example (Phase 2a)
+# =============================================================================
+#
+# Demonstrates the `execution.backends` registry with an `ssh`-transport
+# backend: a workstream's harness runs on a remote host reached over SSH
+# instead of the local machine. Absent `execution:` entirely -> every
+# workstream runs local+bare, as before (see examples/project.yaml).
+#
+# `host` must be a bare hostname or ssh-config alias (NOT user@host:port —
+# use the separate `user`/`port` fields for that).
+#
+# Usage:
+#   uv run maestro validate examples/with-ssh.yaml
+#   uv run maestro orchestrate examples/with-ssh.yaml
+#
+# =============================================================================
+
+project: with-ssh-demo
+description: |
+  Build the API surface on a remote GPU box reached over SSH.
+repo_url: https://github.com/user/with-ssh-demo
+repo_path: ~/projects/with-ssh-demo
+workspace_base: /tmp/maestro-ws/with-ssh-demo
+
+max_concurrent: 2
+base_branch: main
+
+# Execution backends (Phase 2a: remote SSH transport). `default_backend`
+# still applies to any workstream that doesn't declare `backend:`.
+execution:
+  default_backend: local
+  secret_env_defaults:
+    - ANTHROPIC_API_KEY
+  backends:
+    gpu-box:
+      transport:
+        type: ssh
+        host: gpu-box            # ssh config alias or bare hostname
+        workdir_root: /var/tmp/maestro
+        connect_timeout_s: 10
+      isolation:
+        type: bare
+      secret_env:                # NAMES only; values read from the host env
+        - ANTHROPIC_API_KEY
+
+workstreams:
+  - id: api
+    title: "API Surface"
+    description: Build the API surface on the remote executor.
+    scope: ["src/api/**"]
+    backend: gpu-box              # this workstream runs on the gpu-box host
