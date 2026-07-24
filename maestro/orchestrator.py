@@ -130,7 +130,8 @@ class RunningWorkstream:
     + cleanup) so a second monitor/shutdown caller awaits it rather than
     starting a duplicate. ``execution_id`` is the durable execution-handle id
     for a non-local backend (``None`` for the local path, which persists no
-    handle).
+    handle). ``backend_id`` is the resolved execution backend id (e.g.
+    "local", "docker") this workstream was spawned on.
     """
 
     workstream: Workstream
@@ -140,6 +141,7 @@ class RunningWorkstream:
     log_file: Path
     finalize_task: "asyncio.Task | None" = None
     execution_id: str | None = None
+    backend_id: str = "local"
 
 
 @dataclass
@@ -910,6 +912,7 @@ class Orchestrator:
             workspace_path=workspace,
             log_file=log_file,
             execution_id=execution_id,
+            backend_id=backend.id,
         )
 
         # Update PID in DB (same-state field patch, no dispatch). Docker
@@ -1284,8 +1287,9 @@ class Orchestrator:
         """
         if return_code == 0:
             self._logger.info(
-                "Workstream '%s' completed successfully",
+                "Workstream '%s' completed successfully (backend=%s)",
                 workstream_id,
+                running.backend_id,
             )
             await self._handle_success(workstream_id, running.workspace_path)
         else:

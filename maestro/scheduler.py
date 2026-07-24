@@ -170,6 +170,8 @@ class RunningTask:
         finalize_task: The single finalization task for this run, if started.
         execution_id: The minted execution-handle id for non-local backends,
             or ``None`` for the local path (no `execution_handles` row).
+        backend_id: The resolved execution backend id (e.g. "local",
+            "docker") this task was spawned on.
     """
 
     task: Task
@@ -178,6 +180,7 @@ class RunningTask:
     log_file: Path
     finalize_task: "asyncio.Task | None" = None
     execution_id: str | None = None
+    backend_id: str = "local"
 
 
 @dataclass
@@ -1148,6 +1151,7 @@ class Scheduler:
                 started_at=datetime.now(UTC),
                 log_file=log_file,
                 execution_id=execution_id,
+                backend_id=backend.id,
             )
 
             return True
@@ -1349,6 +1353,7 @@ class Scheduler:
                         task_id=task_id,
                         agent=task.routed_agent_type or task.agent_type.value,
                         validation_passed=True,
+                        backend_id=running_task.backend_id,
                     )
                 else:
                     # Include validation output in error for retry context
@@ -1372,6 +1377,7 @@ class Scheduler:
                     task_id=task_id,
                     agent=task.routed_agent_type or task.agent_type.value,
                     validation_passed=None,
+                    backend_id=running_task.backend_id,
                 )
         else:
             # Process failed

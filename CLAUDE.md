@@ -154,7 +154,7 @@ An ex-post gate block that the operator approved resumes at the ex-post edge (H-
 - **Workspace isolation**: git worktree per workstream (lightweight, shares .git)
 - **Two-level hierarchy**: Orchestrator manages workstreams, spec-runner manages subtasks within each
 - **Git strategy**: `feature/<workstream-id>` branch per workstream, subtask branches merge into it, then PR to main
-- **Communication**: REST API callbacks from spec-runner (state file polling deprecated)
+- **Communication**: REST API callbacks from spec-runner (state file polling deprecated). Docker Isolation Phase 1 adds a container-backed execution path (`backend: docker`, local Docker isolation); recovery for docker-backed executions keys off the execution-handle label, not a pid.
 - **Conflict prevention**: Workstreams define `scope` (file/dir globs), decomposer validates non-overlap
 - **Storage**: SQLite (single file, no external services)
 - **Spec-runner**: External package (PyPI) handles subtask execution within a worktree
