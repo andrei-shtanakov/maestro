@@ -76,6 +76,24 @@ def test_supervisor_rejects_path_escape(tmp_path):
     assert not resolved_evil.exists()
 
 
+def test_supervisor_fails_fast_when_workload_cannot_exec(tmp_path):
+    """I2: a descriptor whose argv[0] is not on PATH must make the supervisor
+    exit non-zero WITHOUT emitting the handshake and WITHOUT a success status
+    marker — so `run()` fails fast instead of hanging forever."""
+    dp = _descriptor(tmp_path, ["maestro-no-such-cmd-xyz", "--go"])
+    out = subprocess.run(
+        [sys.executable, str(SUP), str(dp)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert out.returncode != 0
+    assert "MAESTRO-SUPERVISOR-READY" not in out.stdout
+    # No success status was written (the run never started).
+    status = tmp_path / "maestro-exec-e1" / "e1.status"
+    assert not status.exists()
+
+
 def test_supervisor_preserves_argv_boundaries(tmp_path):
     marker = tmp_path / "argmark.txt"
     argv = [

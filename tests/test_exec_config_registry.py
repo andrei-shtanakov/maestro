@@ -8,6 +8,7 @@ from maestro.execution.exec_config import (
     DockerConfig,
     ExecutionConfig,
     SshTransport,
+    is_denylisted,
 )
 
 
@@ -63,6 +64,39 @@ def test_legacy_and_canonical_docker_collision_raises():
     )
     with pytest.raises(ValueError, match="docker"):
         cfg.normalized()
+
+
+def test_secret_env_defaults_rejects_github_creds():
+    """I1: the GH denylist must also guard `secret_env_defaults`, else a
+    backend with `inherit_secret_defaults` leaks GH_TOKEN to a remote."""
+    with pytest.raises(ValidationError):
+        ExecutionConfig(secret_env_defaults=["GH_TOKEN"])
+    with pytest.raises(ValidationError):
+        ExecutionConfig(secret_env_defaults=["GITHUB_TOKEN"])
+    with pytest.raises(ValidationError):
+        ExecutionConfig(secret_env_defaults=["GH_ENTERPRISE_TOKEN"])
+
+
+def test_effective_secret_env_never_returns_github_creds():
+    """I1 belt-and-suspenders: even a config assembled around the validators
+    (via construct) must never surface a GH_*/GITHUB_TOKEN name."""
+    cfg = ExecutionConfig.model_construct(
+        default_backend="local",
+        secret_env_defaults=["GH_TOKEN"],
+        backends={
+            "a": BackendSpec.model_construct(
+                transport=SshTransport(type="ssh", host="h", workdir_root="/w"),
+                isolation={"type": "bare"},
+                secret_env=["GITHUB_TOKEN", "ANTHROPIC_API_KEY"],
+                inherit_secret_defaults=True,
+                max_concurrent=None,
+            )
+        },
+        docker=None,
+    )
+    result = cfg.effective_secret_env("a")
+    assert result == ["ANTHROPIC_API_KEY"]
+    assert not any(is_denylisted(n) for n in result)
 
 
 def test_effective_secret_env_inherits_defaults_only_when_flagged():

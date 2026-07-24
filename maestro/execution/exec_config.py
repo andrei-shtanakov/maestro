@@ -110,6 +110,17 @@ class ExecutionConfig(BaseModel):
     backends: dict[str, BackendSpec] = Field(default_factory=dict)
     docker: DockerConfig | None = None
 
+    @field_validator("secret_env_defaults")
+    @classmethod
+    def _reject_gh(cls, value: list[str]) -> list[str]:
+        """Reject GitHub credential names in the shared defaults so they can
+        never reach a remote executor via `inherit_secret_defaults`."""
+        bad = [n for n in value if is_denylisted(n)]
+        if bad:
+            msg = f"secret_env_defaults may not carry GitHub credentials: {bad}"
+            raise ValueError(msg)
+        return value
+
     def normalized(self) -> dict[str, "BackendSpec"]:
         """Effective registry: implicit `local`, legacy-docker shim, no collision."""
         registry: dict[str, BackendSpec] = dict(self.backends)
@@ -138,9 +149,16 @@ class ExecutionConfig(BaseModel):
         return registry
 
     def effective_secret_env(self, name: str) -> list[str]:
-        """Per-backend secret allowlist, unioning defaults iff opted in."""
+        """Per-backend secret allowlist, unioning defaults iff opted in.
+
+        Denylisted GitHub credential names are filtered from the result as a
+        belt-and-suspenders guard, so even a hand-constructed config (bypassing
+        the field validators) can never leak `GH_*`/`GITHUB_TOKEN` to a remote
+        executor.
+        """
         spec = self.normalized()[name]
         if spec.inherit_secret_defaults:
             merged = list(dict.fromkeys([*self.secret_env_defaults, *spec.secret_env]))
-            return merged
-        return list(spec.secret_env)
+        else:
+            merged = list(spec.secret_env)
+        return [n for n in merged if not is_denylisted(n)]

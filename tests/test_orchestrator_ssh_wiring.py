@@ -627,6 +627,98 @@ class TestSshRecoveryBranch:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_ssh_terminal_handle_recovers_to_needs_review_not_rerun(
+        self, tmp_path
+    ) -> None:
+        """C1 / spec §J: an ssh execution stranded in the terminal window
+        (finalize's on_terminal persisted, but the center crashed before
+        collect) must route the workstream to NEEDS_REVIEW — never silently
+        reset to READY and re-run over uncollected remote changes. retry_count
+        stays unchanged and the error names the preserved remote workspace."""
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            backend = _ssh_backend()
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(
+                _seed("w", WorkstreamStatus.READY, backend="gpu")
+            )
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu", None, layout.root, layout.status
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+            # Persist the launch coordinates the real ssh spawn writes back
+            # (Task 16b) so the preserved-remote path appears in the message.
+            await db.update_execution_handle_launch(
+                "e1",
+                transport_ref=transport_ref,
+                remote_host="gpu",
+                remote_dir=layout.root,
+                status_marker=layout.status,
+            )
+            # Drive the handle to `terminal` (workload finished, remote diff not
+            # yet collected) while the workstream is still RUNNING.
+            await db.mark_execution_state(
+                "e1", "terminal", allowed_from=["prepared", "running"]
+            )
+            w0 = await db.get_workstream("w")
+            assert w0.status == WorkstreamStatus.RUNNING
+            retry_before = w0.retry_count
+
+            count = await orch._recover_stranded_workstreams()
+
+            assert count == 1
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert w.retry_count == retry_before
+            assert "collect" in (w.error_message or "").lower()
+            assert layout.root in (w.error_message or "")
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_docker_terminal_handle_still_resets_to_ready(self, tmp_path) -> None:
+        """Zero docker regression: a docker `terminal` handle in the same
+        stranded-RUNNING situation still resets to READY (docker collect is a
+        no-op, so reset-and-rerun stays safe) — the new ssh-terminal routing
+        must never touch docker."""
+        orch, db = await _orch_with_db(tmp_path)
+        docker = MagicMock()
+        docker.ps_ids_by_label = AsyncMock(return_value=[])
+        orch._docker = docker
+        try:
+            await db.create_workstream(_seed("w", WorkstreamStatus.READY))
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="docker",
+                transport_ref="docker:maestro-e1",
+                attempt=1,
+            )
+            await db.mark_execution_state("e1", "terminal", allowed_from=["prepared"])
+
+            await orch._recover_stranded_workstreams()
+
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.READY
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_gc_terminal_handles_docker_unaffected_by_ssh_branch(
         self, tmp_path
     ) -> None:
@@ -656,5 +748,57 @@ class TestSshRecoveryBranch:
             assert swept == 1
             remaining = await db.get_open_execution_handles()
             assert all(h["execution_id"] != "e1" for h in remaining)
+        finally:
+            await db.close()
+
+
+# =============================================================================
+# I2: ssh can_run() capability gate in `_spawn_workstream`
+# =============================================================================
+
+
+class TestSshCanRunGate:
+    @pytest.mark.anyio
+    async def test_missing_remote_tools_routes_to_needs_review(self, tmp_path) -> None:
+        """I2: an ssh workstream whose required remote tools are absent
+        (can_run not-ok) is parked in NEEDS_REVIEW BEFORE the READY->RUNNING
+        CAS — the supervisor is never launched. healthcheck alone (reachable)
+        does not prove `spec-runner` is on the remote PATH."""
+        from maestro.execution.models import CapabilityResult
+
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            backend = _ssh_backend()
+
+            async def fake_healthcheck() -> BackendHealth:
+                return BackendHealth(reachable=True)
+
+            async def fake_can_run(req: ExecutionRequest) -> CapabilityResult:
+                del req
+                return CapabilityResult(ok=False, missing_tools=["spec-runner"])
+
+            async def _no_run(req: ExecutionRequest):
+                raise AssertionError("run() must not be called when can_run fails")
+
+            backend.healthcheck = fake_healthcheck  # type: ignore[method-assign]
+            backend.can_run = fake_can_run  # type: ignore[method-assign]
+            backend.run = _no_run  # type: ignore[method-assign]
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(
+                _seed("w", WorkstreamStatus.READY, backend="gpu")
+            )
+            workspace = tmp_path / "ws-w"
+            workspace.mkdir()
+            orch._workspace_mgr.workspace_exists = MagicMock(return_value=True)
+            orch._workspace_mgr.get_workspace_path = MagicMock(return_value=workspace)
+            orch._decomposer.generate_spec = AsyncMock()
+
+            await orch._spawn_workstream("w")
+
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert "spec-runner" in (w.error_message or "")
+            assert "w" not in orch._running
         finally:
             await db.close()

@@ -400,10 +400,33 @@ class Orchestrator:
             if h["entity_kind"] == "workstream"
             and h["state"] in ("prepared", "running")
         }
+        # Parallel lookup for handles that already reached the terminal/collected
+        # window: finalize's `on_terminal` persisted the marker, but the center
+        # crashed before `collect` confirmed the remote diff was applied. For SSH
+        # these must NOT be silently re-run (spec §G/§J) — see the pre-empt check
+        # at the top of the loop. (Rows in these states are returned by
+        # `get_open_execution_handles` alongside prepared/running.)
+        workstream_terminal_handles = {
+            h["entity_id"]: h
+            for h in open_handles
+            if h["entity_kind"] == "workstream"
+            and h["state"] in ("terminal", "collected")
+        }
 
         for state in _STRANDED_INFLIGHT:
             for w in await self._db.get_workstreams_by_status(state):
                 try:
+                    # SSH terminal/collect window (spec §G/§J): an ssh execution
+                    # stranded after its terminal marker but before collect must
+                    # never re-run over uncollected remote changes — park it for
+                    # review with the remote tmp preserved, BEFORE the generic
+                    # pid/reset logic (SSH os_pid is None, so live-orphan detection
+                    # would otherwise let it fall through to FAILED->READY).
+                    term_row = workstream_terminal_handles.get(w.id)
+                    if term_row is not None and self._is_ssh_terminal_strand(term_row):
+                        await self._route_ssh_terminal_strand(w.id, state, term_row)
+                        recovered += 1
+                        continue
                     orphan_pid = (
                         w.process_pid
                         if state is WorkstreamStatus.RUNNING
@@ -568,6 +591,58 @@ class Orchestrator:
         await self._gc_terminal_handles(open_handles)
 
         return recovered
+
+    def _is_ssh_terminal_strand(self, handle_row: dict[str, Any]) -> bool:
+        """True if `handle_row` is an SSH-resolved execution stranded in the
+        terminal/collected window — the case that must route to NEEDS_REVIEW
+        rather than silently re-run (spec §G/§J). Docker rows return False
+        (docker `collect` is a no-op, so its reset-and-rerun stays safe)."""
+        if handle_row["state"] not in ("terminal", "collected"):
+            return False
+        try:
+            backend = self._backends.resolve(handle_row["backend_id"])
+        except Exception:
+            return False
+        return isinstance(backend, SshBackend)
+
+    async def _route_ssh_terminal_strand(
+        self,
+        workstream_id: str,
+        state: WorkstreamStatus,
+        handle_row: dict[str, Any],
+    ) -> None:
+        """Park an SSH workstream stranded in the terminal/collect window for
+        review, preserving the remote tmp. A crash between the terminal marker
+        and collect cannot prove the remote diff was applied, so re-running
+        would discard uncollected remote changes — route to NEEDS_REVIEW
+        (the `collected`-row remote tmp is GC'd separately by the ownership-
+        checked `_gc_terminal_handles` sweep; a `terminal` row is left intact)."""
+        remote_dir = handle_row.get("remote_dir") or "<unknown>"
+        reason = (
+            f"ssh execution stranded in '{handle_row['state']}' after restart "
+            f"(crash between terminal marker and collect); remote workspace "
+            f"preserved at {remote_dir} — verify/collect before resuming"
+        )
+        self._logger.warning(
+            "Workstream '%s' stranded in %s with an ssh execution in the "
+            "terminal/collect window — sending to NEEDS_REVIEW; %s",
+            workstream_id,
+            state.value,
+            reason,
+        )
+        await self._transition(
+            workstream_id, WorkstreamStatus.FAILED, expected_status=state
+        )
+        await self._transition(
+            workstream_id,
+            WorkstreamStatus.NEEDS_REVIEW,
+            expected_status=WorkstreamStatus.FAILED,
+            process_pid=None,
+            generation_pid=None,
+            message=reason,
+            error_message=reason,
+        )
+        self._stats.failed += 1
 
     async def _probe_open_handle(
         self, workstream_id: str, workstream_handles: dict[str, dict[str, Any]]
@@ -986,6 +1061,42 @@ class Orchestrator:
                 reason = f"backend {backend.id} not reachable: {health.detail}"
                 self._logger.warning(
                     "Workstream '%s' backend healthcheck failed: %s",
+                    workstream_id,
+                    reason,
+                )
+                await self._transition(
+                    workstream_id,
+                    WorkstreamStatus.NEEDS_REVIEW,
+                    expected_status=WorkstreamStatus.READY,
+                    message=reason,
+                    error_message=reason,
+                )
+                return
+
+        # SSH capability gate (spec C.4): reachability (healthcheck) does not
+        # prove the remote host actually has `spec-runner` on PATH. Probe it
+        # BEFORE the READY->RUNNING CAS so a missing remote tool routes READY
+        # -> NEEDS_REVIEW (mirroring the healthcheck-failure block) instead of
+        # spawning a supervisor whose workload can never exec. SSH-only;
+        # local/docker are unaffected.
+        if isinstance(backend, SshBackend):
+            cap = await backend.can_run(
+                ExecutionRequest(
+                    run_id=workstream_id,
+                    argv=["spec-runner"],
+                    workdir=workspace,
+                    log_path=self._log_dir / f"{workstream_id}.log",
+                    collect=CollectPolicy(mode="none"),
+                    required_tools=["spec-runner"],
+                )
+            )
+            if not cap.ok:
+                reason = (
+                    f"backend {backend.id} missing required tools on remote: "
+                    f"{cap.missing_tools}"
+                )
+                self._logger.warning(
+                    "Workstream '%s' backend can_run gate failed: %s",
                     workstream_id,
                     reason,
                 )
