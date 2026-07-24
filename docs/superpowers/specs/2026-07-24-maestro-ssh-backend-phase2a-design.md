@@ -49,7 +49,10 @@ Phase 2c).
 
 ### Hard requirements (carried from parent MVP guarantees)
 
-- **No `execution` config → `local + bare`, byte-identical to today.**
+- **No `execution` config → `local + bare`, behavior-compatible with today.**
+  (Not "byte-identical": the registry refactor and schema migration #8 change
+  internal representation even when local execution's observable behavior is
+  unchanged.)
 - **A remote executor never receives GitHub credentials.** `GH_TOKEN` /
   `GITHUB_TOKEN` / `GH_*` denylisted; git/PR/merge stays on the center.
 - **`spec-runner plan --full` (generation) stays local.**
@@ -139,8 +142,8 @@ New files `maestro/execution/ssh_backend.py` and `maestro/execution/ssh_cli.py`.
   allowlist and appended *before* Maestro's non-negotiable options, so a user
   option can never disable:
   - `-o BatchMode=yes` (no interactive/password prompts),
-  - host-key verification (`-o StrictHostKeyChecking` is Maestro-set; user
-    cannot force `no`/`accept-new` off),
+  - `-o StrictHostKeyChecking=yes` (concrete value; Maestro sets exactly `yes`,
+    never `no`/`accept-new` — a known_hosts entry is a precondition),
   - `-o ConnectTimeout=<connect_timeout_s>`,
   - `-o PasswordAuthentication=no` / `-o KbdInteractiveAuthentication=no`.
 
@@ -149,9 +152,12 @@ New files `maestro/execution/ssh_backend.py` and `maestro/execution/ssh_cli.py`.
 - **`healthcheck()`** — fail-fast SSH preconditions: reject empty host; run
   `ssh <guarded-opts> host true` and require success within the connect
   timeout. Mirrors `proctor/docs/remote-workers.md` preconditions.
-- **`can_run(req)`** — `ssh host 'command -v <tool>'` for each
-  `req.required_tools` (e.g. `spec-runner`); missing tools → `CapabilityResult(
-  ok=False, missing_tools=…)`.
+- **`can_run(req)`** — probes `req.required_tools` **without** an unvalidated
+  shell string: each tool name is validated against a strict charset
+  (`[A-Za-z0-9._-]`, no path separators) and the probe runs as a fixed argv
+  (`ssh <host> command -v -- <tool>` with the tool as a distinct argument, or a
+  fixed Python probe that takes tool names as `sys.argv`). Missing tools →
+  `CapabilityResult(ok=False, missing_tools=…)`.
 
 ### C. `run()` sequence (safe launcher, process groups, identity)
 
@@ -181,25 +187,37 @@ New files `maestro/execution/ssh_backend.py` and `maestro/execution/ssh_cli.py`.
    `DockerIsolator.materialize`, extracted to a shared
    `execution/secret_file.py` helper), then deliver it to the remote `0700`
    dir via `rsync`/stdin. Values never appear in any `ssh`/`rsync` argv and are
-   never logged. Referenced remotely via `set -a; . <envfile>; set +a`.
-4. **Verified launcher over stdin, detached, process-group identified.** The
-   remote command is a fixed launcher **script piped over stdin** to
-   `ssh host bash -s`, **not** assembled by shell interpolation of argv. Remote
-   paths and the `execution_id` are passed as **positional arguments**
-   (`bash -s <execution_id> <tmp> -- "$@"`), never interpolated into the script
-   text/heredoc. The script:
-   - writes an **ownership marker** `<tmp>/.maestro-owner` containing the
-     `execution_id` (gates the guarded recursive delete in D);
-   - `setsid` the job into its own **session/process group** so the whole tree
-     can be signalled and descendants can't be orphaned;
-   - writes both `pid` and `pgid` to `<tmp>/<execution_id>.pid`;
-   - on exit writes `<tmp>/<execution_id>.status` **atomically** (write to
-     `.status.tmp`, `fsync`, `rename`) as `{pid, pgid, exit_code,
-     completed_at}`.
-
-   argv (`req.argv`, e.g. `spec-runner run --all …`) is passed to the script as
-   a properly-quoted array (`"$@"` / `printf %q`), so spaces, quotes, and
-   hostile tokens can't break out.
+   never logged. The env-file path is named in the launch descriptor (step 4);
+   the supervisor loads it into the child's environment (no shell sourcing).
+4. **JSON launch descriptor + fixed Python supervisor (not a shell launcher).**
+   A `ssh host bash -s … -- "$@"` construction does **not** preserve argv
+   boundaries: OpenSSH concatenates the remote command into a single string that
+   the remote shell **re-parses**, so a local `create_subprocess_exec` preserves
+   boundaries only up to the `ssh` process, not up to the remote shell. Arbitrary
+   `req.argv` (spaces, quotes, `$()`, newlines, hostile tokens) would then depend
+   on manual escaping — exactly what this design avoids. Instead:
+   - Serialize a **launch descriptor** JSON locally and transfer it to the
+     remote tmp dir alongside the other control files:
+     ```json
+     {"v": 1, "execution_id": "…", "cwd": "<tmp>/repo",
+      "argv": ["spec-runner", "run", "--all", "--spec-prefix", "maestro-"],
+      "env_file": "<tmp>/env", "workdir_root": "/var/tmp/maestro"}
+     ```
+   - Deliver a **fixed, versioned Python supervisor** script into the remote tmp
+     (its source contains **no** interpolated dynamic argv), and launch it with
+     a fixed argv: `ssh <host> python3 <tmp>/maestro_supervisor.py <descriptor>`.
+   - The supervisor:
+     - validates the descriptor and **ownership** (writes/confirms
+       `<tmp>/.maestro-owner` == `execution_id`; refuses if `cwd`/paths escape
+       `workdir_root`);
+     - loads `env_file` into the child environment (parsed in Python, no shell);
+     - runs `subprocess.Popen(argv, cwd=…, env=…, start_new_session=True)` —
+       **no shell**, argv boundaries preserved, own session/process group;
+     - records `pid`/`pgid` to `<tmp>/<execution_id>.pid`;
+     - waits, then writes `<tmp>/<execution_id>.status` JSON **atomically**
+       (`tmp` file → `flush` → `os.fsync` → `os.replace`) as `{pid, pgid,
+       exit_code, completed_at}`. Real `fsync` is a Python primitive; Bash has
+       no portable equivalent.
 5. A local asyncio **monitor** task (D) tails the job's output over SSH into the
    center's `log_path` and polls the status marker to update the cached
    `poll()`.
@@ -241,7 +259,9 @@ from the marker; `timed_out` if `req.timeout_seconds` elapsed first).
 **ownership marker** (`<tmp>/.maestro-owner`, written in C.4) whose content
 matches the expected `execution_id`. A persisted path alone is **not**
 sufficient authorization for a recursive delete — both checks must pass or the
-delete is refused and the row left for review.
+delete is refused and the row left for review. The recursive delete of the tmp
+dir removes **all** control files (launch descriptor, supervisor, env-file,
+pid/status markers, bundle, repo) — only ever after the ownership checks pass.
 
 ### E. Collect — baseline diff, atomic apply, inside finalization
 
@@ -334,11 +354,19 @@ recovery would lose them. So the execution state machine gains a durable
 prepared → running → terminal → collected → cleaned
 ```
 
-**Conditional cleanup — a change to the shared `finalize_handle` contract.**
-The shipped `finalize_handle` (`execution/finalize.py`) calls `cleanup()`
-**unconditionally** after `collect()`, even when collect raised. For SSH that
-would `rm -rf` the remote tmp exactly when its unapplied changes must be kept.
-The contract changes so cleanup is **gated on collect success**:
+**Conditional cleanup + inter-phase persistence — a change to the shared
+`finalize_handle` contract.** The shipped `finalize_handle`
+(`execution/finalize.py`) runs `wait → collect → cleanup` and returns, and the
+monitor writes DB state only **after** the whole helper returns. That has two
+defects for SSH: (a) cleanup runs `rm -rf` even when collect raised (destroying
+the changes that must be kept); and (b) the DB transition happens after *all*
+phases, so a crash in the window `collect succeeds → cleanup deletes remote tmp
+→ CENTER CRASHES` leaves the DB at `running`/`terminal` with `collected` never
+persisted **and** the remote tmp already gone — durable state that lies.
+
+**The hard requirement: a monotonic DB transition must be persisted *between*
+phases, not after the helper.** `finalize_handle` takes phase callbacks that
+perform the monotonic marks, so persistence is interleaved with the operations:
 
 ```python
 @dataclass
@@ -352,22 +380,44 @@ class FinalizationResult:
     @property
     def cleaned(self) -> bool:
         return self.cleanup_attempted and self.cleanup_error is None
+
+async def finalize_handle(handle, *, on_terminal, on_collected) -> FinalizationResult:
+    execution = await handle.wait()
+    await on_terminal()                       # persist `terminal` BEFORE collect
+    try:
+        await handle.collect()
+    except Exception as exc:
+        return FinalizationResult(execution, collect_error=str(exc))
+    await on_collected()                       # persist `collected` BEFORE cleanup
+    try:
+        await handle.cleanup()
+    except Exception as exc:
+        return FinalizationResult(execution, collect_succeeded=True,
+                                  cleanup_attempted=True, cleanup_error=str(exc))
+    return FinalizationResult(execution, collect_succeeded=True,
+                              cleanup_attempted=True)
 ```
 
-Rule in `finalize_handle`:
+Consequences (each crash window is now safe):
 
-- `collect()` succeeds → mark `collected`, then call `cleanup()`
-  (`cleanup_attempted=True`); on success mark `cleaned`.
 - `collect()` fails / conflicts → `cleanup()` is **not** called; remote tmp +
-  staging are preserved; the monitor routes the workstream to **NEEDS_REVIEW**.
-- **Docker / local** `collect()` is a no-op that always succeeds →
-  `collect_succeeded=True`, cleanup runs as before — **zero behavior change**.
+  staging preserved; the monitor routes the workstream to **NEEDS_REVIEW**.
+- crash after `terminal` before `collect` → remote tmp preserved (recovery →
+  NEEDS_REVIEW).
+- crash after `collected` before `cleanup` → recovery can safely GC the leftover
+  remote tmp (the changes are already applied locally).
+- `cleaned` is marked only after `cleanup()` actually succeeds.
+- **Docker / local** `collect()`/`cleanup()` are no-ops that always succeed →
+  `on_terminal`/`on_collected` fire in order and cleanup runs as before —
+  **behavior-compatible** (an extra, ordered `collected` mark).
 
-This makes the `terminal → collected → cleaned` transitions *observable* (driven
-by real collect/cleanup outcomes), not merely declarative. Both modes'
-`_monitor_running` call sites (which today read `fin.cleaned`) branch on
-`fin.collect_succeeded` before marking `collected`/`cleaned` and before entering
-any gate/PR flow.
+Callbacks are monotonic `mark_execution_state` calls (no-op for the local path,
+which persists no handle). This makes the `terminal → collected → cleaned`
+transitions genuinely durable, not merely declarative. (An equivalent shape is
+acceptable: the monitor owns `wait → mark → collect → mark → cleanup → mark`
+inline and the helper only removes boilerplate — the invariant is the same: a DB
+transition **between** phases, keeping the single-owner `ensure_finalize_task`
+semantics.)
 
 - **Schema migration #8** (`_migrate_*`): extend the `execution_handles.state`
   CHECK to include `'collected'`, and `ALTER TABLE ADD COLUMN` for
@@ -404,13 +454,13 @@ any gate/PR flow.
 - **Progress mirror.** `RunningWorkstream` carries the mirror `local_dir`;
   `_update_progress` reads from it (the reader is pointed at the mirror, not the
   live remote spec dir).
-- **Finalization gates the continuation.** In `_monitor_running`, after
-  `ensure_finalize_task`, the workstream may proceed to ex-post gate / PR /
-  merge **only if** `fin.collect_succeeded`. On collect error/conflict:
-  `NEEDS_REVIEW`, preserve remote tmp + staging, do **not** enter the PR/gate
-  flow. Execution state is marked `terminal` → `collected` (only on
-  `collect_succeeded`) → `cleaned` (only on `fin.cleaned`), per the conditional
-  cleanup contract (G).
+- **Finalization gates the continuation.** `ensure_finalize_task` supplies the
+  `on_terminal`/`on_collected` callbacks (monotonic `mark_execution_state`), so
+  DB phases are persisted **between** operations (G), not after the task. After
+  the task resolves, `_monitor_running` proceeds to ex-post gate / PR / merge
+  **only if** `fin.collect_succeeded`. On collect error/conflict: `NEEDS_REVIEW`,
+  preserve remote tmp + staging, do **not** enter the PR/gate flow. `cleaned` is
+  marked from the callback path only on `fin.cleaned`.
 - **Observability.** Propagate `TRACEPARENT` via `trace_env` into the remote
   env; add spans `execution.dispatch`, `execution.transfer` (bytes in/out), and
   record host/backend on the workstream (parent §14).
@@ -423,8 +473,9 @@ Unit (injected fake-SSH runner, **no real sshd**):
 
 - run / poll(cached) / wait / terminate(**process-group**) / kill / cleanup /
   probe;
-- **shell quoting**: argv with spaces, quotes, `$()`, newlines survives to the
-  remote intact (verified launcher over stdin, positional args);
+- **argv boundaries**: argv with spaces, quotes, `$()`, newlines round-trips
+  intact via the JSON descriptor + Python supervisor `Popen(argv, shell=False)`
+  — no shell re-parse on the remote; supervisor source has no interpolated argv;
 - **`ssh_opts` cannot disable** `BatchMode` / host verification / connect
   timeout / password-auth-off (guarded precedence);
 - **host fields**: a `host` containing `@` or `:` is rejected; `user`/`port`
@@ -453,7 +504,9 @@ Unit (injected fake-SSH runner, **no real sshd**):
 
 Gated opt-in e2e (real localhost sshd, skipped by default like the docker
 integration gate): a Mode-2 workstream over `ssh localhost`, mirrored progress
-visible, remote-crash classified, cleanup via a fake runner.
+visible, remote-crash classified. At least **one** e2e case must exercise the
+**real** guarded remote cleanup end-to-end (ownership marker checked, tmp dir
+actually removed over localhost SSH) — not only the fake runner.
 
 **Verification discipline (operational learning):** verify locally with
 **targeted foreground** runs (specific files / `-k` halves) + `pyrefly check` +
