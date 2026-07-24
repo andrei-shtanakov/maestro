@@ -116,7 +116,14 @@ _STRANDED_INFLIGHT = (
 
 @dataclass
 class RunningWorkstream:
-    """Represents a currently running workstream execution."""
+    """Represents a currently running workstream execution.
+
+    ``finalize_task`` holds the single-owner finalization task (reap + collect
+    + cleanup) so a second monitor/shutdown caller awaits it rather than
+    starting a duplicate. ``execution_id`` is the durable execution-handle id
+    for a non-local backend (``None`` for the local path, which persists no
+    handle).
+    """
 
     workstream: Workstream
     handle: TaskHandle
@@ -1180,7 +1187,7 @@ class Orchestrator:
             await self._handle_success(workstream_id, running.workspace_path)
         else:
             self._logger.warning(
-                "Workstream '%s' failed (code %d)",
+                "Workstream '%s' failed (code %s)",
                 workstream_id,
                 return_code,
             )
