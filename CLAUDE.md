@@ -393,7 +393,9 @@ An ex-post gate block that the operator approved resumes at the ex-post edge (H-
   троттлинг у кромки бюджета, перезапрос платный). Умолчание ревью с гейтом
   codex-review — терминальный цикл (решение владельца 2026-08-28): итерировать
   локально `sh scripts/review/local.sh` до чистого вердикта (подписочный codex,
-  $0 API) → пушить **драфтом** (CI отвечает deferred) → приёмочное ревью
+  $0 API; с ре-вендора кита 2026-09 доступен и `REVIEW_HARNESS=claude` —
+  адаптер `scripts/review/harness-claude`, умолчание по-прежнему codex) →
+  пушить **драфтом** (CI отвечает deferred) → приёмочное ревью
   `sh ../devtools/review-pr.sh <repo> <pr> --dry-run`, затем без `--dry-run` —
   вердикт публикуется PR-ревью от **ai-prosto**; CI-прогон после снятия драфта —
   advisory-фолбэк, его красноту/зависание не перегонять (SSOT:

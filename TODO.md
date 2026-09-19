@@ -1022,6 +1022,34 @@
   двухшаговая дисциплина из шапки checksum.sh; дисциплина раундов гейта —
   спека steward §13.
 
+## Входящие 2026-09 (inbox #240, принят 2026-09-19)
+
+- [ ] **Ре-вендор review-kit до текущего релиза** — кит догоняет steward @ `c18bf87` @owner:github:andrei-shtanakov @id:review-kit-catchup-scope
+      (6 членов → 8: добавлены `scripts/review/harness-claude` и
+      `scripts/review/prose-paths.env`, обновлены `local.sh`,
+      `collect-context.sh`, `apply-threshold.sh`, `checksum.sh`,
+      `.github/codex/review-schema.json`).
+      Зачем: без адаптера `harness-claude` местный прогон умеет только codex, а
+      операторский профиль на claude с 2026-09-03 — ревью в штатной
+      конфигурации недоступно; `prose-paths.env` включает фильтр области
+      ревью (срез B, steward#172) и код выхода 5.
+      Едет двумя PR, и порядок обязателен: PR-A — вызывающая сторона
+      (переходный `CHECKSUM_KIT_EXTRA` в джобе `review-kit-integrity`, вахта
+      дрейфа с 6 путей до 8, эти записи), PR-B — РОВНО вендор-копия и PIN.
+      Почему так: скачок состава 6→8 отвергается чекером ИЗ BASE кодом 2,
+      а `attest-vendor.sh` аттестует только PR, целиком лежащий внутри
+      состава кита, — посторонний путь в дифе даёт отказ кодом 3. Значит
+      подпорка обязана приехать раньше и отдельно.
+      Verify: `sh scripts/review/checksum.sh --pin scripts/review/PIN --root .`
+      = 0 и он же из base под `CHECKSUM_KIT_EXTRA` = 0; PR-B —
+      `../devtools/attest-vendor.sh maestro <pr>` вместо модельного ревью.
+  - [ ] Снять переходный `CHECKSUM_KIT_EXTRA` из `review-kit-integrity` @id:review-kit-catchup-extra-cleanup
+        следующим PR — после мержа base несёт новый чекер, который знает оба
+        члена сам, и переменная становится мёртвой подпоркой.
+  - `.github/hooks/pre-push` из того же релиза здесь неприменим: maestro не
+    вендорит ни хук, ни `install-hook.sh` — они штатные соседи кита, а не его
+    члены (шапка `checksum.sh`, §5).
+
 ## Кросс-репные watch-items
 
 - [ ] **`executor-config v0-provisional` висит без потребителя** @owner:github:andrei-shtanakov @id:specrunnerconfig-passthrough @epic:eco.spec-toolchain
