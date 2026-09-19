@@ -71,16 +71,6 @@ jobs:
       - name: checksum.sh из base против дерева PR
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
-          # ПЕРЕХОДНАЯ конфигурация вызывающего (шапка checksum.sh): ре-вендор
-          # 2026-09 расширяет состав кита с 6 членов до 8, а чекер исполняется
-          # ИЗ BASE — старый инвентарь отвергает строки PIN про harness-claude
-          # и prose-paths.env кодом 2 («PIN перечисляет файл вне состава
-          # кита»). CHECKSUM_KIT_EXTRA только ДОБАВЛЯЕТ члены и сузить состав
-          # не может, поэтому переходный маркер `?` здесь не fail-open:
-          # шесть обязательных членов по-прежнему зашиты в чекере, подмена
-          # любого из них остаётся кодом 1. Снять следующим PR — после мержа
-          # base несёт новый чекер, который знает оба члена сам.
-          CHECKSUM_KIT_EXTRA: "?scripts/review/harness-claude ?scripts/review/prose-paths.env"
         run: |
           set -euo pipefail
           if git cat-file -e "$BASE_SHA:scripts/review/checksum.sh" 2>/dev/null; then
