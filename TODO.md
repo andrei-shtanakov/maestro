@@ -1024,11 +1024,15 @@
 
 ## Входящие 2026-09 (inbox #240, принят 2026-09-19)
 
-- [ ] **Ре-вендор review-kit до текущего релиза** — кит догоняет steward @ `c18bf87` @owner:github:andrei-shtanakov @id:review-kit-catchup-scope
-      (6 членов → 8: добавлены `scripts/review/harness-claude` и
+- [x] **Ре-вендор review-kit до текущего релиза** — кит догнал steward @ `c18bf87` @owner:github:andrei-shtanakov @id:review-kit-catchup-scope
+      (состав 6 → 8 членов: добавлены `scripts/review/harness-claude` и
       `scripts/review/prose-paths.env`, обновлены `local.sh`,
       `collect-context.sh`, `apply-threshold.sh`, `checksum.sh`,
-      `.github/codex/review-schema.json`).
+      `.github/codex/review-schema.json`). Влито #241 (`e7c16d0`) + #242
+      (`e1c167c`). Половину дороги прошли параллельно: #237/#238 (волна
+      devtools#228) влились в master во время работы и подняли копию с
+      `1634af7` до `a2d7e71`, так что #242 вёз уже только срез B области
+      ревью (steward#172).
       Зачем: без адаптера `harness-claude` местный прогон умеет только codex, а
       операторский профиль на claude с 2026-09-03 — ревью в штатной
       конфигурации недоступно; `prose-paths.env` включает фильтр области
@@ -1043,9 +1047,10 @@
       Verify: `sh scripts/review/checksum.sh --pin scripts/review/PIN --root .`
       = 0 и он же из base под `CHECKSUM_KIT_EXTRA` = 0; PR-B —
       `../devtools/attest-vendor.sh maestro <pr>` вместо модельного ревью.
-  - [ ] Снять переходный `CHECKSUM_KIT_EXTRA` из `review-kit-integrity` @id:review-kit-catchup-extra-cleanup
-        следующим PR — после мержа base несёт новый чекер, который знает оба
-        члена сам, и переменная становится мёртвой подпоркой.
+  - [x] Снять переходный `CHECKSUM_KIT_EXTRA` из `review-kit-integrity` @id:review-kit-catchup-extra-cleanup
+        — после мержа #242 base несёт чекер `c18bf87`, который знает оба
+        члена сам (`harness-claude` обязательный, `prose-paths.env`
+        переходный), и переменная стала мёртвой подпоркой.
   - `.github/hooks/pre-push` из того же релиза здесь неприменим: maestro не
     вендорит ни хук, ни `install-hook.sh` — они штатные соседи кита, а не его
     члены (шапка `checksum.sh`, §5).
