@@ -151,11 +151,57 @@ def test_the_explicit_db_paths_ask_the_halt() -> None:
     assert src.count("refuse_for_config(config)") == 2
 
 
+@pytest.mark.parametrize(
+    "v",
+    DATA["origin_vectors"],
+    ids=[v["origin"] or "<empty>" for v in DATA["origin_vectors"]],
+)
+def test_every_origin_vector_directly(v: dict) -> None:
+    assert halt_gate.is_github_origin(v["origin"]) is v["github"]
+
+
+def test_a_non_github_origin_is_admitted_not_unread(monkeypatch) -> None:
+    """Review #248: the contract pins gitlab as admit_not_github."""
+    monkeypatch.setenv("DARKFACTORY_HALT_CHECK", "1")
+    monkeypatch.setattr(halt_gate, "check", lambda *_: pytest.fail("must not ask"))
+
+    class _Gitlab:
+        repo_url = "https://gitlab.com/o/r.git"
+
+    halt_gate.refuse_for_config(_Gitlab())
+
+
+def test_the_reads_pin_the_github_host(monkeypatch) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fake(*args: str) -> str | None:
+        calls.append(args)
+        return (
+            '[7,"darkfactory-halt"]' if "--jq" in args else '{"enforcement":"active"}'
+        )
+
+    monkeypatch.setattr(halt_gate, "_gh", fake)
+    halt_gate.check("o", "r")
+    assert all(c[:2] == ("--hostname", "github.com") for c in calls)
+
+
+def test_the_run_db_halt_check_precedes_the_run_branch_gate() -> None:
+    """Review #248: ask before the gate mutates the checkout."""
+    import inspect
+
+    from maestro import cli
+
+    src = inspect.getsource(cli)
+    first_halt = src.index("refuse_for_config(config)")
+    assert first_halt < src.index("db_fresh_binding_head = apply_start_gate(")
+
+
 def test_refuse_for_config_unresolvable_is_unread(monkeypatch) -> None:
     monkeypatch.setenv("DARKFACTORY_HALT_CHECK", "1")
 
     class _Bad:
-        repo_url = "not a url"
+        # GitHub, but no owner/name to read: unread — not "not GitHub".
+        repo_url = "https://github.com/"
         repo = None
 
     with pytest.raises(halt_gate.HaltRefused) as exc:

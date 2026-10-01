@@ -29,6 +29,24 @@ EXIT_HALTED = 6
 EXIT_UNREAD = 2
 
 Decision = tuple[bool, str, str]
+_GITHUB_HOSTS = ("github.com", "www.github.com")
+
+
+def is_github_origin(url: str) -> bool:
+    """Whether an origin URL's host is exactly github.com (admit_not_github;
+    the contract's origin_vectors pin it)."""
+    url = url.strip()
+    if "://" not in url and ":" in url and not url.startswith("/"):
+        head = url.split(":", 1)[0]
+        if "/" in head:
+            return False
+        host = head.rsplit("@", 1)[-1]
+    elif "://" in url:
+        rest = url.split("://", 1)[1]
+        host = rest.split("/", 1)[0].rsplit("@", 1)[-1].split(":", 1)[0]
+    else:
+        return False
+    return host.lower() in _GITHUB_HOSTS
 
 
 class HaltRefused(Exception):
@@ -93,6 +111,8 @@ def _gh(*args: str) -> str | None:
 def check(owner: str, repo: str) -> Decision:
     """Read the halt of github.com/<owner>/<repo> and decide."""
     out = _gh(
+        "--hostname",
+        "github.com",
         "--paginate",
         f"repos/{owner}/{repo}/rulesets?includes_parents=false",
         "--jq",
@@ -109,7 +129,11 @@ def check(owner: str, repo: str) -> Decision:
     if listing is not None:
         named = [r for r in listing if r.get("name") == HALT_RULESET]
         if len(named) == 1:
-            body = _gh(f"repos/{owner}/{repo}/rulesets/{named[0]['id']}")
+            body = _gh(
+                "--hostname",
+                "github.com",
+                f"repos/{owner}/{repo}/rulesets/{named[0]['id']}",
+            )
             try:
                 parsed = json.loads(body) if body is not None else None
             except json.JSONDecodeError:
@@ -126,6 +150,9 @@ def refuse_for_config(config: object) -> None:
         return
     from maestro.repo_identity import IdentityError, identity_from_config
 
+    repo_url = getattr(config, "repo_url", None)
+    if isinstance(repo_url, str) and repo_url and not is_github_origin(repo_url):
+        return  # admit_not_github: the contract admits a non-GitHub origin
     try:
         key = identity_from_config(config)
     except IdentityError as err:

@@ -772,6 +772,15 @@ async def _run_scheduler(
         ) and not clean_effective
         fresh_start = not continuation_selected
         explicit_db = resolved_db_path is not None
+        if explicit_db and fresh_start:
+            # Explicit `--db` skips bootstrap_run and its halt check: ask HERE,
+            # before the run-branch gate can touch the checkout and before the
+            # database opens — the same order bootstrap_run gives (#248).
+            try:
+                refuse_for_config(config)
+            except HaltRefused as e:
+                err_console.print(f"[red]Refusing to start a run:[/red] {e}")
+                raise typer.Exit(e.exit_code) from e
         if resolved_db_path is None:
             try:
                 bootstrap = await bootstrap_run(
@@ -838,16 +847,6 @@ async def _run_scheduler(
                     f"[red]run-branch gate:[/red] {escape(str(e))}", soft_wrap=True
                 )
                 raise typer.Exit(1) from e
-
-        if explicit_db and fresh_start:
-            # Explicit `--db` skips bootstrap_run — and with it the halt
-            # check; ask at the equivalent point, before the database opens
-            # (review #248).
-            try:
-                refuse_for_config(config)
-            except HaltRefused as e:
-                err_console.print(f"[red]Refusing to start a run:[/red] {e}")
-                raise typer.Exit(e.exit_code) from e
 
         # Ensure DB directory exists
         resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
