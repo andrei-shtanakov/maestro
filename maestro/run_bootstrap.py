@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import ulid
 
+from maestro.halt_gate import refuse_if_halted
 from maestro.repo_identity import RepoKey, identity_from_config
 from maestro.run_publish import create_run
 from maestro.run_registry import (
@@ -102,6 +103,8 @@ async def bootstrap_run(
                 f"run {alive.run_id} is live for {repo_key_text}; "
                 "wait for it, or pass --run <run-id> --resume"
             )
+        # D2b: a NEW run asks the DarkFactory halt (opt-in); resume drains.
+        refuse_if_halted(key.host, key.owner, key.repo, local=key.local)
         run_id = str(ulid.new())
         extra: dict[str, object] = {}
         if pre_publish is not None:
