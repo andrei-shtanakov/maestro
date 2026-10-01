@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from maestro import halt_gate
-from maestro.run_bootstrap import bootstrap_run
 
 
 CONTRACT = Path(__file__).resolve().parents[1] / "contracts" / "halt-admission" / "v1"
@@ -79,13 +78,30 @@ class _Config:
     repo_url = "https://github.com/acme/app"
 
 
-async def test_an_admitted_fresh_run_starts(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("DARKFACTORY_HALT_CHECK", "1")
-    monkeypatch.setattr(halt_gate, "check", lambda *_: (True, "admit_off", "off"))
-    result = await bootstrap_run(
-        _Config(), resume=False, run_id_override=None, home=tmp_path
-    )
-    assert result.fresh is True
+def test_an_admitting_halt_lets_run_reach_the_lock(monkeypatch, tmp_path) -> None:
+    """Round 4: the gate lives at the entry now — an admitting halt must
+    let `run` proceed to its PID lock (the first effect after the gate)."""
+    import subprocess
+
+    from typer.testing import CliRunner
+
+    from maestro import cli
+
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    asked: list[object] = []
+    monkeypatch.setattr(cli, "refuse_for_config", asked.append)
+
+    class _Reached(Exception):
+        pass
+
+    def lock() -> int:
+        raise _Reached
+
+    monkeypatch.setattr(cli, "_acquire_pid_lock", lock)
+    result = CliRunner().invoke(cli.app, ["run", str(_tasks_yaml(tmp_path))])
+    assert len(asked) == 1
+    assert isinstance(result.exception, _Reached)
 
 
 @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on", " 1 "])
@@ -171,7 +187,7 @@ def test_refuse_for_config_unresolvable_is_unread(monkeypatch) -> None:
 
     with pytest.raises(halt_gate.HaltRefused) as exc:
         halt_gate.refuse_for_config(_Bad())
-    assert exc.value.exit_code == 2  # unread, never admitted
+    assert exc.value.exit_code == 1  # config cannot name the repo; not admitted
     assert "identity unresolved" in str(exc.value)
 
 
@@ -239,9 +255,9 @@ def halted_cli(monkeypatch):
 def test_every_start_combination_asks_the_halt_first(
     halted_cli, tmp_path, command, extra
 ) -> None:
-    from typer.testing import CliRunner
-
     import subprocess
+
+    from typer.testing import CliRunner
 
     checkout = tmp_path / "checkout"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
@@ -304,4 +320,32 @@ def test_an_unparseable_repo_url_is_unread_not_admitted(monkeypatch) -> None:
 
     with pytest.raises(halt_gate.HaltRefused) as exc:
         halt_gate.refuse_for_config(_Garbled())
-    assert exc.value.exit_code == 2
+    assert exc.value.exit_code == 1  # a config error: retry will not help
+
+
+def test_www_github_is_github_everywhere(monkeypatch) -> None:
+    """Round 4: one definition of GitHub for both decisions."""
+    monkeypatch.setenv("DARKFACTORY_HALT_CHECK", "1")
+    asked: list[str] = []
+    monkeypatch.setattr(
+        halt_gate, "check", lambda o, _r: asked.append(o) or (True, "admit_off", "x")
+    )
+    halt_gate.refuse_if_halted("www.github.com", "acme", "app", local=False)
+    assert asked == ["acme"]
+
+
+def test_the_review_stage_is_not_gated(halted_cli, tmp_path) -> None:
+    """Round 4: reviews of existing PRs land nothing; review-pr is not gated,
+    and `service run --stage review` agrees with it."""
+    import inspect
+
+    src = inspect.getsource(halted_cli._service_run)
+    assert 'if stage == "orchestrate":\n            refuse_for_config(project)' in src
+
+
+def test_a_child_halted_mid_tick_is_a_skip_not_a_failure() -> None:
+    import inspect
+
+    from maestro.service import tick
+
+    assert "code == EXIT_HALTED" in inspect.getsource(tick)

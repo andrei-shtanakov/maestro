@@ -24,9 +24,11 @@ from typing import Any
 
 ENV_FLAG = "DARKFACTORY_HALT_CHECK"
 HALT_RULESET = "darkfactory-halt"
-#: Exit codes, as devtools merge-pr.sh: 6 halted, 2 halt unread (retry fits).
+#: Exit codes, as devtools merge-pr.sh: 6 halted, 2 halt unread (retry fits);
+#: 1 a configuration that cannot name a repository (retrying will not help).
 EXIT_HALTED = 6
 EXIT_UNREAD = 2
+EXIT_CONFIG = 1
 
 Decision = tuple[bool, str, str]
 _GITHUB_HOSTS = ("github.com", "www.github.com")
@@ -54,13 +56,19 @@ def is_github_origin(url: str) -> bool:
 class HaltRefused(Exception):
     """A new run refused by the DarkFactory halt."""
 
-    def __init__(self, message: str, *, unread: bool) -> None:
+    def __init__(
+        self, message: str, *, unread: bool, config_error: bool = False
+    ) -> None:
         super().__init__(message)
-        self.unread = unread
+        self.unread = unread or config_error
+        self.config_error = config_error
 
     @property
     def exit_code(self) -> int:
-        """6 when the halt is in force, 2 when it could not be read."""
+        """6 halt in force; 2 halt unread (retry fits); 1 config cannot name
+        a repository (retry will not help — review #248, round 4)."""
+        if self.config_error:
+            return EXIT_CONFIG
         return EXIT_UNREAD if self.unread else EXIT_HALTED
 
 
@@ -161,6 +169,7 @@ def refuse_for_config(config: object) -> None:
                 f"DarkFactory halt (refuse_unknown): cannot read a host from "
                 f"repo_url {repo_url!r}",
                 unread=True,
+                config_error=True,
             )
         if host.lower() not in _GITHUB_HOSTS:
             return  # admit_not_github: the contract admits a non-GitHub origin
@@ -170,6 +179,7 @@ def refuse_for_config(config: object) -> None:
         raise HaltRefused(
             f"DarkFactory halt (refuse_unknown): identity unresolved: {err}",
             unread=True,
+            config_error=True,
         ) from err
     refuse_if_halted(key.host, key.owner, key.repo, local=key.local)
 
@@ -178,7 +188,7 @@ def refuse_if_halted(host: str, owner: str, repo: str, *, local: bool) -> None:
     """Raise HaltRefused when a new run must not start; no-op when off."""
     if not enabled():
         return
-    if local or host.lower() != "github.com":
+    if local or host.lower() not in _GITHUB_HOSTS:
         return  # admit_not_github
     admit, code, reason = check(owner, repo)
     if not admit:

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import ulid
 
+from maestro.halt_gate import EXIT_HALTED
 from maestro.models import WorkstreamStatus
 from maestro.notifications.base import Notification, NotificationEvent
 from maestro.service.decide import decide_orchestrate, decide_review
@@ -234,8 +235,12 @@ async def _run_orchestrate_tick(
     if decision == "resume":
         argv.append("--resume")
     code = await runner(argv, log_path=log_path)
-    outcome: Outcome = "ok" if code == 0 else "failed"
-    exit_code = EXIT_OK if code == 0 else EXIT_RUN_FAILED
+    # The child asks the halt again at its own entry; a halt that landed
+    # between the tick's check and the child's is the same handled skip the
+    # tick itself reports, not a failed orchestration (review #248, round 4).
+    halted = code == EXIT_HALTED
+    outcome: Outcome = "ok" if code == 0 or halted else "failed"
+    exit_code = EXIT_OK if code == 0 or halted else EXIT_RUN_FAILED
     await db.finalize_service_tick(tick_id, outcome=outcome, exit_code=exit_code)
     return TickResult(decision, outcome, exit_code)
 

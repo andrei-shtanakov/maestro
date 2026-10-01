@@ -3617,11 +3617,14 @@ async def _service_run(
 ) -> int:
     project = load_orchestrator_config(config_path)
 
-    # The DarkFactory halt (opt-in), asked before any lock or database: a
-    # halted repository is a handled skip (0), not a red tick; a halt that
-    # cannot be read is an infrastructure failure (1).
+    # The DarkFactory halt (opt-in), asked before any lock or database, for
+    # the ORCHESTRATE stage only: the review stage reviews PRs that already
+    # exist and lands nothing — `maestro review-pr` is not gated either, and
+    # the two must agree (review #248, round 4). A halted repository is a
+    # handled skip (0), not a red tick; an unreadable halt is a failure (1).
     try:
-        refuse_for_config(project)
+        if stage == "orchestrate":
+            refuse_for_config(project)
     except HaltRefused as e:
         if e.unread:
             err_console.print(f"[red]{escape(str(e))}[/red]")
