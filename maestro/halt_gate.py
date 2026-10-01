@@ -44,9 +44,15 @@ class HaltRefused(Exception):
         return EXIT_UNREAD if self.unread else EXIT_HALTED
 
 
+_TRUE = frozenset({"1", "true", "yes", "on"})
+
+
 def enabled(env: dict[str, str] | None = None) -> bool:
-    """Whether the opt-in flag is set."""
-    return (env if env is not None else os.environ).get(ENV_FLAG) == "1"
+    """Whether the opt-in flag is set — `1`/`true`/`yes`/`on`, any case: a
+    spelling that silently switched the halt off would be the worst
+    failure of an opt-in safety check (review #248)."""
+    raw = (env if env is not None else os.environ).get(ENV_FLAG, "")
+    return raw.strip().lower() in _TRUE
 
 
 def decide(
@@ -110,6 +116,24 @@ def check(owner: str, repo: str) -> Decision:
                 parsed = None
             detail = parsed if isinstance(parsed, dict) else None
     return decide(listing, detail)
+
+
+def refuse_for_config(config: object) -> None:
+    """The halt for a run started WITHOUT bootstrap_run (explicit `--db`):
+    the identity is resolved here. Unresolvable under the flag is an unread
+    halt (exit 2), never an admitted run (review #248)."""
+    if not enabled():
+        return
+    from maestro.repo_identity import IdentityError, identity_from_config
+
+    try:
+        key = identity_from_config(config)
+    except IdentityError as err:
+        raise HaltRefused(
+            f"DarkFactory halt (refuse_unknown): identity unresolved: {err}",
+            unread=True,
+        ) from err
+    refuse_if_halted(key.host, key.owner, key.repo, local=key.local)
 
 
 def refuse_if_halted(host: str, owner: str, repo: str, *, local: bool) -> None:

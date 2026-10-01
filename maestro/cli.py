@@ -66,7 +66,7 @@ from maestro.database import (
 from maestro.decomposer import ProjectDecomposer, resolve_spec_gen_settings
 from maestro.event_log import create_event_logger
 from maestro.git import GitManager
-from maestro.halt_gate import HaltRefused
+from maestro.halt_gate import HaltRefused, refuse_for_config
 from maestro.logging_bridge import setup_logging
 from maestro.models import ArbiterMode, OrchestratorConfig, TaskStatus, WorkstreamStatus
 from maestro.orchestrator import ConfigDriftDetected, Orchestrator
@@ -771,6 +771,7 @@ async def _run_scheduler(
             resume or run is not None or db_has_state
         ) and not clean_effective
         fresh_start = not continuation_selected
+        explicit_db = resolved_db_path is not None
         if resolved_db_path is None:
             try:
                 bootstrap = await bootstrap_run(
@@ -837,6 +838,16 @@ async def _run_scheduler(
                     f"[red]run-branch gate:[/red] {escape(str(e))}", soft_wrap=True
                 )
                 raise typer.Exit(1) from e
+
+        if explicit_db and fresh_start:
+            # Explicit `--db` skips bootstrap_run — and with it the halt
+            # check; ask at the equivalent point, before the database opens
+            # (review #248).
+            try:
+                refuse_for_config(config)
+            except HaltRefused as e:
+                err_console.print(f"[red]Refusing to start a run:[/red] {e}")
+                raise typer.Exit(e.exit_code) from e
 
         # Ensure DB directory exists
         resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2047,6 +2058,13 @@ async def _run_orchestrator(
     # resolver entirely.
     if db_path is not None:
         resolved_db_path = db_path
+        if not resume:
+            # Explicit `--db` skips bootstrap_run and its halt check (#248).
+            try:
+                refuse_for_config(config)
+            except HaltRefused as e:
+                err_console.print(f"[red]Refusing to start a run:[/red] {e}")
+                raise typer.Exit(e.exit_code) from e
     else:
         try:
             bootstrap = await bootstrap_run(config, resume=resume, run_id_override=run)

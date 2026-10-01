@@ -101,3 +101,64 @@ async def test_an_admitted_fresh_run_starts(monkeypatch, tmp_path) -> None:
         _Config(), resume=False, run_id_override=None, home=tmp_path
     )
     assert result.fresh is True
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on", " 1 "])
+def test_the_flag_accepts_obvious_spellings(raw: str) -> None:
+    assert halt_gate.enabled({"DARKFACTORY_HALT_CHECK": raw}) is True
+
+
+@pytest.mark.parametrize("raw", ["", "0", "false", "no", "off"])
+def test_the_flag_off_spellings(raw: str) -> None:
+    assert halt_gate.enabled({"DARKFACTORY_HALT_CHECK": raw}) is False
+
+
+def test_tests_run_without_the_flag() -> None:
+    """conftest strips it, whatever the agent environment exports (#248)."""
+    import os
+
+    assert "DARKFACTORY_HALT_CHECK" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "v",
+    DATA["origin_vectors"],
+    ids=[v["origin"] or "<empty>" for v in DATA["origin_vectors"]],
+)
+def test_origin_vectors_through_maestros_identity(v: dict, tmp_path) -> None:
+    """maestro decides github vs not by RepoKey.host; the contract's origin
+    vectors pin that this host comes out right for each origin (#248)."""
+    from maestro.repo_identity import IdentityError, identity_from_config
+
+    class _Cfg:
+        repo_url = v["origin"]
+
+    try:
+        key = identity_from_config(_Cfg())
+    except IdentityError:
+        assert v["github"] is False
+        return
+    github = (not key.local) and key.host.lower() == "github.com"
+    assert github is v["github"], key
+
+
+def test_the_explicit_db_paths_ask_the_halt() -> None:
+    import inspect
+
+    from maestro import cli
+
+    src = inspect.getsource(cli)
+    assert src.count("refuse_for_config(config)") == 2
+
+
+def test_refuse_for_config_unresolvable_is_unread(monkeypatch) -> None:
+    monkeypatch.setenv("DARKFACTORY_HALT_CHECK", "1")
+
+    class _Bad:
+        repo_url = "not a url"
+        repo = None
+
+    with pytest.raises(halt_gate.HaltRefused) as exc:
+        halt_gate.refuse_for_config(_Bad())
+    assert exc.value.exit_code == 2  # unread, never admitted
+    assert "identity unresolved" in str(exc.value)
