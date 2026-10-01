@@ -32,21 +32,23 @@ Decision = tuple[bool, str, str]
 _GITHUB_HOSTS = ("github.com", "www.github.com")
 
 
-def is_github_origin(url: str) -> bool:
-    """Whether an origin URL's host is exactly github.com (admit_not_github;
-    the contract's origin_vectors pin it)."""
+def origin_host(url: str) -> str | None:
+    """The host of an origin URL, or None when none can be read from it."""
     url = url.strip()
     if "://" not in url and ":" in url and not url.startswith("/"):
         head = url.split(":", 1)[0]
-        if "/" in head:
-            return False
-        host = head.rsplit("@", 1)[-1]
-    elif "://" in url:
+        return None if "/" in head else (head.rsplit("@", 1)[-1] or None)
+    if "://" in url:
         rest = url.split("://", 1)[1]
-        host = rest.split("/", 1)[0].rsplit("@", 1)[-1].split(":", 1)[0]
-    else:
-        return False
-    return host.lower() in _GITHUB_HOSTS
+        return rest.split("/", 1)[0].rsplit("@", 1)[-1].split(":", 1)[0] or None
+    return None
+
+
+def is_github_origin(url: str) -> bool:
+    """Whether an origin URL's host is exactly github.com (admit_not_github;
+    the contract's origin_vectors pin it)."""
+    host = origin_host(url)
+    return host is not None and host.lower() in _GITHUB_HOSTS
 
 
 class HaltRefused(Exception):
@@ -151,8 +153,17 @@ def refuse_for_config(config: object) -> None:
     from maestro.repo_identity import IdentityError, identity_from_config
 
     repo_url = getattr(config, "repo_url", None)
-    if isinstance(repo_url, str) and repo_url and not is_github_origin(repo_url):
-        return  # admit_not_github: the contract admits a non-GitHub origin
+    if isinstance(repo_url, str) and repo_url:
+        host = origin_host(repo_url)
+        if host is None:
+            # Unparseable is UNKNOWN, never "not GitHub" (review #248, r3).
+            raise HaltRefused(
+                f"DarkFactory halt (refuse_unknown): cannot read a host from "
+                f"repo_url {repo_url!r}",
+                unread=True,
+            )
+        if host.lower() not in _GITHUB_HOSTS:
+            return  # admit_not_github: the contract admits a non-GitHub origin
     try:
         key = identity_from_config(config)
     except IdentityError as err:

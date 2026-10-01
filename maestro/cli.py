@@ -674,6 +674,20 @@ async def _verify_run_branch_continuation(
     return row
 
 
+def _refuse_if_halted_or_exit(config: object) -> None:
+    """The DarkFactory halt at the ENTRY of a command that starts or resumes
+    agent work (opt-in, DARKFACTORY_HALT_CHECK). Asked before the PID lock,
+    the run-branch gate and the database, and for every invocation —
+    fresh, resume, `--db` or not: deciding "is this a new run" from flags
+    let three paths slip past the check (review rounds on #248). A process
+    already running is not stopped; it drains."""
+    try:
+        refuse_for_config(config)
+    except HaltRefused as e:
+        err_console.print(f"[red]Refusing to start work:[/red] {escape(str(e))}")
+        raise typer.Exit(e.exit_code) from e
+
+
 async def _run_scheduler(
     config_path: Path,
     db_path: Path | None,
@@ -700,6 +714,8 @@ async def _run_scheduler(
     except CycleError as e:
         err_console.print(f"[red]DAG error:[/red] {e}")
         raise typer.Exit(1) from e
+
+    _refuse_if_halted_or_exit(config)
 
     # Needed by the run-branch gate below (and, unchanged, by the scheduler
     # further down) — moved up from its old post-bootstrap site.
@@ -771,16 +787,6 @@ async def _run_scheduler(
             resume or run is not None or db_has_state
         ) and not clean_effective
         fresh_start = not continuation_selected
-        explicit_db = resolved_db_path is not None
-        if explicit_db and fresh_start:
-            # Explicit `--db` skips bootstrap_run and its halt check: ask HERE,
-            # before the run-branch gate can touch the checkout and before the
-            # database opens — the same order bootstrap_run gives (#248).
-            try:
-                refuse_for_config(config)
-            except HaltRefused as e:
-                err_console.print(f"[red]Refusing to start a run:[/red] {e}")
-                raise typer.Exit(e.exit_code) from e
         if resolved_db_path is None:
             try:
                 bootstrap = await bootstrap_run(
@@ -797,9 +803,6 @@ async def _run_scheduler(
             except RunIsLive as e:
                 err_console.print(f"[red]Refusing to start a second run:[/red] {e}")
                 raise typer.Exit(1) from e
-            except HaltRefused as e:
-                err_console.print(f"[red]Refusing to start a run:[/red] {e}")
-                raise typer.Exit(e.exit_code) from e
             except NoResumableRun as e:
                 # `--run <id>` puts an operator-controlled string in this message
                 # (see `run_bootstrap._run_by_id`), and a value like `[bold]` would
@@ -2051,19 +2054,14 @@ async def _run_orchestrator(
         )
         raise typer.Exit(1)
 
+    _refuse_if_halted_or_exit(config)
+
     # Identity and the run must be resolved — and ORCHESTRA_PIPELINE_ID
     # exported — before logging initializes (obs.py falls back to a fresh
     # ULID otherwise). `--db` is an explicit override that skips the
     # resolver entirely.
     if db_path is not None:
         resolved_db_path = db_path
-        if not resume:
-            # Explicit `--db` skips bootstrap_run and its halt check (#248).
-            try:
-                refuse_for_config(config)
-            except HaltRefused as e:
-                err_console.print(f"[red]Refusing to start a run:[/red] {e}")
-                raise typer.Exit(e.exit_code) from e
     else:
         try:
             bootstrap = await bootstrap_run(config, resume=resume, run_id_override=run)
@@ -2073,9 +2071,6 @@ async def _run_orchestrator(
         except RunIsLive as e:
             err_console.print(f"[red]Refusing to start a second run:[/red] {e}")
             raise typer.Exit(1) from e
-        except HaltRefused as e:
-            err_console.print(f"[red]Refusing to start a run:[/red] {e}")
-            raise typer.Exit(e.exit_code) from e
         except NoResumableRun as e:
             # `--run <id>` puts an operator-controlled string in this message
             # (see `run_bootstrap._run_by_id`), and a value like `[bold]` would
@@ -3621,6 +3616,19 @@ async def _service_run(
     *, config_path: Path, stage: "Stage", db_path: Path | None, sweep: bool
 ) -> int:
     project = load_orchestrator_config(config_path)
+
+    # The DarkFactory halt (opt-in), asked before any lock or database: a
+    # halted repository is a handled skip (0), not a red tick; a halt that
+    # cannot be read is an infrastructure failure (1).
+    try:
+        refuse_for_config(project)
+    except HaltRefused as e:
+        if e.unread:
+            err_console.print(f"[red]{escape(str(e))}[/red]")
+            return 1
+        console.print(f"{project.project} [{stage}]: halted -> skip (exit 0)")
+        console.print(f"[dim]{escape(str(e))}[/dim]", soft_wrap=True)
+        return 0
 
     # `--db` overrides run and database-path resolution — but NOT identity:
     # the lock key below must always be the repository's real RepoKey, never

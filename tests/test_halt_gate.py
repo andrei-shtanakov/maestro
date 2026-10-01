@@ -9,9 +9,7 @@ from pathlib import Path
 import pytest
 
 from maestro import halt_gate
-from maestro.repo_identity import RepoKey
 from maestro.run_bootstrap import bootstrap_run
-from maestro.run_registry import resolve_runs
 
 
 CONTRACT = Path(__file__).resolve().parents[1] / "contracts" / "halt-admission" / "v1"
@@ -81,19 +79,6 @@ class _Config:
     repo_url = "https://github.com/acme/app"
 
 
-async def test_a_halted_fresh_run_is_refused_before_it_exists(
-    monkeypatch, tmp_path
-) -> None:
-    monkeypatch.setenv("DARKFACTORY_HALT_CHECK", "1")
-    monkeypatch.setattr(halt_gate, "check", lambda *_: (False, "refuse_on", "on"))
-    with pytest.raises(halt_gate.HaltRefused):
-        await bootstrap_run(
-            _Config(), resume=False, run_id_override=None, home=tmp_path
-        )
-    key = RepoKey(host="github.com", owner="acme", repo="app")
-    assert await resolve_runs(key, home=tmp_path, lock_root=tmp_path) == []
-
-
 async def test_an_admitted_fresh_run_starts(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("DARKFACTORY_HALT_CHECK", "1")
     monkeypatch.setattr(halt_gate, "check", lambda *_: (True, "admit_off", "off"))
@@ -142,15 +127,6 @@ def test_origin_vectors_through_maestros_identity(v: dict, tmp_path) -> None:
     assert github is v["github"], key
 
 
-def test_the_explicit_db_paths_ask_the_halt() -> None:
-    import inspect
-
-    from maestro import cli
-
-    src = inspect.getsource(cli)
-    assert src.count("refuse_for_config(config)") == 2
-
-
 @pytest.mark.parametrize(
     "v",
     DATA["origin_vectors"],
@@ -185,17 +161,6 @@ def test_the_reads_pin_the_github_host(monkeypatch) -> None:
     assert all(c[:2] == ("--hostname", "github.com") for c in calls)
 
 
-def test_the_run_db_halt_check_precedes_the_run_branch_gate() -> None:
-    """Review #248: ask before the gate mutates the checkout."""
-    import inspect
-
-    from maestro import cli
-
-    src = inspect.getsource(cli)
-    first_halt = src.index("refuse_for_config(config)")
-    assert first_halt < src.index("db_fresh_binding_head = apply_start_gate(")
-
-
 def test_refuse_for_config_unresolvable_is_unread(monkeypatch) -> None:
     monkeypatch.setenv("DARKFACTORY_HALT_CHECK", "1")
 
@@ -208,3 +173,135 @@ def test_refuse_for_config_unresolvable_is_unread(monkeypatch) -> None:
         halt_gate.refuse_for_config(_Bad())
     assert exc.value.exit_code == 2  # unread, never admitted
     assert "identity unresolved" in str(exc.value)
+
+
+# --- review round 3 on #248: the halt is asked at every ENTRY ------------
+#
+# Deciding "is this a new run" from flags let three paths slip past the
+# check (`--db`, `--db` before the run-branch gate, `--resume` over an empty
+# `--db`). The mechanism now asks at the entry of every command that starts
+# or resumes agent work, before the PID lock, the resolver and the database.
+# This table is every combination; each must refuse with 6 touching nothing.
+
+
+def _tasks_yaml(base: Path) -> Path:
+    path = base / "tasks.yaml"
+    path.write_text(
+        "project: demo\n"
+        f"repo: {base / 'checkout'}\n"
+        "tasks:\n  - id: t1\n    title: T\n    prompt: p\n    agent_type: announce\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _project_yaml(base: Path) -> Path:
+    path = base / "project.yaml"
+    path.write_text(
+        "project: demo\n"
+        "repo_url: https://github.com/acme/app\n"
+        f"repo_path: {base / 'checkout'}\n"
+        f"workspace_base: {base / 'ws'}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.fixture
+def halted_cli(monkeypatch):
+    from maestro import cli
+
+    def halted(config: object) -> None:
+        raise halt_gate.HaltRefused("DarkFactory halt (refuse_on): on", unread=False)
+
+    def never(*a, **k):
+        raise AssertionError("touched before the halt was asked")
+
+    monkeypatch.setattr(cli, "refuse_for_config", halted)
+    monkeypatch.setattr(cli, "_acquire_pid_lock", never)
+    monkeypatch.setattr(cli, "bootstrap_run", never)
+    monkeypatch.setattr(cli, "create_database", never)
+    return cli
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        [],
+        ["--resume"],
+        ["--db", "{db}"],
+        ["--db", "{db}", "--resume"],
+        ["--db", "{missing}", "--resume"],
+    ],
+    ids=["fresh", "resume", "db", "db-resume", "db-missing-resume"],
+)
+@pytest.mark.parametrize("command", ["run", "orchestrate"])
+def test_every_start_combination_asks_the_halt_first(
+    halted_cli, tmp_path, command, extra
+) -> None:
+    from typer.testing import CliRunner
+
+    import subprocess
+
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/app",
+        ],
+        check=True,
+    )
+    cfg = _tasks_yaml(tmp_path) if command == "run" else _project_yaml(tmp_path)
+    db = tmp_path / "x.db"
+    db.write_bytes(b"")
+    args = [a.format(db=db, missing=tmp_path / "nope.db") for a in extra]
+    result = CliRunner().invoke(halted_cli.app, [command, str(cfg), *args])
+    assert result.exit_code == 6, result.output
+    assert "touched before" not in repr(result.exception)
+
+
+@pytest.mark.parametrize("unread", [False, True])
+def test_a_halted_service_tick_skips_and_an_unread_one_fails(
+    halted_cli, monkeypatch, tmp_path, unread
+) -> None:
+    """Review r3: a deliberate halt is a handled skip (0), not a red tick;
+    an unread halt is an infrastructure failure (1)."""
+    from typer.testing import CliRunner
+
+    def gate(config: object) -> None:
+        raise halt_gate.HaltRefused("DarkFactory halt (x): y", unread=unread)
+
+    monkeypatch.setattr(halted_cli, "refuse_for_config", gate)
+    result = CliRunner().invoke(
+        halted_cli.app,
+        ["service", "run", str(_project_yaml(tmp_path)), "--stage", "orchestrate"],
+    )
+    assert result.exit_code == (1 if unread else 0), result.output
+    if not unread:
+        assert "halted -> skip" in result.output
+
+
+def test_bootstrap_run_no_longer_carries_its_own_check() -> None:
+    """One mechanism: entries ask; bootstrap_run does not ask a second time."""
+    import inspect
+
+    from maestro import run_bootstrap
+
+    assert "halt" not in inspect.getsource(run_bootstrap.bootstrap_run)
+
+
+def test_an_unparseable_repo_url_is_unread_not_admitted(monkeypatch) -> None:
+    monkeypatch.setenv("DARKFACTORY_HALT_CHECK", "1")
+
+    class _Garbled:
+        repo_url = "not a url"
+
+    with pytest.raises(halt_gate.HaltRefused) as exc:
+        halt_gate.refuse_for_config(_Garbled())
+    assert exc.value.exit_code == 2
