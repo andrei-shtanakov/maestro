@@ -1,0 +1,7 @@
+source: https://github.com/andrei-shtanakov/github-checker contracts/halt-admission/v1
+commit: 65c09a942c4ae87ce9beee62d8efffb3377f6972
+vendored: 2026-10-01
+re-vendor: copy README.md and vectors.json from the producer at a new commit, then update these lines
+
+ad00d26c5b19290a6b5fb28fcfd9349d69aebede76f8048f372711b868b39f56  README.md
+eb428725831edf8efb1df61aa4d205f8d4787123c76ecae83260f4dfa920b735  vectors.json

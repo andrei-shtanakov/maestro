@@ -239,6 +239,9 @@ def cleanup_environment(
     # its own home sets it later and wins.
     monkeypatch.setenv("MAESTRO_HOME", str(fenced_maestro_home))
     monkeypatch.delenv("ATP_CATALOG", raising=False)
+    # The DarkFactory halt check (opt-in) must not reach a real `gh` from a
+    # test run in an agent environment; halt tests set it themselves (#248).
+    monkeypatch.delenv("DARKFACTORY_HALT_CHECK", raising=False)
 
 
 @pytest.fixture

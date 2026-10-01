@@ -16,6 +16,17 @@
   only when the operator runs Maestro from inside it.
 
 ### Added
+
+- **DarkFactory halt check, opt-in** (halt D2b). With
+  `DARKFACTORY_HALT_CHECK=1` (also `true`/`yes`/`on`), `maestro run`,
+  `maestro orchestrate` and `maestro service run` ask GitHub, at their entry
+  and before the PID lock, the run-branch gate and the database, whether the
+  repository's `darkfactory-halt` ruleset is active — for every invocation
+  (fresh, `--resume`, `--db`). Halted → exit 6 (a service tick: handled skip,
+  exit 0); unreadable → exit 2 (a tick: 1); a local or non-github.com identity
+  or no ruleset → unchanged. A process already running is not stopped. The
+  rule is github-checker's `contracts/halt-admission/v1`, vendored with a
+  sha256 pin (`maestro/halt_gate.py`). Without the flag nothing changes.
 - **Mode-1 run-level branch isolation — `git.run_branch` (phase A)** (#216
   part 2). One opt-in key gives a Mode-1 run one checkout on one branch:
   the runtime verifies or creates the branch (from `base_branch`, clean

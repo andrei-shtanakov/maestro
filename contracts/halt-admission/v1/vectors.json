@@ -1,0 +1,209 @@
+{
+  "schema_version": 1,
+  "vectors": [
+    {
+      "name": "listing unreadable",
+      "listing": null,
+      "detail": null,
+      "admit": false,
+      "code": "refuse_unknown"
+    },
+    {
+      "name": "no halt ruleset (not armed)",
+      "listing": [
+        {
+          "id": 1,
+          "name": "Default Branch Restriction"
+        }
+      ],
+      "detail": null,
+      "admit": true,
+      "code": "admit_missing"
+    },
+    {
+      "name": "empty listing",
+      "listing": [],
+      "detail": null,
+      "admit": true,
+      "code": "admit_missing"
+    },
+    {
+      "name": "duplicate name",
+      "listing": [
+        {
+          "id": 1,
+          "name": "darkfactory-halt"
+        },
+        {
+          "id": 2,
+          "name": "darkfactory-halt"
+        }
+      ],
+      "detail": null,
+      "admit": false,
+      "code": "refuse_duplicate"
+    },
+    {
+      "name": "detail unreadable",
+      "listing": [
+        {
+          "id": 7,
+          "name": "darkfactory-halt"
+        }
+      ],
+      "detail": null,
+      "admit": false,
+      "code": "refuse_unknown"
+    },
+    {
+      "name": "halt off",
+      "listing": [
+        {
+          "id": 1,
+          "name": "Default Branch Restriction"
+        },
+        {
+          "id": 7,
+          "name": "darkfactory-halt"
+        }
+      ],
+      "detail": {
+        "id": 7,
+        "name": "darkfactory-halt",
+        "enforcement": "disabled",
+        "bypass_actors": null
+      },
+      "admit": true,
+      "code": "admit_off"
+    },
+    {
+      "name": "halt on",
+      "listing": [
+        {
+          "id": 7,
+          "name": "darkfactory-halt"
+        }
+      ],
+      "detail": {
+        "id": 7,
+        "name": "darkfactory-halt",
+        "enforcement": "active",
+        "bypass_actors": null
+      },
+      "admit": false,
+      "code": "refuse_on"
+    },
+    {
+      "name": "halt on, admin view with bypass list",
+      "listing": [
+        {
+          "id": 7,
+          "name": "darkfactory-halt"
+        }
+      ],
+      "detail": {
+        "id": 7,
+        "name": "darkfactory-halt",
+        "enforcement": "active",
+        "bypass_actors": [
+          {
+            "actor_id": 5,
+            "actor_type": "RepositoryRole",
+            "bypass_mode": "always"
+          }
+        ]
+      },
+      "admit": false,
+      "code": "refuse_on"
+    },
+    {
+      "name": "evaluate mode",
+      "listing": [
+        {
+          "id": 7,
+          "name": "darkfactory-halt"
+        }
+      ],
+      "detail": {
+        "id": 7,
+        "name": "darkfactory-halt",
+        "enforcement": "evaluate"
+      },
+      "admit": false,
+      "code": "refuse_enforcement"
+    },
+    {
+      "name": "enforcement absent",
+      "listing": [
+        {
+          "id": 7,
+          "name": "darkfactory-halt"
+        }
+      ],
+      "detail": {
+        "id": 7,
+        "name": "darkfactory-halt"
+      },
+      "admit": false,
+      "code": "refuse_enforcement"
+    },
+    {
+      "name": "similar name is not the halt",
+      "listing": [
+        {
+          "id": 7,
+          "name": "darkfactory-halt-old"
+        }
+      ],
+      "detail": null,
+      "admit": true,
+      "code": "admit_missing"
+    }
+  ],
+  "origin_vectors": [
+    {
+      "origin": "git@github.com:andrei-shtanakov/devtools.git",
+      "github": true
+    },
+    {
+      "origin": "https://github.com/andrei-shtanakov/devtools",
+      "github": true
+    },
+    {
+      "origin": "https://x-access-token:abc@github.com/o/r.git",
+      "github": true
+    },
+    {
+      "origin": "ssh://git@github.com/o/r.git",
+      "github": true
+    },
+    {
+      "origin": "ssh://git@github.com:443/o/r.git",
+      "github": true
+    },
+    {
+      "origin": "https://GitHub.com/o/r",
+      "github": true
+    },
+    {
+      "origin": "git@git.epam.com:team/sdd-framework.git",
+      "github": false
+    },
+    {
+      "origin": "https://gitlab.com/o/r.git",
+      "github": false
+    },
+    {
+      "origin": "https://github.com.evil.example/o/r",
+      "github": false
+    },
+    {
+      "origin": "/local/bare/repo.git",
+      "github": false
+    },
+    {
+      "origin": "",
+      "github": false
+    }
+  ]
+}
