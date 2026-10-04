@@ -1,0 +1,4 @@
+# spec-runner configuration (v2.0 flat format).
+# политика флота (devtools contracts/fleet-config-policy/v1, 2026-10-04): попытка, правящая файлы верификации, проваливается.
+# Остальное — умолчания spec-runner, как и без этого файла.
+harness_guard: strict
